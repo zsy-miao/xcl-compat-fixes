@@ -255,9 +255,9 @@ try {
             files = @('crates/xcl/src/eh.rs', 'crates/xcl/src/insn.rs', 'crates/xcl/src/gpu/shader.rs')
             scope = 'Batch recognized CLZERO/add/compare/back-jump loops with checked bounds and native writable-range validation; resume at the native compare to preserve flags and branch behavior. Synthetic title checks cover executed loops and memory boundaries.'
         }, [ordered]@{
-            name = 'sse4a_immediate_emulation'
+            name = 'sse4a_emulation'
             files = @('crates/xcl/src/eh.rs', 'crates/xcl/src/insn.rs')
-            scope = 'Emulate defined immediate SSE4a bit-field operations using the captured XMM context, preserving unaffected fields and flags; unsupported or undefined forms continue through normal exception handling.'
+            scope = 'Use community SSE4a bit-field instruction emulation with saved XMM state validation and bounds checks; preserve the existing local CLZERO batching and other CPU handlers.'
         })
         $info.applied_patches += @(
             [ordered]@{ pull_request = 162; url = 'https://github.com/ivall/xcl/pull/162'; source_revision = $pr162Revision; scope = 'Graphics pipelines compile at first use with urgent compilation; compute first-use compilation is opt-in per title via lazy_compute_pipelines or XCL_LAZY_COMPUTE.' },
@@ -276,6 +276,13 @@ try {
             files = @('crates/xcl/src/hle/d3d12x/vram.rs', 'crates/xcl/src/hle/d3d12x/device_x.rs', 'crates/xcl/src/hle/d3d12x/title_textures.rs', 'crates/xcl/src/hle/d3d12x/real.rs', 'crates/xcl/src/hle/kernelx.rs', 'crates/xcl/src/hle/kernelx/lazy.rs', 'crates/xcl/src/hle/dstorage.rs', 'crates/xcl/src/vfs_hooks.rs', 'crates/xcl/src/hle/d3d12x/cpu_writes.rs')
             scope = 'Complete VRAM texture-page allocator and console texture-size argument; per-frame refresh upload wait; unsupported mesh-layout refusal; typeless depth resource families with typed pipeline/clear/depth/stencil views; compatible lazy physical-page reservations and deferred-page handling for DirectStorage, file reads, and CPU completion writes. Local first-touch concurrency/failure/cleanup regressions and PR #187/#203 UMA/sparse changes retained.'
         })
+        $info.upstream_integrations += [ordered]@{
+            source_commit = '0cd0a53b584a8be0fd779d16e5826d97a0e66344'
+            related_commit = 'af20b4b38e5a8003234f28091fb45e03aca68167'
+            url = 'https://github.com/ivall/xcl/commit/af20b4b38e5a8003234f28091fb45e03aca68167'
+            files = @('crates/xcl/src/insn.rs', 'crates/xcl/src/eh.rs')
+            scope = 'SSE4a immediate/register INSERTQ and EXTRQ, including hardware-verified prefix behavior and upper-quadword results. Local floating-point context validation and the prior CLZERO batching remain; unrelated CPU hot-patching is not imported.'
+        }
         $info.test_suites = @('console_depth_buffers_become_pc_ones', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'console_mesh_streams_become_pc_ones', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
         $patchNote += "`r`nIncludes PR #163 depth fixes ($pr163Revision) and PR #170 mesh pipeline fixes ($pr170Revision)."
         $patchNote += "`r`nIncludes PR #192 texture tiling ($pr192Revision) and PR #195 graphics changes ($pr195Revision)."
@@ -285,7 +292,7 @@ try {
         $patchNote += "`r`nThe XG implementation is from #192; the source revision also records local texture-address, allocation cleanup and regression-test changes."
         $info.test_suites = @('clzero_batch', 'sse4a') + $info.test_suites
         $patchNote += "`r`nIncludes local CLZERO loop emulation that avoids repeating a Windows memory query for every 64-byte zero operation."
-        $patchNote += "`r`nIncludes immediate SSE4a bit-field emulation for Intel processors lacking the console instruction."
+        $patchNote += "`r`nIncludes community SSE4a immediate/register bit-field emulation (0cd0a53 and hardware follow-up af20b4b), with local saved-context validation."
     }
     [IO.File]::WriteAllText((Join-Path $stageDirectory 'BUILD-INFO.json'), ($info | ConvertTo-Json -Depth 5), $utf8)
     $startText = @"
