@@ -10,7 +10,7 @@ use std::sync::{OnceLock, RwLock};
 
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
-use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_READWRITE};
 
 const PAGE: usize = 0x1_0000;
 
@@ -29,19 +29,39 @@ fn install() -> bool {
     *INSTALLED.get_or_init(|| unsafe { !AddVectoredExceptionHandler(1, Some(handler)).is_null() })
 }
 
-unsafe fn writable_page(page: usize) -> bool {
+/// A single native region must cover the whole lazy page. A partial explicit commit
+/// or protection change must not be widened by committing the original 64 KiB again.
+unsafe fn query_page(page: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    let end = page.checked_add(PAGE)?;
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    VirtualQuery(page as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
-        && m.State == MEM_COMMIT && m.Protect == PAGE_READWRITE
+    if VirtualQuery(page as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0
+        || m.BaseAddress as usize > page
+        || (m.BaseAddress as usize).checked_add(m.RegionSize)? < end {
+        return None;
+    }
+    Some(m)
+}
+
+unsafe fn writable_page(page: usize) -> bool {
+    query_page(page).is_some_and(|m| m.State == MEM_COMMIT && m.Protect == PAGE_READWRITE)
 }
 
 unsafe fn commit(page: usize) -> bool {
     let mut pages = PAGES.write().unwrap_or_else(|e| e.into_inner());
     match pages.get(&page).copied() {
         Some(PageState::Reserved) => {
-            // Keep the write guard during allocation, and retain Reserved on failure.
-            if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
-                return false;
+            // An explicit commit/protect may have changed native state since mark().
+            // Keep the write guard through querying/allocation, and never replace a
+            // caller's read-only or guarded protection with read-write protection.
+            let Some(m) = query_page(page) else { return false };
+            match m.State {
+                MEM_COMMIT if m.Protect == PAGE_READWRITE => {}
+                MEM_RESERVE => {
+                    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                        return false;
+                    }
+                }
+                _ => return false,
             }
             pages.insert(page, PageState::Committed);
             true
@@ -103,7 +123,28 @@ pub(super) fn forget_released(at: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE, MEM_RESERVE};
+    use windows_sys::Win32::System::Memory::{VirtualFree, VirtualProtect, MEM_RELEASE, PAGE_GUARD, PAGE_READONLY};
+
+    #[test]
+    fn ensure_preserves_explicit_readonly_and_guard_protection() {
+        unsafe {
+            for protect in [PAGE_READONLY, PAGE_READWRITE | PAGE_GUARD] {
+                let r = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+                assert_ne!(r, 0);
+                assert!(mark(r));
+                assert!(!VirtualAlloc(r as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                let mut old = 0;
+                assert_ne!(VirtualProtect(r as *const c_void, PAGE, protect, &mut old), 0);
+                ensure(r + 8, 64);
+                let m = query_page(r).expect("the full page remains committed");
+                assert_eq!(m.State, MEM_COMMIT);
+                assert_eq!(m.Protect, protect, "ensure must preserve explicit protection");
+                assert!(!commit(r), "a queued fault must not override explicit protection");
+                assert!(unmark(r), "rejected preparation retains deferred metadata");
+                assert_ne!(VirtualFree(r as *mut c_void, 0, MEM_RELEASE), 0);
+            }
+        }
+    }
 
     #[test]
     fn a_lazy_page_commits_on_touch_and_ensure() {
