@@ -1,5 +1,11 @@
 # XCL – Xbox Series X|S → Windows compatibility layer
 
+This compatibility branch is based on [ivall/xcl](https://github.com/ivall/xcl).
+It combines attributed community fixes with our original compatibility work.
+[Local compatibility status](LOCAL-COMPATIBILITY.md) records the validation and
+experimental limits. Ongoing commits are published on `work-in-progress`;
+`main` holds the latest validated snapshot.
+
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
 **Discord: <https://discord.gg/yB5tstRHrn>**
 
