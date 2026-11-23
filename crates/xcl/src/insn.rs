@@ -18,8 +18,76 @@ pub enum ConsoleOnly {
     /// `rdpid r64`: TSC_AUX (the processor number) into the register (CONTEXT order: rax, rcx,
     /// rdx, rbx, rsp, rbp, rsi, rdi, r8..r15)
     Rdpid(u8),
+    /// SSE4a immediate form (`src` None) or register-control form (low source bits 5:0,
+    /// 13:8 are the length and index). XMM register numbers are 0..15.
+    Extrq { dst: u8, src: Option<u8>, len: u8, idx: u8 },
+    /// SSE4a INSERTQ; register controls are in source bits 69:64 and 77:72.
+    Insertq { dst: u8, src: u8, reg: bool, len: u8, idx: u8 },
     /// `ud2`: the title's own trap (not emulated)
     Ud2,
+}
+
+// SSE4a implementation from upstream 0cd0a53b584a8be0fd779d16e5826d97a0e66344,
+// with Zen 5 hardware-verified prefix behavior from af20b4b38e5a8003234f28091fb45e03aca68167.
+// Kept separate from the local bounded CLZERO loop emulation.
+fn field_len(len: u8) -> u32 {
+    match len & 63 { 0 => 64, n => n as u32 }
+}
+
+/// Defined EXTRQ fields follow AMD's manual. A field crossing bit 63 is undefined;
+/// upstream consistently uses the result of the shift and mask for those inputs.
+pub fn extrq(v: u64, len: u8, idx: u8) -> u64 {
+    let (len, idx) = (field_len(len), (idx & 63) as u32);
+    let field = v.checked_shr(idx).unwrap_or(0);
+    if len >= 64 { field } else { field & ((1u64 << len) - 1) }
+}
+
+pub fn insertq(dst: u64, src: u64, len: u8, idx: u8) -> u64 {
+    let (len, idx) = (field_len(len), (idx & 63) as u32);
+    let ones = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
+    let mask = ones.checked_shl(idx).unwrap_or(0);
+    (dst & !mask) | ((src & ones).checked_shl(idx).unwrap_or(0) & mask)
+}
+
+/// Only SSE4a uses this upstream prefix scan. It does not broaden the existing decoder's
+/// handling of address-size prefixes on CLZERO or replace the local loop safety checks.
+fn decode_sse4a(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
+    let mut i = 0;
+    let (mut p66, mut rep, mut rex) = (false, 0u8, 0u8);
+    while let Some(&b) = code.get(i) {
+        match b {
+            0x66 => p66 = true,
+            0xF2 => rep = 0xF2,
+            0xF3 => rep = 0xF3,
+            0x2E | 0x3E | 0x26 | 0x36 | 0x64 | 0x65 | 0x67 => {}
+            0x40..=0x4F => {
+                rex = b;
+                i += 1;
+                continue;
+            }
+            _ => break,
+        }
+        rex = 0;
+        i += 1;
+    }
+    if *code.get(i)? != 0x0F { return None; }
+    let opcode = *code.get(i + 1)?;
+    if matches!(opcode, 0x78 | 0x79) && i + (if opcode == 0x78 { 5 } else { 3 }) > 15 { return None; }
+    match (*code.get(i + 1)?, code.get(i + 2).copied()) {
+        (0x78 | 0x79, Some(m)) if (rep == 0xF2 || (rep == 0 && p66)) && m >> 6 == 3 => {
+            let reg = ((m >> 3) & 7) | (rex & 4) << 1;
+            let rm = (m & 7) | (rex & 1) << 3;
+            let imm = |k: usize| code.get(i + 3 + k).copied();
+            match (code[i + 1], rep == 0xF2) {
+                (0x78, false) if (m >> 3) & 7 == 0 => Some((ConsoleOnly::Extrq { dst: rm, src: None, len: imm(0)?, idx: imm(1)? }, i + 5)),
+                (0x79, false) => Some((ConsoleOnly::Extrq { dst: reg, src: Some(rm), len: 0, idx: 0 }, i + 3)),
+                (0x78, true) => Some((ConsoleOnly::Insertq { dst: reg, src: rm, reg: false, len: imm(0)?, idx: imm(1)? }, i + 5)),
+                (0x79, true) => Some((ConsoleOnly::Insertq { dst: reg, src: rm, reg: true, len: 0, idx: 0 }, i + 3)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The length of a ModRM-encoded operand (ModRM, SIB and displacement) at `b[0]`, None when the
@@ -47,6 +115,7 @@ fn modrm_len(b: &[u8]) -> Option<usize> {
 
 /// The console-only instruction at the start of `code` and its length.
 pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
+    if let Some(sse4a) = decode_sse4a(code) { return Some(sse4a); }
     let mut i = 0;
     let (mut p66, mut pf3, mut rex) = (false, false, 0u8);
     while let Some(&b) = code.get(i) {
@@ -119,6 +188,90 @@ pub fn clzero_batch(start: usize, bound: usize) -> Option<ClzeroBatch> {
 /// `code` as hex, for a log line.
 pub fn hex(code: &[u8]) -> String {
     code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod sse4a_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_observed_insertq_and_all_rex_register_forms() {
+        assert_eq!(decode(&[0xF2, 0x0F, 0x78, 0xC1, 16, 16]), Some((ConsoleOnly::Insertq { dst: 0, src: 1, reg: false, len: 16, idx: 16 }, 6)));
+        for dst in 0..16u8 {
+            for src in 0..16u8 {
+                let rex = 0x40 | ((dst >> 3) << 2) | (src >> 3);
+                let m = 0xC0 | ((dst & 7) << 3) | (src & 7);
+                assert_eq!(decode(&[0xF2, rex, 0x0F, 0x78, m, 0x50, 0x50]), Some((ConsoleOnly::Insertq { dst, src, reg: false, len: 0x50, idx: 0x50 }, 7)));
+                assert_eq!(decode(&[0xF2, rex, 0x0F, 0x79, m]), Some((ConsoleOnly::Insertq { dst, src, reg: true, len: 0, idx: 0 }, 5)));
+                assert_eq!(decode(&[0x66, rex, 0x0F, 0x79, m]), Some((ConsoleOnly::Extrq { dst, src: Some(src), len: 0, idx: 0 }, 5)));
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_extrq_immediate_fixed_extension_and_rex_b() {
+        for dst in 0..16u8 {
+            assert_eq!(decode(&[0x66, 0x40 | (dst >> 3), 0x0F, 0x78, 0xC0 | (dst & 7), 8, 16]), Some((ConsoleOnly::Extrq { dst, src: None, len: 8, idx: 16 }, 7)));
+        }
+        // Upstream follows the hardware's /0 check on ModRM; REX.R is irrelevant here.
+        assert_eq!(decode(&[0x66, 0x44, 0x0F, 0x78, 0xC0, 8, 16]), Some((ConsoleOnly::Extrq { dst: 0, src: None, len: 8, idx: 16 }, 7)));
+    }
+
+    #[test]
+    fn follows_upstream_hardware_verified_prefix_order() {
+        let expected = Some((ConsoleOnly::Insertq { dst: 0, src: 1, reg: false, len: 16, idx: 16 }, 7));
+        for code in [
+            [0x66, 0xF2, 0x0F, 0x78, 0xC1, 16, 16], [0xF2, 0x66, 0x0F, 0x78, 0xC1, 16, 16],
+            [0xF3, 0xF2, 0x0F, 0x78, 0xC1, 16, 16], [0x67, 0xF2, 0x0F, 0x78, 0xC1, 16, 16],
+            [0x41, 0xF2, 0x0F, 0x78, 0xC1, 16, 16],
+        ] { assert_eq!(decode(&code), expected, "{code:02x?}"); }
+        for code in [
+            [0xF2, 0xF3, 0x0F, 0x78, 0xC1, 16, 16], [0xF3, 0x66, 0x0F, 0x78, 0xC1, 16, 16],
+            [0x66, 0xF3, 0x0F, 0x78, 0xC0, 16, 16],
+        ] { assert_eq!(decode(&code), None, "#UD prefix order: {code:02x?}"); }
+    }
+
+    #[test]
+    fn rejects_truncation_memory_operands_and_non_sse4a_opcodes() {
+        let code = [0xF2, 0x0F, 0x78, 0xC1, 16, 16];
+        for n in 0..code.len() { assert_eq!(decode(&code[..n]), None); }
+        for bad in [
+            &[0xF2, 0x0F, 0x78, 0x01, 16, 16][..], &[0x66, 0x0F, 0x78, 0xC8, 16, 16][..],
+            &[0x0F, 0x78, 0xC1, 16, 16][..], &[0xF3, 0x0F, 0x78, 0xC1, 16, 16][..],
+            &[0xF2, 0x0F, 0x79, 0x01][..], &[0x66, 0x0F, 0x79, 0x01][..],
+        ] { assert_eq!(decode(bad), None, "{bad:02x?}"); }
+        let mut too_long = vec![0x66; 10];
+        too_long.extend_from_slice(&code);
+        assert_eq!(decode(&too_long), None, "an x86 instruction may not exceed 15 bytes");
+    }
+
+    #[test]
+    fn defined_fields_match_an_independent_bitwise_reference() {
+        let (dst, src) = (0xA5A5_89AB_CDEF_0123u64, 0xF0E1_D2C3_B4A5_9687u64);
+        for idx in 0..64u8 {
+            for width in 1..=64u8 - idx {
+                let mut expected = dst;
+                for bit in 0..width {
+                    let at = u32::from(idx + bit);
+                    expected = (expected & !(1u64 << at)) | (((src >> bit) & 1) << at);
+                }
+                let len = if width == 64 { 0 } else { width };
+                assert_eq!(insertq(dst, src, len, idx), expected);
+                let extracted = (0..width).fold(0u64, |v, bit| v | (((src >> (idx + bit)) & 1) << bit));
+                assert_eq!(extrq(src, len, idx), extracted);
+            }
+        }
+    }
+
+    #[test]
+    fn masks_controls_and_matches_upstream_undefined_field_policy() {
+        assert_eq!(insertq(u64::MAX, 0x1234, 0x50, 0x50), 0xFFFF_FFFF_1234_FFFF);
+        assert_eq!(extrq(0x1234_5678_9ABC_DEF0, 0x50, 0x50), 0x9ABC);
+        assert_eq!(insertq(0, u64::MAX, 0, 0), u64::MAX);
+        assert_eq!(extrq(u64::MAX, 0, 0), u64::MAX);
+        assert_eq!(insertq(0, u64::MAX, 0, 1), u64::MAX - 1);
+        assert_eq!(extrq(u64::MAX, 63, 2), u64::MAX >> 2);
+    }
 }
 
 #[cfg(test)]

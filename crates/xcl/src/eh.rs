@@ -280,6 +280,41 @@ unsafe fn emulate_clzero_loop(ctx: &mut windows_sys::Win32::System::Diagnostics:
     true
 }
 
+/// SSE4a from upstream 0cd0a53b and its Zen 5 correction af20b4b. Keep the OS context
+/// validity check: the saved SSE registers live in FltSave, not CONTEXT.VectorRegister.
+unsafe fn emulate_sse4a(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, instruction: crate::insn::ConsoleOnly) -> bool {
+    use crate::insn::ConsoleOnly;
+    use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_FLOATING_POINT_AMD64;
+    if ctx.ContextFlags & CONTEXT_FLOATING_POINT_AMD64 != CONTEXT_FLOATING_POINT_AMD64 { return false; }
+    let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+    let (dst, low) = match instruction {
+        ConsoleOnly::Extrq { dst, src, len, idx } => {
+            let Some(d) = x.get(dst as usize) else { return false };
+            let (len, idx) = match src {
+                Some(s) => {
+                    let Some(s) = x.get(s as usize) else { return false };
+                    (s.Low as u8, (s.Low >> 8) as u8)
+                }
+                None => (len, idx),
+            };
+            (dst, crate::insn::extrq(d.Low, len, idx))
+        }
+        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+            let (Some(d), Some(s)) = (x.get(dst as usize), x.get(src as usize)) else { return false };
+            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            (dst, crate::insn::insertq(d.Low, s.Low, len, idx))
+        }
+        _ => return false,
+    };
+    x[dst as usize].Low = low;
+    // AMD documents this half as undefined. Upstream's Zen 5 hardware comparison of
+    // 32,779 cases found zero, so retain that observed console-family behavior.
+    x[dst as usize].High = 0;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("SSE4a: emulated INSERTQ/EXTRQ using saved XMM state (upstream 0cd0a53b, af20b4b)"));
+    true
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
@@ -335,6 +370,9 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15,
             ];
             *regs[r as usize & 15] = cpu;
+        }
+        ConsoleOnly::Extrq { .. } | ConsoleOnly::Insertq { .. } => {
+            if !emulate_sse4a(ctx, what) { return 0; }
         }
     }
     ctx.Rip += len as u64;
@@ -855,6 +893,86 @@ pub fn start_probes() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
+}
+
+#[cfg(test)]
+mod sse4a_tests {
+    use super::*;
+    use crate::insn::ConsoleOnly;
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_FLOATING_POINT_AMD64};
+
+    #[test]
+    fn immediate_forms_change_only_destination_xmm_and_keep_flags() {
+        unsafe {
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
+            ctx.EFlags = 0xCD7;
+            ctx.MxCsr = 0x1F80;
+            ctx.Rax = 0x1234;
+            for (i, x) in ctx.Anonymous.FltSave.XmmRegisters.iter_mut().enumerate() {
+                x.Low = 0xA5A5_5555_0000_0000 | i as u64;
+                x.High = (0x1234_5678_0000_0000 | i as u64) as i64;
+            }
+            ctx.Anonymous.FltSave.XmmRegisters[9].Low = 0xFEED_BEEF_1234_5678;
+            let before = ctx;
+            assert!(emulate_sse4a(&mut ctx, ConsoleOnly::Insertq { dst: 8, src: 9, reg: false, len: 16, idx: 16 }));
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].Low, 0xA5A5_5555_5678_0008);
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].High, 0);
+            for i in 0..16 {
+                if i != 8 {
+                    assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[i].Low, before.Anonymous.FltSave.XmmRegisters[i].Low);
+                    assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[i].High, before.Anonymous.FltSave.XmmRegisters[i].High);
+                }
+            }
+            assert_eq!((ctx.ContextFlags, ctx.EFlags, ctx.MxCsr, ctx.Rax), (before.ContextFlags, before.EFlags, before.MxCsr, before.Rax));
+            assert!(emulate_sse4a(&mut ctx, ConsoleOnly::Extrq { dst: 8, src: None, len: 16, idx: 16 }));
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].Low, 0x5678);
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].High, 0);
+            assert_eq!(ctx.EFlags, before.EFlags);
+        }
+    }
+
+    #[test]
+    fn register_control_forms_read_the_correct_half_before_destination_write() {
+        unsafe {
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
+            ctx.Anonymous.FltSave.XmmRegisters[8].Low = 0x1122_3344_5566_7788;
+            ctx.Anonymous.FltSave.XmmRegisters[9].Low = 0xFEDC_BA98_7654_3210;
+            ctx.Anonymous.FltSave.XmmRegisters[9].High = 0x5A5A_0000_0000_1010;
+            let source = ctx.Anonymous.FltSave.XmmRegisters[9];
+            assert!(emulate_sse4a(&mut ctx, ConsoleOnly::Insertq { dst: 8, src: 9, reg: true, len: 0, idx: 0 }));
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].Low, 0x1122_3344_3210_7788);
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[9].Low, source.Low);
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[9].High, source.High);
+            // Source and destination may alias. Controls must be read before high is zeroed.
+            ctx.Anonymous.FltSave.XmmRegisters[8].Low = 0x1122_3344_5566_7788;
+            ctx.Anonymous.FltSave.XmmRegisters[8].High = 0x1010;
+            assert!(emulate_sse4a(&mut ctx, ConsoleOnly::Insertq { dst: 8, src: 8, reg: true, len: 0, idx: 0 }));
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].Low, 0x1122_3344_7788_7788);
+            ctx.Anonymous.FltSave.XmmRegisters[9].Low = 0xFFFF_FFFF_FFFF_1010;
+            assert!(emulate_sse4a(&mut ctx, ConsoleOnly::Extrq { dst: 8, src: Some(9), len: 0, idx: 0 }));
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[8].Low, 0x7788);
+        }
+    }
+
+    #[test]
+    fn declines_missing_float_context_and_invalid_register_indices() {
+        unsafe {
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Anonymous.FltSave.XmmRegisters[0].Low = 0x1234;
+            let op = ConsoleOnly::Insertq { dst: 0, src: 1, reg: false, len: 16, idx: 16 };
+            assert!(!emulate_sse4a(&mut ctx, op));
+            ctx.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
+            for op in [
+                ConsoleOnly::Insertq { dst: 16, src: 0, reg: false, len: 1, idx: 0 },
+                ConsoleOnly::Insertq { dst: 0, src: 16, reg: true, len: 0, idx: 0 },
+                ConsoleOnly::Extrq { dst: 16, src: None, len: 1, idx: 0 },
+                ConsoleOnly::Extrq { dst: 0, src: Some(16), len: 0, idx: 0 },
+            ] { assert!(!emulate_sse4a(&mut ctx, op)); }
+            assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[0].Low, 0x1234);
+        }
+    }
 }
 
 #[cfg(test)]
