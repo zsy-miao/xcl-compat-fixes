@@ -60,9 +60,14 @@ fn committed_texture_address_survives_the_retail_clear_and_is_freed() {
         let raw = resource.as_raw();
         let key = raw as usize;
         adopt(raw, Kind::Resource);
-        let address = resource.GetGPUVirtualAddress() as usize;
+        // The adopted slot distinguishes title code from PC/runtime callers. This test is
+        // host code, so its normal COM call must retain the PC answer; invoke the console
+        // target directly with the genuine resource to exercise the title's path.
+        assert_eq!(resource.GetGPUVirtualAddress(), 0, "host calls must keep the native PC address");
+        let address = res_gpu_va_x(raw) as usize;
         assert_ne!(address, 0);
-        assert_eq!(resource.GetGPUVirtualAddress() as usize, address, "the fallback address must be stable");
+        assert_eq!(res_gpu_va_x(raw) as usize, address, "the console fallback address must be stable");
+        assert_eq!(resource.GetGPUVirtualAddress(), 0, "the fallback must not change PC/runtime calls");
         assert_eq!(title_address(key), Some(address));
         assert_eq!(TEXTURE_MEMORY.lock().unwrap().as_ref().unwrap().get(&key), Some(&address));
         // Exact operation that crashed the retail executable: memset(address, 0, 256*256*4).
