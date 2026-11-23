@@ -396,6 +396,64 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
+        let lay = &self.layout;
+        let e = 1usize << lay.elem_log2;
+        // Per-row/block optimization by gw1337x, PR #283 comment 7116115692.
+        // a level in the mip tail starts inside a block: element by element (small levels)
+        // Noncanonical XORs also retain the old checked reads: they can cross a block
+        // or end an element past its last byte even when the block itself is present.
+        if l.origin != (0, 0) || lay.base_xor >= lay.block_bytes || lay.base_xor & (e - 1) != 0 {
+            return self.detile_level_slow(src, i, slice);
+        }
+        let (w, h) = (l.width, l.height);
+        let mut out = vec![0u8; w * h * e];
+        let (bw, bh, bd) = (lay.block_w, lay.block_h, lay.block_d);
+        let pitch_blocks = l.pitch.div_ceil(bw);
+        let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        // linear: each row is contiguous (blocks of 256 B one row high, side by side)
+        if lay.mode == 0 && lay.base_xor == 0 {
+            let row = w * e;
+            for y in 0..h {
+                let o = l.offset + y * pitch_blocks * lay.block_bytes;
+                if o < src.len() {
+                    let n = row.min((src.len() - o) / e * e);
+                    out[y * row..y * row + n].copy_from_slice(&src[o..o + n]);
+                }
+            }
+            return out;
+        }
+        // tiled: what the row and the block give, once per row and per block (`offset_z`)
+        let z = lay.oz[slice % bd] ^ hi(&lay.hz, slice, bd);
+        for y in 0..h {
+            let yo = lay.oy[y % bh] ^ hi(&lay.hy, y, bh) ^ z;
+            let row_base = l.offset + (y / bh) * pitch_blocks * lay.block_bytes;
+            for bx in 0..w.div_ceil(bw) {
+                let bo = yo ^ lay.hx[bx % lay.hx.len()];
+                let base = row_base + bx * lay.block_bytes;
+                let x0 = bx * bw;
+                let n = bw.min(w - x0);
+                let d0 = (y * w + x0) * e;
+                if base + lay.block_bytes <= src.len() {
+                    for xi in 0..n {
+                        let o = base + ((lay.ox[xi] ^ bo) as usize ^ lay.base_xor);
+                        out[d0 + xi * e..d0 + xi * e + e].copy_from_slice(&src[o..o + e]);
+                    }
+                } else {
+                    for xi in 0..n {
+                        let o = base + ((lay.ox[xi] ^ bo) as usize ^ lay.base_xor);
+                        if let Some(s) = src.get(o..o + e) {
+                            out[d0 + xi * e..d0 + xi * e + e].copy_from_slice(s);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `detile_level` element by element (`element_at` for each)
+    fn detile_level_slow(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
+        let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
         for y in 0..l.height {
@@ -485,6 +543,63 @@ mod tests {
         ] {
             let c = Chain::new(Layout::new(mode, e, cfg).unwrap(), w, h, side, mips);
             assert_eq!(c.slice_bytes, bytes, "{w}x{h} e{e} mode {mode} mips {mips}");
+        }
+    }
+
+    /// The fast `detile_level` (per row and per block) gives what the element-by-element one
+    /// gives: every mode, element size and pipe configuration, levels in and out of the tail,
+    /// array slices, a base swizzle, and a source cut short.
+    /// Original differential test by gw1337x (PR #283 comment 7116115692), extended
+    /// with zero/noncanonical XORs and cuts inside individual elements and rows.
+    #[test]
+    fn fast_detile_matches_element_by_element() {
+        let mut modes = vec![0u32];
+        modes.extend(MODES);
+        for mode in modes {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let Some(lay) = Layout::new(mode, e, cfg) else { continue };
+                    let aligned = (0x5a5 << e) & (lay.block_bytes - 1) & !((1 << e) - 1);
+                    let mut xors = vec![0, aligned, aligned | 1, lay.block_bytes + (1 << e)];
+                    xors.sort_unstable();
+                    xors.dedup();
+                    for base_xor in xors {
+                        let mut layout = lay.clone();
+                        layout.base_xor = base_xor;
+                        let c = Chain::new(layout, 70, 37, 1, 4);
+                        let mut src = vec![0u8; c.slice_bytes * 2];
+                        for (k, b) in src.iter_mut().enumerate() {
+                            *b = (k as u32).wrapping_mul(2654435761).rotate_right(13) as u8;
+                        }
+                        let mut cuts = vec![0, 1, (1 << e) - 1, 1 << e, (1 << e) + 1, c.slice_bytes / 3, c.slice_bytes - 1, src.len() - 1];
+                        cuts.sort_unstable();
+                        cuts.dedup();
+                        for i in 0..c.levels.len() {
+                            for slice in 0..2 {
+                                assert_eq!(c.detile_level(&src, i, slice), c.detile_level_slow(&src, i, slice), "mode {mode} e {e} {cfg:?} xor {base_xor:#x} level {i} slice {slice}");
+                            }
+                            for &cut in &cuts {
+                                let short = &src[..cut];
+                                assert_eq!(c.detile_level(short, i, 0), c.detile_level_slow(short, i, 0), "mode {mode} e {e} {cfg:?} xor {base_xor:#x} level {i}, cut {cut}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linear_detile_truncated_element_is_entirely_zero() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        for log2 in 1..=4 {
+            let e = 1usize << log2;
+            let c = Chain::new(Layout::new(0, log2, cfg).unwrap(), 3, 2, 1, 1);
+            let partial = c.element_at(&c.levels[0], 1, 1, 0) + e - 1;
+            let src = vec![0xA5; partial];
+            let mut expected = vec![0xA5; 4 * e]; // first row and the first element of row two
+            expected.resize(6 * e, 0);
+            assert_eq!(c.detile_level(&src, 0, 0), expected, "log2 {log2}: partial elements must not leak prefix bytes");
         }
     }
 
