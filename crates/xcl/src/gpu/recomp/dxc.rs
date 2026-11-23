@@ -203,10 +203,48 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    if URGENT.with(|u| u.get()) {
+        return compile_now(src, entry, profile, extra);
+    }
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
+}
+
+thread_local! {
+    /// inside `urgent`
+    static URGENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with its DXC compiles done at once, on a thread of their own: not queued behind the
+/// background pipelines on the workers, not held by `wait_for_memory`. For a title thread that
+/// waits in its pipeline creation (no stand-in): GTA VI's watchdog kills the game when one of
+/// its threads stays silent ~30 s, and with commit short most workers sat in `wait_for_memory`
+/// holding queued jobs while five title threads waited behind them.
+pub fn urgent<R>(f: impl FnOnce() -> R) -> R {
+    let prev = URGENT.with(|u| u.replace(true));
+    let r = f();
+    URGENT.with(|u| u.set(prev));
+    r
+}
+
+/// `compile` on a fresh `DXC_STACK` thread, waited for (counted in `WORKING`, so the workers'
+/// `wait_for_memory` sees it).
+fn compile_now(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    WORKING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _slot = MemorySlot;
+    std::thread::scope(|s| {
+        let t = std::thread::Builder::new()
+            .name("xcl-dxc-urgent".into())
+            .stack_size(DXC_STACK)
+            .spawn_scoped(s, || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(src, entry, profile, extra)))
+                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()))
+            })
+            .map_err(|e| format!("DXC: cannot start a compile thread: {e}"))?;
+        t.join().unwrap_or_else(|_| Err("DXC: the compile thread panicked".into()))
+    })
 }
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {

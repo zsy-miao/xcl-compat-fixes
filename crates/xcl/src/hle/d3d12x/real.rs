@@ -3443,6 +3443,9 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.StreamOutput = std::mem::zeroed();
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // the console's topology types (rect list 19, none) are not the PC's: the driver refused
+    // GTA VI's stand-ins (0x80070057) and the title waited in the call for its compiles
+    pc_topology_type(&mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
@@ -3480,20 +3483,58 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    super::pso_async::submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    let job: super::pso_async::Job = Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            out as usize
+        } else {
+            0
+        }
+    });
+    if LAZY_NEXT.with(|l| l.replace(false)) {
+        super::pso_async::submit_lazy(*ppv as usize, compute, job);
+    } else {
+        super::pso_async::submit(*ppv as usize, compute, job);
+    }
     Some(hr)
 }
+
+thread_local! {
+    /// the next `go_background` builds at the pipeline's first use (`go_lazy`)
+    static LAZY_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `go_background` with the build left for the stand-in's first use (`pso_async::lazy`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn go_lazy(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+    compute: bool,
+    owned: OwnedDesc,
+    standin: unsafe fn(*mut c_void, PsoFn, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
+) -> Option<HRESULT> {
+    LAZY_NEXT.with(|l| l.set(true));
+    let r = go_background(this, f, desc, riid, ppv, compute, owned, standin, build);
+    LAZY_NEXT.with(|l| l.set(false));
+    r
+}
+
+/// The title's graphics pipeline has console shaders (what `go_lazy` defers). Compute pipelines
+/// are not deferred: with GTA VI's built at their first dispatch the device was removed (an
+/// invalid call, ~20 s in); there are far fewer of them and their first bind waits anyway.
+unsafe fn console_graphics(desc: *const c_void) -> bool {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return false;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    shader_bytes(&d.VS).is_some_and(is_console) && shader_bytes(&d.HS).is_none() && shader_bytes(&d.DS).is_none() && shader_bytes(&d.GS).is_none()
+}
+
 
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
@@ -3513,12 +3554,18 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    if super::pso_async::lazy() && console_graphics(desc) {
+        if let Some(hr) = own_graphics(desc).and_then(|o| go_lazy(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
+            return hr;
+        }
+    }
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
             return hr;
         }
-        if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
+        // no stand-in: the title waits in this call – its compiles go first
+        if let Some(hr) = crate::gpu::recomp::dxc::urgent(|| translated_graphics_pso(this, f, desc, riid, ppv)) {
             return hr;
         }
     } else if let Some(hr) = translated {
@@ -3568,7 +3615,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             LAST_COMPUTE_RS.with(|c| c.set(0));
             return hr;
         }
-        console = translated_compute_pso(this, f, desc, riid, ppv);
+        console = crate::gpu::recomp::dxc::urgent(|| translated_compute_pso(this, f, desc, riid, ppv));
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
@@ -4182,7 +4229,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, build_stream)) {
             return hr;
         }
-        if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {
+        if let Some(hr) = crate::gpu::recomp::dxc::urgent(|| translated_mesh_stream(this, desc, riid, ppv)) {
             return hr;
         }
     } else if let Some(hr) = translated {
