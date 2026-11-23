@@ -204,6 +204,7 @@ try {
         }
     }
     Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--test', 'disasm_e2e', '--test', 'e2e', '--test', 'rpf_e2e', '--test', 'gpu_compute_e2e', '--', '--test-threads=1', '--nocapture') -CountTests
+    Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--test', 'bcpack_controls', 'independent_synthetic_corpus', '--', '--nocapture') -CountTests
     if ($branch -eq $patchBranch) {
         try {
             $env:XCL_LAZY_COMPUTE = '1'
@@ -296,7 +297,7 @@ try {
             scope = 'SSE4a immediate/register INSERTQ and EXTRQ, including hardware-verified prefix behavior and upper-quadword results. Local floating-point context validation and the prior CLZERO batching remain; unrelated CPU hot-patching is not imported.'
         }
         $info.test_suites = @('console_depth_buffers_become_pc_ones', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'console_mesh_streams_become_pc_ones', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
-        $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests') + $info.test_suites
+        $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
         $patchNote += "`r`nIncludes PR #163 depth fixes ($pr163Revision) and PR #170 mesh pipeline fixes ($pr170Revision)."
         $patchNote += "`r`nIncludes PR #192 texture tiling ($pr192Revision) and PR #195 graphics changes ($pr195Revision)."
         $patchNote += "`r`nIncludes PR #162 first-use pipelines ($pr162Revision); compute first-use is disabled by default and can be enabled per title with lazy_compute_pipelines. XCL_LAZY_COMPUTE overrides that setting."

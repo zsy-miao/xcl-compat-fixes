@@ -42,3 +42,21 @@ Ongoing source commits are pushed to `work-in-progress`. `main` advances after
 the required checks pass. Game captures, dumps, game assets, binaries and
 credentials are excluded. The separate helper retains its own license and
 source provenance. A passing synthetic check is not a claim of working gameplay.
+
+## Measured game trial, 2026-11-23
+
+The offline trial of program revision `a767d51c8b5daddc661e63062b0a3d76d9c71598`
+ran for 332.81 seconds, ended at the requested timer with exit code 0, and recorded
+no crash. It showed 479 frames with no reported pipeline/compiler failures. The
+frontend remains partial; navigation and gameplay are not confirmed.
+
+Twenty unique BC7 packets were captured locally: eleven requested 65,536 output
+bytes, and nine requested 262,144. All twenty passed independent native/reference
+entropy comparison, complete input consumption, and strict external reconstruction
+with zero missing, invalid or normalized blocks. Fitted output remains provisional.
+The capture data and decoded game bytes are excluded from the repositories.
+
+A later `CopyMemoryToMemoryX` request was refused because its CPU-mirrored source
+lies outside UMA. Its role in the remaining stall is unproven. Supporting that
+path requires correctly ordered GPU staging; it should not be replaced by an
+immediate CPU copy. See [contributor findings](CONTRIBUTOR-FINDINGS.md).
