@@ -280,6 +280,22 @@ unsafe fn emulate_clzero_loop(ctx: &mut windows_sys::Win32::System::Diagnostics:
     true
 }
 
+/// The captured retail CLWB loops at +0x532f1b0 / +0x532f1f0 / +0x532f230.
+/// Upstream b25582a removes the same exception overhead by patching live code;
+/// keep our single-CLWB no-op semantics and leave every instruction byte intact.
+unsafe fn emulate_clwb_loop(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, code: &[u8]) -> bool {
+    if ctx.EFlags & 0x100 != 0 || !crate::insn::clwb_loop(code) { return false; }
+    let Some(batch) = crate::insn::clwb_batch(ctx.Rax as usize, ctx.Rcx as usize) else { return false };
+    let Some(compare_rip) = ctx.Rip.checked_add(8) else { return false };
+    ctx.Rax = batch.next_rax as u64;
+    ctx.Rip = compare_rip;
+    // CMP overwrites the ADD's arithmetic flags before anything can observe them.
+    // Leave the saved flags unchanged until that original CMP executes.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("CLWB: batched no-op cache-flush loop ({} iterations); native comparison follows", batch.iterations));
+    true
+}
+
 /// SSE4a from upstream 0cd0a53b and its Zen 5 correction af20b4b. Keep the OS context
 /// validity check: the saved SSE registers live in FltSave, not CONTEXT.VectorRegister.
 unsafe fn emulate_sse4a(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, instruction: crate::insn::ConsoleOnly) -> bool {
@@ -343,7 +359,10 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     }
     match what {
         ConsoleOnly::Ud2 => return 0,
-        ConsoleOnly::Clwb | ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
+        ConsoleOnly::Clwb => {
+            if emulate_clwb_loop(ctx, code) { return -1; }
+        }
+        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
         ConsoleOnly::Clzero => {
             if emulate_clzero_loop(ctx, code) {
                 return -1;
@@ -971,6 +990,123 @@ mod sse4a_tests {
                 ConsoleOnly::Extrq { dst: 0, src: Some(16), len: 0, idx: 0 },
             ] { assert!(!emulate_sse4a(&mut ctx, op)); }
             assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[0].Low, 0x1234);
+        }
+    }
+}
+
+#[cfg(test)]
+mod clwb_batch_tests {
+    use super::*;
+    use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+
+    const LOOP: [u8; 13] = [0x66, 0x0F, 0xAE, 0x30, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x3B, 0xC1, 0x76, 0xF3];
+    const ARITHMETIC_FLAGS: u64 = 0x8D5; // CF/PF/AF/ZF/SF/OF, all overwritten by CMP.
+
+    fn test_code() -> usize {
+        static CODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CODE.get_or_init(|| {
+            let mut bytes = [0x90u8; 16];
+            bytes[..LOOP.len()].copy_from_slice(&LOOP);
+            // The mapped-module registry lives for the process: retain its tiny
+            // synthetic code allocation for exactly that lifetime too.
+            let code = Box::leak(Box::new(bytes)).as_ptr() as usize;
+            modules::register_mapped(std::sync::Arc::new(modules::MappedModule {
+                name: "clwb_batch_test.dll".into(), path: "clwb_batch_test.dll".into(),
+                base: code, size: 16, entry_rva: 0, is_dll: true, exports: Default::default(),
+                tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: std::sync::atomic::AtomicBool::new(false),
+                initialized: std::sync::atomic::AtomicBool::new(true), stack_reserve: 0,
+            }));
+            code
+        })
+    }
+
+    unsafe fn native_cmp_flags(left: u64, right: u64) -> u64 {
+        let flags: u64;
+        std::arch::asm!("cmp {left}, {right}", "pushfq", "pop {flags}",
+            left = in(reg) left, right = in(reg) right, flags = lateout(reg) flags);
+        flags & ARITHMETIC_FLAGS
+    }
+
+    unsafe fn scalar_noop_loop(start: u64, bound: u64) -> (u64, u64) {
+        let next: u64;
+        let flags: u64;
+        // The existing single-CLWB handler is a no-op. Execute the original ADD,
+        // CMP and inclusive JBE on the CPU as an independent arithmetic reference.
+        std::arch::asm!("2:", "add rax, 64", "cmp rax, rcx", "jbe 2b", "pushfq", "pop {flags}",
+            inout("rax") start => next, in("rcx") bound, flags = lateout(reg) flags);
+        (next, flags & ARITHMETIC_FLAGS)
+    }
+
+    #[test]
+    fn saved_context_reaches_native_compare_with_scalar_registers_and_flags() {
+        let code = test_code();
+        for (start, bound) in [(0x1000u64, 0), (0x1000, 0x1000), (0x1000, 0x1040), (0x1051, 0x1102)] {
+            unsafe {
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                ctx.Rip = code as u64;
+                ctx.Rax = start;
+                ctx.Rcx = bound;
+                ctx.Rdx = 0x1234_5678;
+                ctx.Rbx = 0x8765_4321;
+                ctx.Rsp = 0x5678_1234;
+                ctx.EFlags = 0x202;
+                let (expected, flags) = scalar_noop_loop(start, bound);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!((ctx.Rip, ctx.Rax, ctx.Rcx), ((code + 8) as u64, expected, bound));
+                assert_eq!((ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.EFlags), (0x1234_5678, 0x8765_4321, 0x5678_1234, 0x202));
+                assert_eq!(native_cmp_flags(ctx.Rax, ctx.Rcx), flags);
+                assert_eq!(std::slice::from_raw_parts(code as *const u8, LOOP.len()), &LOOP,
+                    "acceleration must not patch the title's instruction bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn equality_at_the_chunk_limit_runs_the_remaining_iteration() {
+        unsafe {
+            let code = test_code();
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Rip = code as u64;
+            ctx.Rcx = 64 << 20;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax), ((code + 8) as u64, ctx.Rcx));
+            assert_ne!(native_cmp_flags(ctx.Rax, ctx.Rcx) & 0x40, 0, "native CMP sets ZF, so JBE takes its backedge");
+            ctx.Rip = code as u64; // the original JBE returns to the CLWB
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            let (expected, flags) = scalar_noop_loop(0, ctx.Rcx);
+            assert_eq!(ctx.Rax, expected);
+            assert_eq!(native_cmp_flags(ctx.Rax, ctx.Rcx), flags);
+        }
+    }
+
+    #[test]
+    fn stepping_unknown_loops_and_overflow_keep_single_instruction_semantics() {
+        unsafe {
+            let code = test_code();
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Rip = code as u64;
+            ctx.Rax = 0x1000;
+            ctx.Rcx = 0x2000;
+            ctx.EFlags = 0x302; // TF: let the debugger observe every ADD/backedge.
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax, ctx.Rcx, ctx.EFlags), ((code + 4) as u64, 0x1000, 0x2000, 0x302));
+
+            ctx.Rip = code as u64;
+            ctx.Rax = u64::MAX - 63;
+            ctx.Rcx = u64::MAX;
+            ctx.EFlags = 0x202;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax, ctx.EFlags), ((code + 4) as u64, u64::MAX - 63, 0x202));
+
+            ctx.Rip = code as u64;
+            ctx.Rax = 0x1000;
+            let mut changed = LOOP;
+            changed[11] = 0x72; // strict JB is a different loop
+            assert!(!emulate_clwb_loop(&mut ctx, &changed));
+            assert_eq!((ctx.Rip, ctx.Rax), (code as u64, 0x1000));
+            ctx.Rip = u64::MAX - 7;
+            assert!(!emulate_clwb_loop(&mut ctx, &LOOP));
+            assert_eq!((ctx.Rip, ctx.Rax), (u64::MAX - 7, 0x1000));
         }
     }
 }

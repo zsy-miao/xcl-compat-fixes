@@ -185,9 +185,97 @@ pub fn clzero_batch(start: usize, bound: usize) -> Option<ClzeroBatch> {
     Some(ClzeroBatch { address, bytes, next_rax })
 }
 
+/// The observed `clwb [rax]; add rax,64; cmp rax,rcx; jbe clwb` loop.
+/// Unlike upstream b25582a's CLWB NOP patch, this leaves the title's code intact.
+/// Both encodings below compare RAX with RCX; prefixes, operands and backedge
+/// must otherwise match exactly before any native arithmetic is skipped.
+pub fn clwb_loop(code: &[u8]) -> bool {
+    let Some(b) = code.get(..13) else { return false };
+    b[..8] == [0x66, 0x0F, 0xAE, 0x30, 0x48, 0x83, 0xC0, 0x40]
+        && (b[8..11] == [0x48, 0x39, 0xC8] || b[8..11] == [0x48, 0x3B, 0xC1])
+        && b[11..13] == [0x76, 0xF3]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClwbBatch {
+    pub iterations: usize,
+    /// RAX at the following native CMP after the emulated ADDs, without wrapping.
+    pub next_rax: usize,
+}
+
+/// CLWB is already a no-op in our coherent host-memory emulation. Skip only
+/// bounded repetitions of that same operation and its ADD, then run CMP/JBE
+/// natively. JBE includes equality: reaching the bound requires another iteration.
+/// Declining a wrapping advance leaves the original ADD/branch to handle it.
+pub fn clwb_batch(start: usize, bound: usize) -> Option<ClwbBatch> {
+    const MAX_LINES: usize = 1 << 20; // at most 64 MiB of address advancement
+    let iterations = (bound.saturating_sub(start) / 64 + 1).min(MAX_LINES);
+    let next_rax = start.checked_add(iterations.checked_mul(64)?)?;
+    Some(ClwbBatch { iterations, next_rax })
+}
+
 /// `code` as hex, for a log line.
 pub fn hex(code: &[u8]) -> String {
     code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod clwb_batch_tests {
+    use super::*;
+
+    const LOOP: [u8; 13] = [0x66, 0x0F, 0xAE, 0x30, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x3B, 0xC1, 0x76, 0xF3];
+
+    #[test]
+    fn accepts_only_the_observed_loop_and_equivalent_compare_encoding() {
+        assert!(clwb_loop(&LOOP));
+        let mut other = LOOP;
+        other[9..11].copy_from_slice(&[0x39, 0xC8]);
+        assert!(clwb_loop(&other));
+        for n in 0..LOOP.len() { assert!(!clwb_loop(&LOOP[..n])); }
+        for i in 0..LOOP.len() {
+            let mut changed = LOOP;
+            changed[i] ^= 1;
+            assert!(!clwb_loop(&changed), "changed byte {i}");
+        }
+        // A different effective address, increment, bound, strict branch or prefix
+        // must keep using the normal single-instruction path.
+        for (i, value) in [(3, 0x31), (7, 0x20), (10, 0xC2), (11, 0x72), (0, 0x67)] {
+            let mut changed = LOOP;
+            changed[i] = value;
+            assert!(!clwb_loop(&changed));
+        }
+    }
+
+    #[test]
+    fn inclusive_bound_and_one_iteration_match_a_scalar_noop_loop() {
+        for start in [0usize, 1, 0x1000, 0x1051] {
+            for distance in 0..257usize {
+                let bound = start + distance;
+                let mut scalar = start;
+                let mut iterations = 0;
+                loop {
+                    scalar += 64;
+                    iterations += 1;
+                    if scalar > bound { break; }
+                }
+                assert_eq!(clwb_batch(start, bound), Some(ClwbBatch { iterations, next_rax: scalar }));
+            }
+        }
+        assert_eq!(clwb_batch(0x1000, 0x1040), Some(ClwbBatch { iterations: 2, next_rax: 0x1080 }));
+        assert_eq!(clwb_batch(0x1000, 0x1000), Some(ClwbBatch { iterations: 1, next_rax: 0x1040 }));
+        assert_eq!(clwb_batch(0x1000, 0), Some(ClwbBatch { iterations: 1, next_rax: 0x1040 }));
+    }
+
+    #[test]
+    fn bounds_each_chunk_and_declines_wrapping_adds() {
+        let batch = clwb_batch(0x1000, usize::MAX).unwrap();
+        assert_eq!(batch.iterations, 1 << 20);
+        assert_eq!(batch.next_rax - 0x1000, 64 << 20);
+        assert!(batch.next_rax < usize::MAX, "the native JBE continues at a chunk boundary");
+        assert_eq!(clwb_batch(usize::MAX - 63, usize::MAX), None);
+        assert_eq!(clwb_batch(usize::MAX, 0), None);
+        assert_eq!(clwb_batch(usize::MAX - 64, 0), Some(ClwbBatch { iterations: 1, next_rax: usize::MAX }));
+    }
 }
 
 #[cfg(test)]
