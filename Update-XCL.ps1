@@ -187,7 +187,8 @@ try {
     if ($branch -eq $patchBranch) {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'clzero_batch', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'sse4a', '--', '--test-threads=1', '--nocapture') -CountTests
-        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'dstorage', '--', '--test-threads=1', '--nocapture') -CountTests
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'dstorage', '--', '--test-threads=1', '--nocapture', '--skip', 'external_pipe_parent', '--skip', 'external_pipe_descendant') -CountTests
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::d3d12x::title_textures::mirror_tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_depth_buffers_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'real::depth_regression_tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', '--', '--test-threads=1', '--nocapture') -CountTests
@@ -259,6 +260,10 @@ try {
             name = 'sse4a_emulation'
             files = @('crates/xcl/src/eh.rs', 'crates/xcl/src/insn.rs')
             scope = 'Use community SSE4a bit-field instruction emulation with saved XMM state validation and bounds checks; preserve the existing local CLZERO batching and other CPU handlers.'
+        }, [ordered]@{
+            name = 'bounded_bcpack_bc7'
+            files = @('crates/xcl/src/hle/bcpack.rs', 'crates/xcl/src/hle/bcpack_bc7_general.rs', 'crates/xcl/src/hle/dstorage_bcpack.rs', 'crates/xcl/src/hle/dstorage.rs')
+            scope = 'MIT entropy and independently reconstructed BC7 modes; unsupported initial/cross-mode prediction refuses atomically. XCL_BCPACK_EXTERNAL_DECODER enables a separate bounded research process for fitted history, with strict diagnostics, exact block sizes and a deadline covering inherited pipes. Fitted output is provisional; the external program is not included in the portable archive.'
         })
         $info.applied_patches += @(
             [ordered]@{ pull_request = 162; url = 'https://github.com/ivall/xcl/pull/162'; source_revision = $pr162Revision; scope = 'Graphics pipelines compile at first use with urgent compilation; compute first-use compilation is opt-in per title via lazy_compute_pipelines or XCL_LAZY_COMPUTE.' },
@@ -273,7 +278,9 @@ try {
         )
         $info.applied_patches += @(
             [ordered]@{ pull_request = 225; url = 'https://github.com/ivall/xcl/pull/225'; source_revision = '327c24c98ea883f9fa586d647b5898e073ca6d34'; scope = 'Fallback texture arenas use aligned resource sizes and retire unused backing; existing shared target pages are retained.' },
-            [ordered]@{ pull_request = 230; url = 'https://github.com/ivall/xcl/pull/230'; source_revision = 'b85602215a2f616f734187504d30279e4c249df4'; scope = 'Aligned sparse tile hash distribution and its bucket regression only; PR #203 sparse-page behavior retained.' }
+            [ordered]@{ pull_request = 230; url = 'https://github.com/ivall/xcl/pull/230'; source_revision = 'b85602215a2f616f734187504d30279e4c249df4'; scope = 'Aligned sparse tile hash distribution and its bucket regression only; PR #203 sparse-page behavior retained.' },
+            [ordered]@{ pull_request = 252; url = 'https://github.com/ivall/xcl/pull/252'; source_revision = '862a0d488d6ba1e7b3ffcfb10f8419251df2648b'; scope = 'Write-watch GPU-visible Windows fallback reservations; forced-fallback regression covers all three flag combinations.' },
+            [ordered]@{ pull_request = 283; url = 'https://github.com/ivall/xcl/pull/283'; source_revision = '94bfcf00332e3270611067cc242bf186074d3e3b'; scope = 'Pair GPU-only reservations with CPU views; watch and upload from the CPU source while preserving GPU title addresses. Local Entry.state and lazy mappings retained. Includes actual GPU readback and CPU rewrite regression.' }
         )
         $info.upstream_integrations = @([ordered]@{
             source_commit = $textureAllocatorRevision
