@@ -3808,10 +3808,42 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// Refuse console mesh layouts whose meaning is still unknown. In particular the retail
+/// title's MS in the AS slot must be checked before `pc_stream_types` renumbers it: upstream
+/// 38b05b7 found that accepting that layout kept the title rendering black frames.
+unsafe fn unsupported_console_mesh_stream(desc: *const c_void) -> Option<String> {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return None;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return None;
+    }
+    let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
+    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1))?;
+    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+    if ms_slot.is_none() && is_console(as_slot) && crate::gpu::xbox::parse(as_slot).is_some_and(|sh| sh.stage == "MS") {
+        return Some(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(as_slot)));
+    }
+    if let Some(ms) = ms_slot.filter(|ms| is_console(ms)) {
+        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        return Some(format!(
+            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
+            crate::gpu::shader::fnv64(as_slot), crate::gpu::shader::fnv64(ms)
+        ));
+    }
+    None
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_mesh, is_console};
+    if let Some(reason) = unsupported_console_mesh_stream(desc) {
+        note_translation_error(reason);
+        return Some(E_INVALIDARG);
+    }
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
     }
@@ -3823,28 +3855,6 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     let ms = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1))?;
     if !is_console(ms) {
         return None;
-    }
-    if let Some(a) = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1)) {
-        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
-        // Refused, the title got no pipeline and wrote to address 0 a moment later (a retail
-        // title, ~3 minutes in, five such pipelines). Its shader pack has no amplification
-        // programs at all – what sits in the AS slot is another mesh-stage container – so until
-        // the console's numbering here is known the pipeline is made from the MS slot alone:
-        // it exists (the title goes on), what it draws may be wrong.
-        note_translation_error(format!(
-            "mesh pipeline with AS {:016x} (MS {:016x}) – the AS slot is ignored; subobjects {types:?}",
-            crate::gpu::shader::fnv64(a),
-            crate::gpu::shader::fnv64(ms)
-        ));
-        static N: AtomicU64 = AtomicU64::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 8 {
-            crate::xlog_warn!(
-                "D3D12.X: mesh pipeline with a shader in the AS slot ({} B, console: {}) – made from its MS slot only ({} B)",
-                a.len(),
-                is_console(a),
-                ms.len()
-            );
-        }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, wave32_only(this))) {
@@ -4239,6 +4249,13 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
+    if let Some(reason) = unsupported_console_mesh_stream(desc) {
+        note_translation_error(reason);
+        if !ppv.is_null() {
+            *ppv = std::ptr::null_mut();
+        }
+        return E_INVALIDARG;
+    }
     // the console's stream numbers its mesh shader 24 (the PC's AS): as the PC's from here on
     let pc_types = pc_stream_types(desc);
     let pc_desc: [usize; 2] = pc_types.as_ref().map_or([0, 0], |b| [b.len(), b.as_ptr() as usize]);
@@ -5111,3 +5128,7 @@ mod stream_tests {
 #[cfg(test)]
 #[path = "real_depth_tests.rs"]
 mod depth_regression_tests;
+
+#[cfg(test)]
+#[path = "real_mesh_refusal_tests.rs"]
+mod mesh_refusal_tests;
