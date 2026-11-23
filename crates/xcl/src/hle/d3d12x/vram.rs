@@ -20,7 +20,8 @@
 //! are mapped onto the pages of its addresses. Targets at one address share pages, a page
 //! exists once however many targets cover it, and what no target covers takes nothing.
 //! Arenas remain for what cannot be tiled (an address not 64 KiB aligned, a resource the
-//! driver does not make reserved).
+//! driver does not make reserved: D32S8, MSAA): heaps of the placement's size, shared by
+//! placements inside them, let go 2 s after their last resource (256 MiB ones: 2.8 GB of D32S8).
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -31,29 +32,83 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::util::HRESULT;
 
-/// bytes of title address space an arena stands for at least (and of video memory it takes)
-const ARENA: usize = 256 << 20;
-/// an arena that replaces others grows to multiples of this (`plan`)
-const UNION_ALIGN: usize = 256 << 20;
-/// arenas start and end at multiples of this
-const ARENA_ALIGN: usize = 256 << 20;
-
-struct Arena {
+/// A heap of video memory for placements at title addresses `[base, base + size)`.
+struct Arena<H> {
     base: usize,
     size: usize,
-    heap: ID3D12Heap,
+    /// the heap's alignment (a placement that needs more does not go in)
+    align: usize,
+    heap: H,
+    /// resources placed in it
+    users: u32,
+    /// when the last of them went
+    idle_since: Option<std::time::Instant>,
+    id: u64,
+}
+
+/// The arenas, apart from D3D12 (`H`: the heap; numbers in the tests).
+struct Arenas<H> {
+    list: Vec<Arena<H>>,
+    next_id: u64,
+}
+
+impl<H: Clone> Arenas<H> {
+    const fn new() -> Self {
+        Arenas { list: Vec::new(), next_id: 0 }
+    }
+
+    /// Arenas no resource used for `IDLE` go (their heap with the last reference).
+    fn sweep(&mut self, now: std::time::Instant) {
+        self.list.retain(|a| a.users > 0 || a.idle_since.is_none_or(|t| now.duration_since(t) < IDLE));
+    }
+
+    /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
+    /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
+    /// (heap, offset, arena id); None: no heap.
+    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+        self.sweep(now);
+        let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
+        let i = match self.list.iter().rposition(fits) {
+            Some(i) => i,
+            None => {
+                let size = bytes.div_ceil(align) * align;
+                let heap = make(size, align)?;
+                self.next_id += 1;
+                self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
+                self.list.len() - 1
+            }
+        };
+        let a = &mut self.list[i];
+        a.users += 1;
+        a.idle_since = None;
+        Some((a.heap.clone(), va - a.base, a.id))
+    }
+
+    /// A resource in arena `id` released.
+    fn release(&mut self, id: u64, now: std::time::Instant) {
+        if let Some(a) = self.list.iter_mut().find(|a| a.id == id) {
+            a.users = a.users.saturating_sub(1);
+            if a.users == 0 {
+                a.idle_since = Some(now);
+            }
+        }
+    }
+
+    fn bytes(&self) -> usize { self.list.iter().map(|a| a.size).sum() }
 }
 
 // D3D12 heaps are free-threaded
-unsafe impl Send for Arena {}
+unsafe impl Send for Arenas<ID3D12Heap> {}
 
-static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
-/// bytes of every arena made (replaced ones live on while their resources do)
+static ARENAS: Mutex<Arenas<ID3D12Heap>> = Mutex::new(Arenas::new());
+/// resource → its arena's id
+static ARENA_OF: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+/// bytes of every arena made
 static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// (bytes of the arenas in use, bytes of all arenas made) – `XCL_ACTIVITY`
 pub fn arena_bytes() -> (usize, usize) {
-    (ARENAS.lock().unwrap().iter().map(|a| a.size).sum(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
+    (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -66,6 +121,9 @@ pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
+        if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
+            ARENAS.lock().unwrap().release(id, std::time::Instant::now());
+        }
     }
 }
 
@@ -75,93 +133,27 @@ pub fn gpu_owned(flags: u32) -> bool {
     flags & 0x7 != 0
 }
 
-/// Where a placement at `[va, va + bytes)` goes, given the arenas' ranges (base, size).
-#[derive(Debug, PartialEq)]
-enum Plan {
-    /// into arena `index`, at `offset`
-    Reuse { index: usize, offset: usize },
-    /// into a new arena `[base, base + size)`, which takes the place of the arenas `replaces`
-    /// (indices, ascending) in the list
-    New { base: usize, size: usize, replaces: Vec<usize> },
-}
-
-/// The arenas never overlap, so an address has one arena and resources at one address share
-/// memory. A new arena takes the 32 MiB blocks the range needs and, while it overlaps none,
-/// grows to 128 MiB – no further than the next arena. A range that straddles arenas gets one
-/// arena over the union of the range and every arena it overlaps; those arenas leave the list
-/// (their resources keep their heaps, but later placements at their addresses use the new one).
-fn plan(arenas: &[(usize, usize)], va: usize, bytes: usize) -> Plan {
-    if let Some(index) = arenas.iter().position(|&(b, n)| b <= va && va + bytes <= b + n) {
-        return Plan::Reuse { index, offset: va - arenas[index].0 };
-    }
-    let (mut lo, mut hi) = (va & !(ARENA_ALIGN - 1), (va + bytes).div_ceil(ARENA_ALIGN) * ARENA_ALIGN);
-    let overlaps = |lo: usize, hi: usize| -> Vec<usize> { (0..arenas.len()).filter(|&i| arenas[i].0 < hi && lo < arenas[i].0 + arenas[i].1).collect() };
-    let mut replaces = overlaps(lo, hi);
-    if replaces.is_empty() {
-        let next = arenas.iter().map(|&(b, _)| b).filter(|&b| b >= hi).min().unwrap_or(usize::MAX);
-        hi = hi.max(lo.saturating_add(ARENA)).min(next);
-        return Plan::New { base: lo, size: hi - lo, replaces };
-    }
-    // the union grows as it takes in arenas, which may overlap further ones
-    loop {
-        for &i in &replaces {
-            lo = lo.min(arenas[i].0);
-            hi = hi.max(arenas[i].0 + arenas[i].1);
-        }
-        let more = overlaps(lo, hi);
-        if more.len() == replaces.len() {
-            // the replaced arenas live on with their resources: room to grow in, so the next
-            // placements around here land in this one instead of replacing it in turn (a retail
-            // game: 38 replacements left 6.4 GB of arenas over 2 GB of its addresses)
-            let others: Vec<(usize, usize)> = (0..arenas.len()).filter(|i| !replaces.contains(i)).map(|i| arenas[i]).collect();
-            let below = others.iter().map(|&(b, n)| b + n).filter(|&e| e <= lo).max().unwrap_or(0);
-            let above = others.iter().map(|&(b, _)| b).filter(|&b| b >= hi).min().unwrap_or(usize::MAX);
-            let lo = (lo & !(UNION_ALIGN - 1)).max(below);
-            let hi = hi.div_ceil(UNION_ALIGN).saturating_mul(UNION_ALIGN).min(above);
-            return Plan::New { base: lo, size: hi - lo, replaces };
-        }
-        replaces = more;
-    }
-}
-
-/// The arena holding `[va, va + bytes)` (None: no video memory).
-unsafe fn arena_for(dev: &ID3D12Device, va: usize, bytes: usize) -> Option<(ID3D12Heap, u64)> {
-    let mut g = ARENAS.lock().unwrap();
-    let ranges: Vec<(usize, usize)> = g.iter().map(|a| (a.base, a.size)).collect();
-    let (base, size, replaces) = match plan(&ranges, va, bytes) {
-        Plan::Reuse { index, offset } => return Some((g[index].heap.clone(), offset as u64)),
-        Plan::New { base, size, replaces } => (base, size, replaces),
-    };
+/// A new arena's heap: `size` bytes of video memory for title addresses from `va`.
+unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: size as u64,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-        // MSAA targets need 4 MiB placement
-        Alignment: D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT as u64,
+        // 64 KiB, or 4 MiB for MSAA targets
+        Alignment: align as u64,
         Flags: D3D12_HEAP_FLAG_NONE,
     };
     let mut heap: Option<ID3D12Heap> = None;
     if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
-        crate::xlog_warn!("D3D12.X: video-memory arena for {base:#x}: CreateHeap: {e}");
+        crate::xlog_warn!("D3D12.X: video-memory arena for {va:#x}: CreateHeap: {e}");
         return None;
     }
-    let heap = heap?;
-    MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-    if replaces.is_empty() {
-        crate::xlog_info!("D3D12.X: video-memory arena for title addresses {base:#x}..{:#x}", base + size);
-    } else {
-        // the placed resources hold their heaps: the old arenas live on as long as they do
-        crate::xlog_info!(
-            "D3D12.X: video-memory arena for title addresses {base:#x}..{:#x} replaces {} arena(s) a placement at {va:#x}..{:#x} straddled (resources already in them no longer alias later ones)",
-            base + size,
-            replaces.len(),
-            va + bytes
-        );
-        for &i in replaces.iter().rev() {
-            g.remove(i);
-        }
+    let made = MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 16 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: video-memory arena #{n} for title addresses {va:#x}..{:#x} ({made} bytes of arenas made so far)", va + size);
     }
-    g.push(Arena { base, size, heap: heap.clone() });
-    Some((heap, (va - base) as u64))
+    heap
 }
 
 /// bytes of a page – of the title's addresses and of a tile
@@ -441,50 +433,25 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     if info.SizeInBytes == u64::MAX || info.SizeInBytes == 0 || va as u64 % info.Alignment.max(1) != 0 {
         return None;
     }
-    let (heap, offset) = arena_for(dev, va, info.SizeInBytes as usize)?;
-    let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset as usize, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    let align = (info.Alignment as usize).max(PAGE);
+    let now = std::time::Instant::now();
+    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
+        ARENAS.lock().unwrap().release(id, now);
         return None;
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
     Some(hr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
-
-    /// Applies placements to a list of arena ranges as `arena_for` does; returns the arena
-    /// (base) each placement landed in.
-    fn place_all(seq: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<usize>) {
-        let mut arenas: Vec<(usize, usize)> = Vec::new();
-        let mut landed = Vec::new();
-        for &(va, bytes) in seq {
-            match plan(&arenas, va, bytes) {
-                Plan::Reuse { index, offset } => {
-                    assert_eq!(arenas[index].0 + offset, va);
-                    landed.push(arenas[index].0);
-                }
-                Plan::New { base, size, replaces } => {
-                    assert!(base <= va && va + bytes <= base + size, "{va:#x} in {base:#x}+{size:#x}");
-                    assert_eq!((base % ARENA_ALIGN, size % ARENA_ALIGN), (0, 0));
-                    for &i in replaces.iter().rev() {
-                        arenas.remove(i);
-                    }
-                    arenas.push((base, size));
-                    landed.push(base);
-                }
-            }
-            for (i, a) in arenas.iter().enumerate() {
-                for b in &arenas[i + 1..] {
-                    assert!(a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0, "arenas {a:x?} and {b:x?} overlap");
-                }
-            }
-        }
-        (arenas, landed)
-    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
@@ -496,30 +463,179 @@ mod tests {
         assert_eq!(heap_ranges(0, &[(0, 3), (0, 1), (0, 2)]), [(true, 3, 1), (true, 1, 2)]);
     }
 
-    #[test]
-    fn a_straddling_placement_gets_one_arena_over_both() {
-        // #104: 16 MiB at 0x1_0400_0000, then 48 MiB at 0x1_0200_0000 (ends inside the first arena)
-        let (arenas, landed) = place_all(&[(0x1_0400_0000, 16 * MIB), (0x1_0200_0000, 48 * MIB), (0x1_0400_0000, 16 * MIB)]);
-        assert_eq!(arenas, [(0x1_0000_0000, UNION_ALIGN)]);
-        // the third placement, at the first one's address, shares the new arena with the second
-        assert_eq!(landed[1], landed[2]);
+    /// A placement's arena id, with heaps numbered as they are made.
+    fn take(a: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: Instant) -> u64 {
+        let n = a.list.len() as u32;
+        a.take(va, bytes, align, now, |_, _| Some(n)).unwrap().2
     }
 
     #[test]
-    fn a_new_arena_stops_at_the_next_one() {
-        // an arena at one alignment step first; then 16 MiB just below it fits in the step below
-        let (a, b) = (0x1_0000_0000 + ARENA_ALIGN, 0x1_0000_0000 + ARENA_ALIGN - 16 * MIB);
-        let (arenas, landed) = place_all(&[(a, 16 * MIB), (b, 16 * MIB)]);
-        assert_eq!(arenas, [(a, ARENA), (0x1_0000_0000, ARENA_ALIGN)]);
-        assert_eq!(landed, [a, 0x1_0000_0000]);
+    fn an_arena_is_shared_at_its_addresses_and_otherwise_its_placements_size() {
+        let (t, a0) = (Instant::now(), 0x1_0000_0000);
+        let mut a = Arenas::new();
+        let first = take(&mut a, a0, 70 * MIB, PAGE, t);
+        assert_eq!(a.bytes(), 70 * MIB, "the placement's size, not 256 MiB");
+        // the same address, and a smaller placement inside: the same memory
+        assert_eq!(take(&mut a, a0, 70 * MIB, PAGE, t), first);
+        assert_eq!(take(&mut a, a0 + 4 * MIB, 8 * MIB, PAGE, t), first);
+        // one straddling its end gets an arena of its own size; so does an MSAA target that needs 4 MiB
+        let straddle = take(&mut a, a0 + 64 * MIB, 70 * MIB, PAGE, t);
+        let msaa = take(&mut a, a0 + 8 * MIB, 8 * MIB, 4 * MIB, t);
+        assert!(straddle != first && msaa != first && msaa != straddle);
+        assert_eq!(a.bytes(), (70 + 70 + 8) * MIB);
+        // the newest arena holding an address is the one placements there share
+        assert_eq!(take(&mut a, a0 + 64 * MIB, 4 * MIB, PAGE, t), straddle);
     }
 
     #[test]
-    fn a_placement_over_several_arenas_merges_them_all() {
-        // two arenas with a gap, then one placement over the gap into both
-        let a = 0x2_0000_0000;
-        let (arenas, _) = place_all(&[(a, MIB), (a + 160 * MIB, MIB), (a + 20 * MIB, 150 * MIB), (a + 50 * MIB, MIB)]);
-        assert_eq!(arenas, [(a, UNION_ALIGN)]);
+    fn an_arena_no_resource_uses_goes_after_two_seconds() {
+        let (t, a0) = (Instant::now(), 0x1_0000_0000);
+        let mut a = Arenas::new();
+        let id = take(&mut a, a0, 70 * MIB, PAGE, t);
+        a.release(id, t);
+        // placed again within 2 s: the same memory (with what it holds)
+        assert_eq!(take(&mut a, a0, 70 * MIB, PAGE, t + Duration::from_secs(1)), id);
+        a.release(id, t + Duration::from_secs(1));
+        take(&mut a, a0 + 512 * MIB, MIB, PAGE, t + Duration::from_secs(3) + Duration::from_millis(1));
+        assert_eq!(a.bytes(), MIB, "the idle arena went");
+    }
+
+    /// The retail game's pattern (HANDOFF): targets packed back to back over 3.5 GB of its
+    /// addresses and placed again and again, each round at the last round's addresses or a third
+    /// of a target further on, so placements straddle earlier ones. Main's 256 MiB arenas merged
+    /// straddled arenas into growing unions while the old ones lived on (15 GB in 2 s).
+    #[test]
+    fn streamed_targets_stay_bounded() {
+        const S: usize = 64 * MIB; // a 3840x2160 D32S8, rounded
+        const K: usize = 8; // targets a round
+        const SPAN: usize = 3584 * MIB;
+        let (t0, a0) = (Instant::now(), 0x1_0000_0000usize);
+        let mut a = Arenas::new();
+        let mut live: std::collections::VecDeque<Vec<u64>> = std::collections::VecDeque::new();
+        let mut bytes = Vec::new();
+        for r in 0..400usize {
+            let now = t0 + Duration::from_millis(500 * r as u64);
+            let start = ((r / 2) * S / 3) % (SPAN - K * S) & !(PAGE - 1);
+            live.push_back((0..K).map(|k| take(&mut a, a0 + start + k * S, S, PAGE, now)).collect());
+            // a target lives three rounds (1.5 s)
+            if live.len() > 3 {
+                for id in live.pop_front().unwrap() {
+                    a.release(id, now);
+                }
+            }
+            bytes.push(a.bytes());
+        }
+        // live: 3 rounds of targets; idle and kept (< 2 s): 4 more
+        let most = *bytes.iter().max().unwrap();
+        assert!(most <= 7 * K * S, "{most} bytes of arenas");
+        let early = *bytes[20..120].iter().max().unwrap();
+        let late = *bytes[300..].iter().max().unwrap();
+        assert!(late <= early, "arenas grow over time: {early} then {late} bytes");
+    }
+
+    /// On the GPU: D32S8 targets 256 MiB apart take their own size of video memory, not an arena
+    /// of 256 MiB each; depth and stencil survive a clear, CopyResource and a read of both planes;
+    /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
+    #[test]
+    fn d32s8_targets_take_their_own_size_of_video_memory() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let memory: IDXGIAdapter3 = adapter.cast().unwrap();
+            let local = || {
+                let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                let _ = memory.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut i);
+                i.CurrentUsage
+            };
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let tex = |w: u64, h: u32| D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w, Height: h, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R32G8X24_TYPELESS, SampleDesc: sample, Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default() };
+            let ds = D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 };
+            let clear = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: ds } };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize, d: &D3D12_RESOURCE_DESC| {
+                let mut p = std::ptr::null_mut();
+                let hr = place(dev.as_raw(), va, d, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32, &clear as *const _ as *const c_void, None, riid, &mut p);
+                assert!(hr.is_some_and(|hr| hr >= 0) && !p.is_null(), "D32S8 target at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+
+            // 14 4K targets over 3.5 GB of addresses
+            let big = tex(3840, 2160);
+            let size = dev.GetResourceAllocationInfo(0, &[big]).SizeInBytes as usize;
+            let (used0, arenas0) = (local(), arena_bytes().0);
+            let targets: Vec<ID3D12Resource> = (0..14).map(|k| place_at(0x40_0000_0000 + k * 256 * MIB, &big)).collect();
+            let (used, arenas) = (local().saturating_sub(used0) as usize, arena_bytes().0 - arenas0);
+            println!("14 D32S8 3840x2160 targets ({size} bytes each): {arenas} bytes of arenas, {used} bytes more local video memory");
+            assert!(arenas <= 14 * size.next_multiple_of(PAGE), "{arenas} bytes of arenas");
+            assert!(used < 14 * 256 * MIB, "{used} bytes of video memory");
+            drop(targets);
+
+            // clear one, copy it to another, read both planes back
+            let small = tex(64, 64);
+            let (a, b) = (place_at(0x48_0000_0000, &small), place_at(0x48_1000_0000, &small));
+            let dsv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() }).unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            let view = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() };
+            dev.CreateDepthStencilView(&a, Some(&view), dsv);
+            let mut layouts = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+            let mut total = 0u64;
+            dev.GetCopyableFootprints(&small, 0, 2, 0, Some(layouts.as_mut_ptr()), None, None, Some(&mut total));
+            let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+            let mut readback: Option<ID3D12Resource> = None;
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+            let readback = readback.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let barrier = |r: &ID3D12Resource, from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.25, 0x5A, None);
+            list.ResourceBarrier(&[barrier(&a, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE), barrier(&b, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyResource(&b, &a);
+            list.ResourceBarrier(&[barrier(&b, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            for (plane, layout) in layouts.iter().enumerate() {
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *layout } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&b), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: plane as u32 } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            // no event: returns when the fence has the value
+            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            let mut p = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            let bytes = std::slice::from_raw_parts(p as *const u8, total as usize);
+            let row = |plane: usize, y: usize| layouts[plane].Offset as usize + y * layouts[plane].Footprint.RowPitch as usize;
+            for y in [0, 31, 63] {
+                let depth = f32::from_le_bytes(bytes[row(0, y)..row(0, y) + 4].try_into().unwrap());
+                assert_eq!((depth, bytes[row(1, y)]), (0.25, 0x5A), "row {y}: depth, stencil");
+            }
+            readback.Unmap(0, None);
+            drop((a, b));
+
+            // 2 s later the arenas no target uses are let go: one new target's is all that is left
+            std::thread::sleep(IDLE + Duration::from_millis(100));
+            let last = place_at(0x50_0000_0000, &small);
+            let small_size = dev.GetResourceAllocationInfo(0, &[small]).SizeInBytes as usize;
+            assert_eq!(arena_bytes().0 - arenas0, small_size.next_multiple_of(PAGE));
+            drop(last);
+        }
     }
 }
 
