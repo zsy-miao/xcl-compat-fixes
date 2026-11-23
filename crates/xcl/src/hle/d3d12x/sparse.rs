@@ -75,7 +75,8 @@ impl Hasher for FxHasher {
     }
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        // Tile addresses are 64 KiB aligned. Move mixed bits into the low bucket-index bits.
+        self.0.rotate_right(23)
     }
 }
 
@@ -1390,6 +1391,21 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_tile_addresses_spread_across_hash_buckets() {
+        use std::hash::BuildHasher;
+
+        let hasher = BuildHasherDefault::<FxHasher>::default();
+        let mut used = [false; 256];
+        for tile in 0..used.len() {
+            let address = (1usize << 32) + tile * TILE;
+            let bucket = hasher.hash_one(address) as usize & (used.len() - 1);
+            used[bucket] = true;
+        }
+        let occupied = used.iter().filter(|&&bucket| bucket).count();
+        assert!(occupied >= used.len() / 2, "256 aligned addresses used {occupied} buckets");
+    }
 
     /// Only the 64-byte chunks the CPU changed are sent again – the rest of the page may hold
     /// what the GPU wrote.
