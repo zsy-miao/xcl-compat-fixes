@@ -80,9 +80,100 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
 }
 
+/// Recognize only `clzero; add rax,64; cmp rax,r64; jb clzero`.
+/// The register index uses the CONTEXT order documented on `ConsoleOnly::Rdpid`.
+/// Returning to the native CMP after a batch preserves its flags and branch behavior.
+pub fn clzero_loop_bound(code: &[u8]) -> Option<usize> {
+    let b = code.get(..12)?;
+    if b[..7] != [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40]
+        || !matches!(b[7], 0x48 | 0x4C) || b[8] != 0x39
+        || b[9] & 0xC7 != 0xC0 || b[10..] != [0x72, 0xF4]
+    {
+        return None;
+    }
+    Some(((b[9] >> 3) & 7) as usize | ((((b[7] >> 2) & 1) as usize) << 3))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClzeroBatch {
+    /// CLZERO rounds its address down to a 64-byte line.
+    pub address: usize,
+    pub bytes: usize,
+    /// RAX at the following native CMP, after all emulated ADDs.
+    pub next_rax: usize,
+}
+
+/// Plan a bounded number of iterations of the recognized do-while loop. No memory is
+/// accessed here; the exception handler must validate the whole writable span first.
+pub fn clzero_batch(start: usize, bound: usize) -> Option<ClzeroBatch> {
+    const MAX_LINES: usize = (1 << 20) / 64;
+    let distance = bound.saturating_sub(start);
+    let lines = (distance / 64 + usize::from(distance % 64 != 0)).max(1).min(MAX_LINES);
+    let bytes = lines.checked_mul(64)?;
+    let next_rax = start.checked_add(bytes)?;
+    let address = start & !63;
+    address.checked_add(bytes)?;
+    Some(ClzeroBatch { address, bytes, next_rax })
+}
+
 /// `code` as hex, for a log line.
 pub fn hex(code: &[u8]) -> String {
     code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod clzero_batch_tests {
+    use super::*;
+
+    const LOOP_R10: [u8; 12] = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4];
+
+    #[test]
+    fn recognizes_exact_loop_and_all_bound_registers() {
+        assert_eq!(clzero_loop_bound(&LOOP_R10), Some(10));
+        for reg in 0..16usize {
+            let mut code = LOOP_R10;
+            code[7] = if reg < 8 { 0x48 } else { 0x4C };
+            code[9] = 0xC0 | ((reg as u8 & 7) << 3);
+            assert_eq!(clzero_loop_bound(&code), Some(reg));
+        }
+    }
+
+    #[test]
+    fn rejects_changed_instructions_backedges_and_truncation() {
+        for n in 0..LOOP_R10.len() {
+            assert_eq!(clzero_loop_bound(&LOOP_R10[..n]), None);
+        }
+        for (at, byte) in [(0, 0x90), (6, 0x20), (7, 0x44), (8, 0x3B), (9, 0xD1), (10, 0x76), (11, 0xF5)] {
+            let mut code = LOOP_R10;
+            code[at] = byte;
+            assert_eq!(clzero_loop_bound(&code), None, "changed byte {at}");
+        }
+    }
+
+    #[test]
+    fn plans_unaligned_zero_lines_and_final_comparison_register() {
+        let p = clzero_batch(0x1051, 0x1102).unwrap();
+        assert_eq!(p, ClzeroBatch { address: 0x1040, bytes: 0xC0, next_rax: 0x1111 });
+        assert!(p.next_rax >= 0x1102);
+        assert!(p.next_rax - 64 < 0x1102);
+    }
+
+    #[test]
+    fn executes_one_iteration_even_when_bound_is_not_ahead() {
+        for bound in [0x1000, 0x1051] {
+            assert_eq!(clzero_batch(0x1051, bound), Some(ClzeroBatch { address: 0x1040, bytes: 64, next_rax: 0x1091 }));
+        }
+    }
+
+    #[test]
+    fn caps_work_and_rejects_addition_overflow() {
+        let p = clzero_batch(0x1000, usize::MAX).unwrap();
+        assert_eq!(p.bytes, 1 << 20);
+        assert_eq!(p.next_rax, 0x101000);
+        assert!(p.next_rax < usize::MAX); // native JB will request another bounded batch
+        assert_eq!(clzero_batch(usize::MAX - 63, usize::MAX), None);
+        assert_eq!(clzero_batch(usize::MAX, 0), None);
+    }
 }
 
 #[cfg(test)]

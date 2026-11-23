@@ -254,6 +254,32 @@ unsafe fn code_at(rip: usize) -> String {
     crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
 }
 
+/// Execute only the recognized CLZERO/ADD loop as a bounded write. The native CMP/JB
+/// still runs, producing the exact comparison flags (and requesting another batch at the cap).
+unsafe fn emulate_clzero_loop(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, code: &[u8]) -> bool {
+    // A debugger stepping instructions must still observe every ADD and backedge.
+    if ctx.EFlags & 0x100 != 0 { return false; }
+    let Some(bound_register) = crate::insn::clzero_loop_bound(code) else { return false };
+    let regs = [
+        ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi,
+        ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+    ];
+    let Some(batch) = crate::insn::clzero_batch(ctx.Rax as usize, regs[bound_register] as usize) else { return false };
+    let Some(compare_rip) = ctx.Rip.checked_add(7) else { return false };
+    // A native CLZERO write can fault deferred plain pages in. Commit only pages already
+    // tracked by that mechanism, then validate the entire span using current OS protections.
+    crate::hle::kernelx::lazy::ensure(batch.address, batch.bytes);
+    if !crate::gpu::shader::writable(batch.address, batch.bytes) {
+        return false;
+    }
+    std::ptr::write_bytes(batch.address as *mut u8, 0, batch.bytes);
+    ctx.Rax = batch.next_rax as u64;
+    ctx.Rip = compare_rip;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("CLZERO: batched zero loop ({} bytes); native comparison follows", batch.bytes));
+    true
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
@@ -284,8 +310,12 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb | ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
         ConsoleOnly::Clzero => {
+            if emulate_clzero_loop(ctx, code) {
+                return -1;
+            }
             let line = (ctx.Rax as usize) & !63;
-            if crate::gpu::shader::readable(line, 64) {
+            crate::hle::kernelx::lazy::ensure(line, 64);
+            if crate::gpu::shader::writable(line, 64) {
                 std::ptr::write_bytes(line as *mut u8, 0, 64);
             } else {
                 return 0; // the real instruction faults there too
@@ -825,6 +855,25 @@ pub fn start_probes() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
+}
+
+#[cfg(test)]
+mod clzero_batch_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_instruction_stepping_without_touching_memory() {
+        unsafe {
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = 0x1000;
+            ctx.Rax = 0x2000;
+            ctx.R10 = 0x3000;
+            ctx.EFlags = 0x100; // TF
+            let code = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4];
+            assert!(!emulate_clzero_loop(&mut ctx, &code));
+            assert_eq!((ctx.Rip, ctx.Rax, ctx.R10, ctx.EFlags), (0x1000, 0x2000, 0x3000, 0x100));
+        }
+    }
 }
 
 #[cfg(test)]
