@@ -651,6 +651,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
@@ -658,8 +659,18 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     // depth + unordered access together, and the resource got no size
     let pc_flags = if flags & 0x2 != 0 { flags & 0xFF & !0x4 } else { flags & 0xFF };
     d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
-    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
-    d[0x20..0x24].copy_from_slice(&pc_format(format).to_le_bytes());
+    // A depth resource is read through shader views as well as a DSV. Its PC resource must
+    // therefore be typeless; only its views, pipeline and optimized clear use typed formats.
+    let pc = match format {
+        118..=120 => 44, // R24G8_TYPELESS, with D24S8 / depth / stencil views
+        20 if flags & 2 != 0 => 19,
+        40 if flags & 2 != 0 => 39,
+        45 if flags & 2 != 0 => 44,
+        55 if flags & 2 != 0 => 53,
+        86 | 115 if flags & 5 != 0 => 28,
+        f => pc_view_format(f),
+    };
+    d[0x20..0x24].copy_from_slice(&pc.to_le_bytes());
     d
 }
 
@@ -682,6 +693,33 @@ pub fn pc_format(f: u32) -> u32 {
         119 => 46,
         120 => 47,
         f => f,
+    }
+}
+
+/// Typed format for shader views; unlike render targets, ordinary packed-colour textures
+/// keep their PC-supported 16-bit format and layout.
+pub fn pc_view_format(f: u32) -> u32 {
+    match f {
+        116 | 117 => 10,
+        118 => 45,
+        119 => 46,
+        120 => 47,
+        f => f,
+    }
+}
+
+/// The typed shader-readable member of a depth resource's PC format family.
+pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
+    let view = pc_view_format(view);
+    match (resource, view) {
+        (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
+        (19..=22, 22 | 61 | 62) => 22,
+        (44..=47, 0 | 41 | 44 | 45 | 46 | 53 | 54 | 55 | 56) => 46,
+        (44..=47, 47 | 61 | 62) => 47,
+        (39 | 40, 0 | 39 | 40) => 41,
+        (53 | 55, 0 | 53 | 55) => 56,
+        (28, 86 | 115) => 28,
+        (_, v) => v,
     }
 }
 
@@ -991,10 +1029,19 @@ mod tests {
         x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes()); // depth + UAV + console bits
         let d = pc_resource_desc(&x);
         let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
-        assert_eq!((u(0x20), u(0x30)), (45, 0x2));
+        assert_eq!((u(0x20), u(0x30)), (44, 0x2));
         x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes()); // a UAV texture keeps it
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x30..0x34].try_into().unwrap()), 0x4);
         assert_eq!((pc_format(119), pc_format(120), pc_format(28)), (46, 47, 28));
+        for (typed, typeless) in [(20u32, 19u32), (40, 39), (45, 44), (55, 53)] {
+            x[0x20..0x24].copy_from_slice(&typed.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
+            let d = pc_resource_desc(&x);
+            assert_eq!(u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), typeless);
+        }
+        x[0x20..0x24].copy_from_slice(&86u32.to_le_bytes());
+        x[0x30..0x34].fill(0);
+        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 86, "ordinary packed-colour textures retain their layout");
     }
 
     #[test]

@@ -1786,28 +1786,103 @@ unsafe fn pc_view_format<T>(desc: *const T) -> Option<T> {
 /// the plain ones as an illegal call (a retail title: device removal). `view` 0 is "the
 /// resource's format", which no typeless or depth resource can be viewed as.
 fn pc_depth_view_format(resource: i32, view: i32) -> i32 {
-    match (resource, view) {
-        // R32G8X24_TYPELESS / D32_FLOAT_S8X24_UINT: depth as 21, stencil as 22
-        (19..=22, 0 | 19 | 20 | 39 | 40 | 41) => 21,
-        (19..=22, 61 | 62) => 22,
-        // R24G8_TYPELESS / D24_UNORM_S8_UINT: depth as 46, stencil as 47
-        (44..=47, 0 | 44 | 45 | 41 | 53 | 54 | 55 | 56) => 46,
-        (44..=47, 61 | 62) => 47,
-        // R32_TYPELESS / D32_FLOAT, R16_TYPELESS / D16_UNORM
-        (39 | 40, 0 | 39 | 40) => 41,
-        (53 | 55, 0 | 53 | 55) => 56,
-        (_, v) => v,
+    super::device_x::pc_shader_view_format(resource as u32, view as u32) as i32
+}
+
+/// A shader view's typed format, in the family of the resource actually made on the PC.
+unsafe fn pc_shader_view_desc<T: Copy>(res: *mut c_void, desc: *const T) -> Option<T> {
+    let d = desc.as_ref()?;
+    let format = (desc as *const u32).read_unaligned();
+    let pc = match ID3D12Resource::from_raw_borrowed(&res) {
+        Some(r) => super::device_x::pc_shader_view_format(r.GetDesc().Format.0 as u32, format),
+        None => super::device_x::pc_view_format(format),
+    };
+    if pc == format { return None; }
+    let mut out = *d;
+    (&mut out as *mut T as *mut u32).write_unaligned(pc);
+    Some(out)
+}
+
+/// A default DSV cannot inherit a typeless resource format. An explicit UNKNOWN format
+/// needs the same typed member, while retaining its mip, slice and read-only flags.
+fn pc_depth_dsv(rd: &D3D12_RESOURCE_DESC, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> Option<D3D12_DEPTH_STENCIL_VIEW_DESC> {
+    let typed = match rd.Format.0 {
+        19 => 20, 39 => 40, 44 => 45, 53 => 55,
+        _ => return None,
+    };
+    if let Some(d) = desc {
+        if d.Format.0 != 0 { return None; }
+        let mut out = *d;
+        out.Format.0 = typed;
+        return Some(out);
     }
+    let mut out = D3D12_DEPTH_STENCIL_VIEW_DESC::default();
+    out.Format.0 = typed;
+    let array = rd.DepthOrArraySize > 1;
+    match rd.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array => {
+            out.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1DARRAY;
+            out.Anonymous.Texture1DArray.ArraySize = rd.DepthOrArraySize as u32;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => out.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1D,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if rd.SampleDesc.Count > 1 && array => {
+            out.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+            out.Anonymous.Texture2DMSArray.ArraySize = rd.DepthOrArraySize as u32;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if rd.SampleDesc.Count > 1 => out.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if array => {
+            out.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            out.Anonymous.Texture2DArray.ArraySize = rd.DepthOrArraySize as u32;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => out.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// `desc` with the PC's format name for a view of the depth buffer `res` (None: as it is).
 unsafe fn pc_depth_srv(res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
-    let d = desc.as_ref()?;
-    let rf = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc().Format.0;
+    let rd = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc();
+    if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER { return None; }
+    let rf = rd.Format.0;
+    let mut default = D3D12_SHADER_RESOURCE_VIEW_DESC::default();
+    if desc.is_null() {
+        if !matches!(rf, 19 | 39 | 44 | 53) { return None; }
+        default.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        let array = rd.DepthOrArraySize > 1;
+        match rd.Dimension {
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D if array => {
+                default.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                default.Anonymous.Texture1DArray.MipLevels = u32::MAX;
+                default.Anonymous.Texture1DArray.ArraySize = rd.DepthOrArraySize as u32;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+                default.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                default.Anonymous.Texture1D.MipLevels = u32::MAX;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if rd.SampleDesc.Count > 1 && array => {
+                default.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                default.Anonymous.Texture2DMSArray.ArraySize = rd.DepthOrArraySize as u32;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if rd.SampleDesc.Count > 1 => default.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if array => {
+                default.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                default.Anonymous.Texture2DArray.MipLevels = u32::MAX;
+                default.Anonymous.Texture2DArray.ArraySize = rd.DepthOrArraySize as u32;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+                default.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                default.Anonymous.Texture2D.MipLevels = u32::MAX;
+            }
+            _ => return None,
+        }
+    }
+    let d = desc.as_ref().unwrap_or(&default);
+    if matches!(d.ViewDimension, D3D12_SRV_DIMENSION_BUFFER | D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) { return None; }
     let f = pc_depth_view_format(rf, d.Format.0);
     // the PC reads stencil from plane 1; the console takes plane 0 with a stencil format
     let stencil = matches!(f, 22 | 47) && matches!(rf, 19..=22 | 44..=47);
-    if f == d.Format.0 && !stencil {
+    if !desc.is_null() && f == d.Format.0 && !stencil {
         return None;
     }
     let mut v = std::ptr::read(d);
@@ -1828,11 +1903,13 @@ unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, de
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
     let pc_view = pc_view_format(desc);
     let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_DEPTH_STENCIL_VIEW_DESC);
+    let default = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_depth_dsv(&r.GetDesc(), desc.as_ref()));
+    let desc = default.as_ref().map_or(desc, |d| d as *const D3D12_DEPTH_STENCIL_VIEW_DESC);
     f(this, res, desc, handle)
 }
 
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
-    let pc_view = pc_view_format(desc);
+    let pc_view = pc_shader_view_desc(res, desc);
     let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
     let pc_depth = pc_depth_srv(res, desc);
     let desc = pc_depth.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
@@ -2047,7 +2124,7 @@ unsafe fn pc_null_uav(res: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
-    let pc_view = pc_view_format(desc);
+    let pc_view = pc_shader_view_desc(res, desc);
     let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_UNORDERED_ACCESS_VIEW_DESC);
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
@@ -5128,6 +5205,10 @@ mod stream_tests {
 #[cfg(test)]
 #[path = "real_depth_tests.rs"]
 mod depth_regression_tests;
+
+#[cfg(test)]
+#[path = "real_depth_gpu_tests.rs"]
+mod depth_gpu_regression_tests;
 
 #[cfg(test)]
 #[path = "real_mesh_refusal_tests.rs"]

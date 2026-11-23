@@ -17,7 +17,7 @@ fn with_resource_desc<T>(format: i32, f: impl FnOnce(*mut c_void) -> T) -> T {
     vtable[10] = get_desc as usize;
     let mut resource = ResourceWithDesc {
         vtable: vtable.as_ptr(),
-        desc: D3D12_RESOURCE_DESC { Format: DXGI_FORMAT(format), ..Default::default() },
+        desc: D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Format: DXGI_FORMAT(format), DepthOrArraySize: 1, MipLevels: 1, SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
     };
     f(&mut resource as *mut ResourceWithDesc as *mut c_void)
 }
@@ -25,18 +25,18 @@ fn with_resource_desc<T>(format: i32, f: impl FnOnce(*mut c_void) -> T) -> T {
 #[test]
 fn console_depth_views_become_pc_ones() {
     for (resource, view, expected) in [
-        (20, 41, 21), // a plain R32_FLOAT name for D32S8's depth plane
-        (20, 61, 22), // an R8 name for D32S8's stencil plane
-        (45, 56, 46), // a plain R16_UNORM name for the mapped D16S8 depth
-        (45, 62, 47), // an R8_UINT name for the mapped stencil plane
-        (40, 0, 41),
-        (55, 0, 56),
+        (19, 41, 21), // a plain R32_FLOAT name for D32S8's depth plane
+        (19, 61, 22), // an R8 name for D32S8's stencil plane
+        (44, 56, 46), // a plain R16_UNORM name for the mapped D16S8 depth
+        (44, 62, 47), // an R8_UINT name for the mapped stencil plane
+        (39, 0, 41),
+        (53, 0, 56),
         (28, 28, 28),
     ] {
         assert_eq!(pc_depth_view_format(resource, view), expected);
     }
 
-    with_resource_desc(20, |resource| unsafe {
+    with_resource_desc(19, |resource| unsafe {
         let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT(41),
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -61,7 +61,7 @@ fn console_depth_views_become_pc_ones() {
 
 #[test]
 fn console_depth_stencil_array_keeps_plane_after_format_conversion() {
-    with_resource_desc(45, |resource| unsafe {
+    with_resource_desc(44, |resource| unsafe {
         let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT(120),
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -88,6 +88,45 @@ fn console_depth_stencil_array_keeps_plane_after_format_conversion() {
         assert_eq!(desc.Format.0, 120);
         assert_eq!(desc.Anonymous.Texture2DArray.PlaneSlice, 0);
     });
+}
+
+#[test]
+fn typeless_depth_defaults_have_typed_views_and_keep_explicit_fields() {
+    let mut resource = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Format: DXGI_FORMAT(44), DepthOrArraySize: 3, MipLevels: 2,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let dsv = pc_depth_dsv(&resource, None).expect("typeless resource needs a typed default DSV");
+    assert_eq!(dsv.Format.0, 45);
+    assert_eq!(dsv.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DARRAY);
+    unsafe { assert_eq!(dsv.Anonymous.Texture2DArray.ArraySize, 3); }
+    let mut explicit = dsv;
+    explicit.Format.0 = 0;
+    explicit.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+    explicit.Anonymous.Texture2DArray.MipSlice = 1;
+    let mapped = pc_depth_dsv(&resource, Some(&explicit)).unwrap();
+    assert_eq!(mapped.Format.0, 45);
+    assert_eq!(mapped.Flags, explicit.Flags);
+    unsafe { assert_eq!(mapped.Anonymous.Texture2DArray.MipSlice, 1); }
+    resource.SampleDesc.Count = 4;
+    assert_eq!(pc_depth_dsv(&resource, None).unwrap().ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY);
+    for (resource, depth) in [(19, 21), (39, 41), (44, 46), (53, 56)] {
+        with_resource_desc(resource, |raw| unsafe {
+            let srv = pc_depth_srv(raw, std::ptr::null()).expect("typeless resource needs a typed default SRV");
+            assert_eq!(srv.Format.0, depth);
+            assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+            assert_eq!(srv.Anonymous.Texture2D.MipLevels, u32::MAX);
+        });
+    }
+}
+
+#[test]
+fn shader_view_conversion_preserves_plain_packed_textures() {
+    for (resource, view, expected) in [(86, 86, 86), (28, 86, 28), (44, 119, 46), (44, 120, 47)] {
+        assert_eq!(super::super::device_x::pc_shader_view_format(resource, view), expected);
+    }
 }
 
 #[test]
