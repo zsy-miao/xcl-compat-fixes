@@ -531,8 +531,16 @@ pub fn dump_threads() {
                         ok
                     };
                     if got {
+                        // Unwinding changes the context. Keep the captured registers so a busy
+                        // title loop can be distinguished from a wait without reading its memory.
+                        let registers = format!(
+                            "rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                            c.0.Rip, c.0.Rsp, c.0.Rax, c.0.Rbx, c.0.Rcx, c.0.Rdx,
+                            c.0.Rsi, c.0.Rdi, c.0.Rbp, c.0.R8, c.0.R9, c.0.R10,
+                            c.0.R11, c.0.R12, c.0.R13, c.0.R14, c.0.R15,
+                        );
                         let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
-                        lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
+                        lines.push(format!("thread {} '{}': {} | {registers}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
                 }
