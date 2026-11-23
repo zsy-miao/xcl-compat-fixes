@@ -1775,6 +1775,16 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   4 GiB window – a redesign of how shaders reach title memory.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
+## Console CPU instructions the PC lacks (2026-11-23)
+A retail game on an Intel CPU before Ice Lake / Alder Lake dies with 0xC000001D (illegal instruction) in its own code
+right after its first `CreateShaderResourceView` (the first descriptor written into title memory). `insn.rs` decodes
+the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`, `rdpru`, `monitorx` / `mwaitx`
+(AMD only), `rdpid` – and the vectored handler (`eh::emulate_console_only`) emulates them and steps over
+(`clwb` / `monitorx` / `mwaitx`: nothing, the PC's memory is coherent; `clzero`: 64 zero bytes at rAX; `rdpru`:
+QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruction. Any other illegal instruction
+(and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
+SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`

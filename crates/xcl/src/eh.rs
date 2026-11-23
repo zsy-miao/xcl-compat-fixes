@@ -76,6 +76,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
         }
+        if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+            extra = format!(" (code bytes: {})", code_at(addr));
+        }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
@@ -237,6 +240,71 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+
+/// The first 16 code bytes at `rip`, as hex (as far as they are readable).
+unsafe fn code_at(rip: usize) -> String {
+    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
+}
+
+/// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
+/// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
+/// logged with its code bytes and goes on to the title's handlers.
+unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> i32 {
+    use crate::insn::ConsoleOnly;
+    let rip = ctx.Rip as usize;
+    if modules::image_base_for_addr(rip).is_none() || !crate::gpu::shader::readable(rip, 1) {
+        return 0;
+    }
+    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    let code = std::slice::from_raw_parts(rip as *const u8, n);
+    let Some((what, len)) = crate::insn::decode(code) else {
+        crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
+        return 0;
+    };
+    static SEEN: std::sync::Mutex<Vec<ConsoleOnly>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut seen) = SEEN.lock() {
+        if !seen.contains(&what) {
+            seen.push(what);
+            if what == ConsoleOnly::Ud2 {
+                crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
+            } else {
+                crate::xlog_warn!("{what:?} in {} – a console CPU instruction this CPU lacks: emulated (logged once)", modules::describe_address(rip));
+            }
+        }
+    }
+    match what {
+        ConsoleOnly::Ud2 => return 0,
+        ConsoleOnly::Clwb | ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
+        ConsoleOnly::Clzero => {
+            let line = (ctx.Rax as usize) & !63;
+            if crate::gpu::shader::readable(line, 64) {
+                std::ptr::write_bytes(line as *mut u8, 0, 64);
+            } else {
+                return 0; // the real instruction faults there too
+            }
+        }
+        ConsoleOnly::Rdpru => {
+            let mut v = 0i64;
+            windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v);
+            let v = if ctx.Rcx as u32 <= 1 { v as u64 } else { 0 };
+            ctx.Rax = v & 0xFFFF_FFFF;
+            ctx.Rdx = v >> 32;
+        }
+        ConsoleOnly::Rdpid(r) => {
+            let cpu = windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() as u64;
+            let regs: [&mut u64; 16] = [
+                &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi,
+                &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15,
+            ];
+            *regs[r as usize & 15] = cpu;
+        }
+    }
+    ctx.Rip += len as u64;
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     const CPP: i32 = 0xE06D_7363_u32 as i32;
     const THREAD_NAME: i32 = 0x406D_1388;
@@ -255,6 +323,9 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
             }
         }
         return 0;
+    }
+    if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+        return emulate_console_only(&mut *(*info).ContextRecord);
     }
     if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
         return 0;
