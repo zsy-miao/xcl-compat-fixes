@@ -1,4 +1,4 @@
-//! Opt-in local fixtures for BCPack mode 7 requests. No decoding or destination writes.
+//! Opt-in local fixtures for BCPack modes 5 and 7. No decoding or destination writes.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -22,7 +22,7 @@ pub(super) unsafe fn capture_refused(request: &Request) {
     let mut state = STATE.get_or_init(Default::default).lock().unwrap();
     let captures = state.entry(directory.clone()).or_default();
     match capture_to(&directory, captures, request) {
-        Ok(Some(path)) => crate::xlog_info!("DirectStorage: captured BCPack mode 7 source locally: {}", path.display()),
+        Ok(Some(path)) => crate::xlog_info!("DirectStorage: captured BCPack mode {} source locally: {}", request.bcpack(), path.display()),
         Ok(None) => {}
         Err(error) => warn_once("BCPack capture", format_args!("local fixture capture failed: {error}")),
     }
@@ -36,7 +36,8 @@ fn initialize(directory: &Path, captures: &mut Captures) -> Result<(), String> {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(hex) = name.strip_prefix("bcpack7-").and_then(|s| s.strip_suffix(".bin")) {
+                if let Some(hex) = name.strip_prefix("bcpack7-").or_else(|| name.strip_prefix("bcpack5-"))
+                    .and_then(|s| s.strip_suffix(".bin")) {
                     if let Ok(hash) = u64::from_str_radix(hex, 16) {
                         captures.seen.insert(hash);
                     }
@@ -96,7 +97,7 @@ fn fixture_hash(request: &Request, bytes: &[u8]) -> u64 {
 }
 
 unsafe fn capture_to(directory: &Path, captures: &mut Captures, request: &Request) -> Result<Option<PathBuf>, String> {
-    if request.bcpack() != 7 || request.source_size == 0 || request.source_size > MAX_BYTES
+    if !matches!(request.bcpack(), 5 | 7) || request.source_size == 0 || request.source_size > MAX_BYTES
         || request.destination_size == 0 || request.destination_size > MAX_BYTES || request.intermediate_size > MAX_BYTES
     {
         return Ok(None);
@@ -111,7 +112,7 @@ unsafe fn capture_to(directory: &Path, captures: &mut Captures, request: &Reques
         return Ok(None);
     }
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-    let stem = format!("bcpack7-{hash:016x}");
+    let stem = format!("bcpack{}-{hash:016x}", request.bcpack());
     let binary = directory.join(format!("{stem}.bin"));
     let mut output = match std::fs::OpenOptions::new().write(true).create_new(true).open(&binary) {
         Ok(file) => file,
@@ -215,12 +216,43 @@ mod tests {
     }
 
     #[test]
+    fn bcpack_mode5_failure_capture_reads_the_validated_file_offset() {
+        let directory = TempDir::new();
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let source_path = directory.0.join("synthetic-mode5-source.bin");
+        std::fs::write(&source_path, b"prefixPAYLOADsuffix").unwrap();
+        let file = Arc::new(FileInner { id: 1, path: crate::util::wide(&source_path.to_string_lossy()),
+            file: Mutex::new(Some(Arc::new(std::fs::File::open(&source_path).unwrap()))) });
+        let mut destination = [0xA5u8; 64];
+        unsafe {
+            let object = new_object(file_vtbl(), Arc::clone(&file));
+            let request = Request { options: 5 << BCPACK_SHIFT, source: object as u64,
+                offset: 6, source_size: 7, destination: destination.as_mut_ptr() as u64,
+                destination_size: destination.len() as u32, ..Default::default() };
+            assert_eq!(request.check(false), Err(E_DECOMPRESSION));
+            let binary = capture_to(&directory.0, &mut Captures::default(), &request).unwrap().unwrap();
+            assert!(binary.file_name().unwrap().to_string_lossy().starts_with("bcpack5-"));
+            assert_eq!(std::fs::read(&binary).unwrap(), b"PAYLOAD");
+            let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(binary.with_extension("json")).unwrap()).unwrap();
+            assert_eq!(metadata["bcpack_mode"], 5);
+            assert_eq!(metadata["source_kind"], "file");
+            assert_eq!(metadata["source_offset"], 6);
+            assert_eq!(metadata["source_size"], 7);
+            assert_eq!(metadata["source_file"], source_path.to_string_lossy().as_ref());
+            assert_eq!(execute(&request, Some(&file), None, None), Err(E_DECOMPRESSION));
+            assert_eq!(destination, [0xA5; 64], "capture must not change the destination or refusal");
+            release::<FileInner>(object);
+        }
+    }
+
+    #[test]
     fn bcpack_failure_capture_caps_samples_and_rejects_oversized_requests_before_reading() {
         let directory = TempDir::new();
         let mut captures = Captures::default();
         for byte in 0..(MAX_SAMPLES + 2) as u8 {
             let source = [byte; 4];
-            let request = Request { options: SOURCE_MEMORY_BIT | (7 << BCPACK_SHIFT), source: source.as_ptr() as u64,
+            let mode = if byte % 2 == 0 { 5 } else { 7 };
+            let request = Request { options: SOURCE_MEMORY_BIT | (mode << BCPACK_SHIFT), source: source.as_ptr() as u64,
                 source_size: 4, destination: 0x1000, destination_size: 64, ..Default::default() };
             let captured = unsafe { capture_to(&directory.0, &mut captures, &request) }.unwrap();
             assert_eq!(captured.is_some(), (byte as usize) < MAX_SAMPLES);

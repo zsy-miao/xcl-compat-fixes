@@ -989,7 +989,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         return;
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
-    if r.bcpack() == 7 {
+    if matches!(r.bcpack(), 5 | 7) {
         bcpack_capture::capture_refused(&r);
     }
     if let Err(hr) = r.check(q.source_memory) {
