@@ -153,6 +153,50 @@ pub fn in_graphics_reservation(p: usize) -> bool {
 
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// GPU-only reservations paired with the title's preceding CPU view of the same size.
+/// Upstream PR #283 (94bfcf0), stacked on PR #252: kept-in-step textures read/watch
+/// the CPU view while retaining their original GPU-view title address.
+pub mod mirrors {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct State {
+        cpu: Vec<(usize, usize)>,
+        gpu: BTreeMap<usize, (usize, usize)>,
+    }
+    static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
+
+    pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
+        if t & super::MEM_64K_PAGES != super::MEM_64K_PAGES || t & 0x1000 != 0 {
+            return;
+        }
+        let mut s = STATE.lock().unwrap();
+        if p & 0x800 != 0 && p & 0xFF == super::mem::PAGE_NOACCESS {
+            let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
+            if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
+                s.gpu.insert(base, (size, cpu));
+                crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
+            }
+        } else if p & 0xFF != super::mem::PAGE_NOACCESS {
+            s.cpu.push((base, size));
+        }
+    }
+
+    pub fn released(base: usize) {
+        let mut s = STATE.lock().unwrap();
+        s.cpu.retain(|&(b, _)| b != base);
+        s.gpu.remove(&base);
+        s.gpu.retain(|_, &mut (_, c)| c != base);
+    }
+
+    pub fn source(va: usize) -> Option<usize> {
+        let s = STATE.lock().unwrap();
+        let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
+        let offset = va.checked_sub(gpu)?;
+        (offset < size).then(|| cpu.checked_add(offset)).flatten()
+    }
+}
+
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
 /// write-watched address space of Windows; everything else from Windows.
@@ -164,6 +208,8 @@ const MEM_LARGE_PAGES_X: u32 = 0x2000_0000;
 /// a protection bit of the console's title memory the GPU uses (GTA VI's index and vertex data:
 /// 0x22004; its 2.2 GB block of other data: 0x2404)
 const PAGE_GPU_X: u32 = 0x2_0000;
+/// PAGE_GRAPHICS_NOACCESS through PAGE_GRAPHICS_NOCACHE, as upstream PR #252.
+const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
 
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
@@ -245,6 +291,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             reserved_outside("graphics reservation", size, t, q as usize);
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::reserved(q as usize, size, t, p);
             return q;
         }
     }
@@ -256,6 +303,19 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
             trace_mem("VirtualAlloc (reservation, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
+        }
+    }
+    // GPU-visible reservations too large for the windows still need write watching:
+    // title_textures uploads their CPU-written data (PR #252, 862a0d4).
+    if addr.is_null() && t & 0x2000 != 0 && (t & (MEM_GRAPHICS | MEM_LARGE_PAGES_X) != 0 || p & PAGE_GRAPHICS_ANY != 0) {
+        let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+        if !q.is_null() {
+            GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::reserved(q as usize, size, t, p);
+            reserved_outside("GPU-visible reservation", size, t, q as usize);
+            trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+            return q;
         }
     }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
@@ -363,6 +423,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & mem::MEM_RELEASE != 0 {
         lazy::forget_released(addr as usize);
+        mirrors::released(addr as usize);
     }
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
