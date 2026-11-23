@@ -380,7 +380,7 @@ fn main() {
             let flags_before: u64;
             let flags_after: u64;
             macro_rules! instruction {
-                ($destination:literal, $source:literal, $bytes:literal) => {
+                ($destination:tt, $source:tt, $bytes:literal) => {
                     std::arch::asm!(
                         "cmp rax, rdx",
                         "pushfq", "pop r8",
@@ -456,7 +456,7 @@ fn main() {
             let flags_before: u64;
             let flags_after: u64;
             macro_rules! instruction {
-                ($destination:literal, $source:literal, $bytes:literal) => {
+                ($destination:tt, $source:tt, $bytes:literal) => {
                     std::arch::asm!(
                         "cmp rax, rdx",
                         "pushfq", "pop r8",
