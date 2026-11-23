@@ -9,7 +9,7 @@ try {
     if (-not (Test-Path -LiteralPath $selection)) { throw 'Open xcl.exe once and select the game first.' }
     $game = (Get-Content -LiteralPath $selection -Raw).Trim()
     if (-not (Test-Path -LiteralPath $game)) { throw 'The previously selected game could not be found.' }
-    foreach ($setting in @('XCL_RUN_SECONDS', 'XCL_FRAME_DUMP', 'XCL_FRAME_DUMP_FULL', 'XCL_PRESS_AT', 'XCL_PRESS_A_AT', 'XCL_THREAD_DUMP_AT', 'XCL_TRACE_MEM', 'XCL_ACTIVITY')) {
+    foreach ($setting in @('XCL_RUN_SECONDS', 'XCL_FRAME_DUMP', 'XCL_FRAME_DUMP_FULL', 'XCL_PRESS_AT', 'XCL_PRESS_A_AT', 'XCL_THREAD_DUMP_AT', 'XCL_TRACE_MEM', 'XCL_ACTIVITY', 'XCL_VRAM_ARENAS')) {
         [Environment]::SetEnvironmentVariable($setting, $null, 'Process')
     }
     $env:XCL_NETWORK = '0'
@@ -17,6 +17,7 @@ try {
     $env:XCL_LAZY_PSO = '1'
     $env:XCL_LAZY_COMPUTE = '1'
     $env:XCL_HEAP_WINDOWS = '1'
+    $ErrorActionPreference = 'Continue'
     & $executable run $game
     exit $LASTEXITCODE
 }
