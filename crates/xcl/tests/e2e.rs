@@ -126,6 +126,9 @@ fn test_title_runs_and_game_folder_is_untouched() {
     );
     let fails: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[FAIL]")).collect();
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
+    if stderr.contains("Clzero in ") {
+        assert!(stderr.contains("CLZERO: batched zero loop"), "CLZERO faults must exercise the batch path, not just the slow single-instruction fallback: {stderr}");
+    }
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
     assert!(
         stdout.contains("[PASS] CPU: CLZERO batches preserve guarded bytes, registers and CMP flags"),
