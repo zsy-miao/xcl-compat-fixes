@@ -270,6 +270,10 @@ try {
             [ordered]@{ pull_request = 195; url = 'https://github.com/ivall/xcl/pull/195'; source_revision = $pr195Revision; scope = 'Four graphics files; PR #192 replaces its XG implementation; local allocation and address regressions are recorded by the source revision.' },
             [ordered]@{ pull_request = 203; url = 'https://github.com/ivall/xcl/pull/203'; source_revision = $pr203Revision; scope = 'Memory-window and sparse-page integration from the user-specified source combination; compute first-use remains a per-title opt-in.' }
         )
+        $info.applied_patches += @(
+            [ordered]@{ pull_request = 225; url = 'https://github.com/ivall/xcl/pull/225'; source_revision = '327c24c98ea883f9fa586d647b5898e073ca6d34'; scope = 'Fallback texture arenas use aligned resource sizes and retire unused backing; existing shared target pages are retained.' },
+            [ordered]@{ pull_request = 230; url = 'https://github.com/ivall/xcl/pull/230'; source_revision = 'b85602215a2f616f734187504d30279e4c249df4'; scope = 'Aligned sparse tile hash distribution and its bucket regression only; PR #203 sparse-page behavior retained.' }
+        )
         $info.upstream_integrations = @([ordered]@{
             source_commit = $textureAllocatorRevision
             url = "https://github.com/ivall/xcl/commit/$textureAllocatorRevision"
@@ -293,6 +297,7 @@ try {
         $info.test_suites = @('clzero_batch', 'sse4a') + $info.test_suites
         $patchNote += "`r`nIncludes local CLZERO loop emulation that avoids repeating a Windows memory query for every 64-byte zero operation."
         $patchNote += "`r`nIncludes community SSE4a immediate/register bit-field emulation (0cd0a53 and hardware follow-up af20b4b), with local saved-context validation."
+        $patchNote += "`r`nIncludes PR #225 fallback texture-arena memory improvements and PR #230 aligned sparse tile hash fix, found by the community-update watcher."
     }
     [IO.File]::WriteAllText((Join-Path $stageDirectory 'BUILD-INFO.json'), ($info | ConvertTo-Json -Depth 5), $utf8)
     $startText = @"
