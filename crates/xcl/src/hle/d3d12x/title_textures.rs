@@ -268,6 +268,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
+            super::vram::before_execute(q);
         });
     }
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {

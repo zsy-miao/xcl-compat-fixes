@@ -833,7 +833,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     if !buffer && super::vram::gpu_owned(flags) {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
-        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, riid, ppv) {
+        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
             if hr >= 0 && !(*ppv).is_null() {
                 real::note_title_address(*ppv as usize, va as usize);
             }
