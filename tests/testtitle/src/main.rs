@@ -436,6 +436,85 @@ fn main() {
         Ok(())
     });
 
+    check("CPU: SSE4a register controls preserve bitfields, sources and flags", || unsafe {
+        // Official hardware-verified semantics: INSERTQ controls are in source[127:64],
+        // EXTRQ controls in source[63:0]; low six bits are length, bits 13:8 are index.
+        #[inline(never)]
+        unsafe fn run<const INSERT: bool, const HIGH: bool>(
+            destination: u64,
+            source_words: [u64; 2],
+            expected: u64,
+            name: &str,
+        ) -> Result<(), String> {
+            use std::arch::x86_64::__m128i;
+            const NEIGHBOR: [u64; 2] = [0x8BAD_F00D_7654_3210, 0x0123_4567_89AB_CDEF];
+            const MARKER: u64 = 0x8765_4321_AABB_CCDD;
+            let mut result: __m128i = std::mem::transmute([destination, 0xA55A_2468_1357_FEDCu64]);
+            let mut source: __m128i = std::mem::transmute(source_words);
+            let mut neighbor: __m128i = std::mem::transmute(NEIGHBOR);
+            let mut marker = MARKER;
+            let flags_before: u64;
+            let flags_after: u64;
+            macro_rules! instruction {
+                ($destination:literal, $source:literal, $bytes:literal) => {
+                    std::arch::asm!(
+                        "cmp rax, rdx",
+                        "pushfq", "pop r8",
+                        $bytes,
+                        "pushfq", "pop rcx",
+                        in("rax") 7usize,
+                        in("rdx") 8usize,
+                        inout("r11") marker,
+                        lateout("r8") flags_before,
+                        lateout("rcx") flags_after,
+                        inout($destination) result,
+                        inout($source) source,
+                        inout("xmm2") neighbor,
+                    )
+                };
+            }
+            match (INSERT, HIGH) {
+                (true, false) => instruction!("xmm0", "xmm1", ".byte 0xF2, 0x0F, 0x79, 0xC1"),
+                (true, true) => instruction!("xmm8", "xmm9", ".byte 0xF2, 0x45, 0x0F, 0x79, 0xC1"),
+                (false, false) => instruction!("xmm0", "xmm1", ".byte 0x66, 0x0F, 0x79, 0xC1"),
+                (false, true) => instruction!("xmm8", "xmm9", ".byte 0x66, 0x45, 0x0F, 0x79, 0xC1"),
+            }
+            let result: [u64; 2] = std::mem::transmute(result);
+            let source: [u64; 2] = std::mem::transmute(source);
+            let neighbor: [u64; 2] = std::mem::transmute(neighbor);
+            ensure!(result[0] == expected, "SSE4a {name}: lower result {:#x}, expected {expected:#x}", result[0]);
+            ensure!(source == source_words, "SSE4a {name}: source XMM changed");
+            ensure!(neighbor == NEIGHBOR && marker == MARKER, "SSE4a {name}: another register changed");
+            ensure!(flags_before == flags_after, "SSE4a {name}: flags changed from {flags_before:#x} to {flags_after:#x}");
+            Ok(())
+        }
+        run::<true, false>(
+            0x1122_3344_5566_7788,
+            [0xFEDC_BA98_7654_3210, 0xAABB_CCDD_0000_1010],
+            0x1122_3344_3210_7788,
+            "register INSERTQ middle field",
+        )?;
+        run::<true, true>(
+            0x1122_3344_5566_7788,
+            [1, 0xAABB_CCDD_0000_3F01],
+            0x9122_3344_5566_7788,
+            "register INSERTQ high XMM and highest bit",
+        )?;
+        run::<false, false>(
+            0x1122_3344_5566_7788,
+            [0xAABB_CCDD_0000_1010, 0xFEDC_BA98_7654_3210],
+            0x5566,
+            "register EXTRQ middle field",
+        )?;
+        run::<false, true>(
+            0x9122_3344_5566_7788,
+            [0xAABB_CCDD_0000_3F01, 0xFEDC_BA98_7654_3210],
+            1,
+            "register EXTRQ high XMM and highest bit",
+        )?;
+        Ok(())
+    });
+
     check("kernelx: GetConsoleType / XSystemGetDeviceType", || unsafe {
         ensure!(GetConsoleType() == 6, "GetConsoleType = {}", GetConsoleType());
         ensure!(XSystemGetDeviceType() == 7, "device type = {}", XSystemGetDeviceType());
