@@ -358,6 +358,84 @@ fn main() {
         Ok(())
     });
 
+    check("CPU: SSE4a INSERTQ and EXTRQ preserve defined bits, sources and flags", || unsafe {
+        // Reference: AMD's INSERTQ/EXTRQ instruction definitions and LLVM ammintrin.h.
+        // Immediate length/index use six bits; zero length means 64. Upper destination
+        // bits are undefined, so only the defined lower 64 bits are checked.
+        #[inline(never)]
+        unsafe fn run<const INSERT: bool, const LENGTH: u8, const INDEX: u8, const HIGH: bool>(
+            destination: u64,
+            source_low: u64,
+            expected: u64,
+            name: &str,
+        ) -> Result<(), String> {
+            use std::arch::x86_64::__m128i;
+            const NEIGHBOR: [u64; 2] = [0x8BAD_F00D_7654_3210, 0x0123_4567_89AB_CDEF];
+            const MARKER: u64 = 0x8765_4321_AABB_CCDD;
+            let source_words = [source_low, 0xD00D_1234_9876_ABCD];
+            let mut result: __m128i = std::mem::transmute([destination, 0xA55A_2468_1357_FEDCu64]);
+            let mut source: __m128i = std::mem::transmute(source_words);
+            let mut neighbor: __m128i = std::mem::transmute(NEIGHBOR);
+            let mut marker = MARKER;
+            let flags_before: u64;
+            let flags_after: u64;
+            macro_rules! instruction {
+                ($destination:literal, $source:literal, $bytes:literal) => {
+                    std::arch::asm!(
+                        "cmp rax, rdx",
+                        "pushfq", "pop r8",
+                        $bytes,
+                        "pushfq", "pop rcx",
+                        length = const LENGTH,
+                        index = const INDEX,
+                        in("rax") 7usize,
+                        in("rdx") 8usize,
+                        inout("r11") marker,
+                        lateout("r8") flags_before,
+                        lateout("rcx") flags_after,
+                        inout($destination) result,
+                        inout($source) source,
+                        inout("xmm2") neighbor,
+                    )
+                };
+            }
+            match (INSERT, HIGH) {
+                // The first form includes the exact retail crash instruction.
+                (true, false) => instruction!("xmm0", "xmm1", ".byte 0xF2, 0x0F, 0x78, 0xC1, {length}, {index}"),
+                (true, true) => instruction!("xmm8", "xmm9", ".byte 0xF2, 0x45, 0x0F, 0x78, 0xC1, {length}, {index}"),
+                (false, false) => instruction!("xmm0", "xmm1", ".byte 0x66, 0x0F, 0x78, 0xC0, {length}, {index}"),
+                (false, true) => instruction!("xmm8", "xmm1", ".byte 0x66, 0x41, 0x0F, 0x78, 0xC0, {length}, {index}"),
+            }
+            let result: [u64; 2] = std::mem::transmute(result);
+            let source: [u64; 2] = std::mem::transmute(source);
+            let neighbor: [u64; 2] = std::mem::transmute(neighbor);
+            ensure!(result[0] == expected, "SSE4a {name}: lower result {:#x}, expected {expected:#x}", result[0]);
+            ensure!(source == source_words, "SSE4a {name}: source XMM changed");
+            ensure!(neighbor == NEIGHBOR && marker == MARKER, "SSE4a {name}: another register changed");
+            ensure!(flags_before == flags_after, "SSE4a {name}: flags changed from {flags_before:#x} to {flags_after:#x}");
+            Ok(())
+        }
+
+        const DESTINATION: u64 = 0x1122_3344_5566_7788;
+        const SOURCE: u64 = 0xFEDC_BA98_7654_3210;
+        run::<true, 16, 16, false>(DESTINATION, SOURCE, 0x1122_3344_3210_7788, "INSERTQ retail 16/16")?;
+        run::<true, 0x50, 0x50, false>(DESTINATION, SOURCE, 0x1122_3344_3210_7788, "INSERTQ six-bit controls")?;
+        run::<true, 0, 0, false>(DESTINATION, SOURCE, SOURCE, "INSERTQ zero means 64")?;
+        run::<true, 0x40, 0x40, false>(DESTINATION, SOURCE, SOURCE, "INSERTQ masked zero controls")?;
+        run::<true, 1, 63, false>(DESTINATION, 1, 0x9122_3344_5566_7788, "INSERTQ highest bit")?;
+        run::<true, 8, 24, false>(DESTINATION, SOURCE, 0x1122_3344_1066_7788, "INSERTQ keeps outside bits")?;
+        run::<true, 16, 16, true>(DESTINATION, SOURCE, 0x1122_3344_3210_7788, "INSERTQ high XMM registers")?;
+
+        run::<false, 16, 16, false>(DESTINATION, SOURCE, 0x5566, "EXTRQ 16/16")?;
+        run::<false, 0x50, 0x50, false>(DESTINATION, SOURCE, 0x5566, "EXTRQ six-bit controls")?;
+        run::<false, 0, 0, false>(DESTINATION, SOURCE, DESTINATION, "EXTRQ zero means 64")?;
+        run::<false, 0x40, 0x40, false>(DESTINATION, SOURCE, DESTINATION, "EXTRQ masked zero controls")?;
+        run::<false, 1, 63, false>(0x9122_3344_5566_7788, SOURCE, 1, "EXTRQ highest bit")?;
+        run::<false, 8, 24, false>(DESTINATION, SOURCE, 0x55, "EXTRQ clears remaining lower bits")?;
+        run::<false, 16, 16, true>(DESTINATION, SOURCE, 0x5566, "EXTRQ high XMM destination")?;
+        Ok(())
+    });
+
     check("kernelx: GetConsoleType / XSystemGetDeviceType", || unsafe {
         ensure!(GetConsoleType() == 6, "GetConsoleType = {}", GetConsoleType());
         ensure!(XSystemGetDeviceType() == 7, "device type = {}", XSystemGetDeviceType());

@@ -134,6 +134,10 @@ fn test_title_runs_and_game_folder_is_untouched() {
         stdout.contains("[PASS] CPU: CLZERO batches preserve guarded bytes, registers and CMP flags"),
         "the CLZERO batch regression did not execute: {stdout}"
     );
+    assert!(
+        stdout.contains("[PASS] CPU: SSE4a INSERTQ and EXTRQ preserve defined bits, sources and flags"),
+        "the SSE4a regression did not execute: {stdout}"
+    );
     assert!(out.status.success(), "exit code {:?}", out.status.code());
 
     // (2) the game folder is untouched
