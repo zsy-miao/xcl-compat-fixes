@@ -93,3 +93,9 @@ separate reference helper produced matching outputs in two local runs. The suite
 includes a game-free BC5 control, a virtual memory destination and a file-backed
 request spanning two physical pages. Set `XCL_BCPACK_EXTERNAL_DECODER` to the
 absolute helper path to include those two process tests in the packaged build.
+
+The extended run of `cb8e15f` reached readable UI Text Size and Legal Notices
+screens on this PC. It displayed 1,132 frames and exited at its 430-second timer
+without a reported crash. The subsequent build `b696652` passed 125 release checks,
+including both optional BC5 helper tests. Its first 285-second game run exited
+normally after 548 frames. The log for that run did not record a BC5 request.
