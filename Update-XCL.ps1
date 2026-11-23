@@ -185,6 +185,7 @@ try {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'insn::tests', '--', '--test-threads=1', '--nocapture') -CountTests
     }
     if ($branch -eq $patchBranch) {
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'clzero_batch', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_depth_buffers_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'real::depth_regression_tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', '--', '--test-threads=1', '--nocapture') -CountTests
@@ -233,6 +234,7 @@ try {
         build_current = [bool]$BuildCurrent
         applied_patches = @()
         upstream_integrations = @()
+        local_fixes = @()
         built_utc = [DateTime]::UtcNow.ToString('o')
         build_command = 'cargo build --locked --release --workspace'
         tests_passed = $testPassed
@@ -247,6 +249,11 @@ try {
         $patchNote = "Includes PR #151 CPU compatibility fix ($pr151Revision).`r`nhttps://github.com/ivall/xcl/pull/151"
     }
     if ($branch -eq $patchBranch) {
+        $info.local_fixes = @([ordered]@{
+            name = 'clzero_loop_emulation'
+            files = @('crates/xcl/src/eh.rs', 'crates/xcl/src/insn.rs', 'crates/xcl/src/gpu/shader.rs')
+            scope = 'Batch recognized CLZERO/add/compare/back-jump loops with checked bounds and native writable-range validation; resume at the native compare to preserve flags and branch behavior. Synthetic title checks cover executed loops and memory boundaries.'
+        })
         $info.applied_patches += @(
             [ordered]@{ pull_request = 162; url = 'https://github.com/ivall/xcl/pull/162'; source_revision = $pr162Revision; scope = 'Graphics pipelines compile at first use with urgent compilation; compute first-use compilation is opt-in per title via lazy_compute_pipelines or XCL_LAZY_COMPUTE.' },
             [ordered]@{ pull_request = 163; url = 'https://github.com/ivall/xcl/pull/163'; source_revision = $pr163Revision },
@@ -271,6 +278,8 @@ try {
         $patchNote += "`r`nIncludes PR #187 memory windows ($pr187Revision), PR #203 integration ($pr203Revision), and PR #164 diagnostics ($pr164Revision)."
         $patchNote += "`r`nIncludes selected texture allocator/upload, mesh-layout refusal, typeless depth/view consistency, and lazy physical-page changes from upstream $textureAllocatorRevision; BUILD-INFO.json records the nine-file integration scope."
         $patchNote += "`r`nThe XG implementation is from #192; the source revision also records local texture-address, allocation cleanup and regression-test changes."
+        $info.test_suites = @('clzero_batch') + $info.test_suites
+        $patchNote += "`r`nIncludes local CLZERO loop emulation that avoids repeating a Windows memory query for every 64-byte zero operation."
     }
     [IO.File]::WriteAllText((Join-Path $stageDirectory 'BUILD-INFO.json'), ($info | ConvertTo-Json -Depth 5), $utf8)
     $startText = @"
