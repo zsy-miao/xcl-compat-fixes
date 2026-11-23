@@ -101,6 +101,9 @@ const COMMAND_REQUEST: u32 = 0;
 /// ID3D12Fence::Signal
 const FENCE_SIGNAL: usize = 10;
 
+#[path = "dstorage_capture.rs"]
+mod bcpack_capture;
+
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![DStorageGetFactory]
 }
@@ -966,6 +969,9 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
     if let Err(hr) = r.check(q.source_memory) {
+        if hr == E_DECOMPRESSION && r.bcpack() == 7 {
+            bcpack_capture::capture_refused(&r);
+        }
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         return q.enqueue(Entry::Refused { hr, req: r, file: None });
     }
