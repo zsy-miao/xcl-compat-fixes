@@ -102,6 +102,8 @@ mod tests {
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x74, 0x24, 0x08]), Some((ConsoleOnly::Clwb, 6)));
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x35, 1, 2, 3, 4]), Some((ConsoleOnly::Clwb, 8)));
         assert_eq!(decode(&[0x66, 0x41, 0x0F, 0xAE, 0x30]), Some((ConsoleOnly::Clwb, 5)));
+        // Exact instruction at the retail title's illegal-instruction crash: clwb [r9].
+        assert_eq!(decode(&[0x66, 0x41, 0x0F, 0xAE, 0x31]), Some((ConsoleOnly::Clwb, 5)));
         // rdpid rax; rdpid r9
         assert_eq!(decode(&[0xF3, 0x0F, 0xC7, 0xF8]), Some((ConsoleOnly::Rdpid(0), 4)));
         assert_eq!(decode(&[0xF3, 0x41, 0x0F, 0xC7, 0xF9]), Some((ConsoleOnly::Rdpid(9), 5)));

@@ -260,6 +260,30 @@ fn main() {
         Ok(())
     });
 
+    check("CPU: exact retail CLWB encoding resumes and preserves memory", || unsafe {
+        #[repr(align(64))]
+        struct CacheLines([u8; 192]);
+        let mut lines = Box::new(CacheLines([0xA5; 192]));
+        let line = lines.0.as_mut_ptr().add(64);
+        // clwb [r9], including the prefixes from the retail crash. On a CPU without CLWB,
+        // XCL's vectored handler must advance past all five bytes and resume this title.
+        std::arch::asm!(".byte 0x66, 0x41, 0x0F, 0xAE, 0x31", in("r9") line, options(nostack, preserves_flags));
+        ensure!(lines.0.iter().all(|b| std::ptr::read_volatile(b) == 0xA5), "CLWB changed the buffer");
+        Ok(())
+    });
+
+    check("CPU: CLZERO zeros one aligned cache line and preserves its neighbors", || unsafe {
+        #[repr(align(64))]
+        struct CacheLines([u8; 192]);
+        let mut lines = Box::new(CacheLines([0xA5; 192]));
+        // The instruction rounds an interior address down to its 64-byte cache line.
+        let inside_line = lines.0.as_mut_ptr().add(64 + 17);
+        std::arch::asm!(".byte 0x0F, 0x01, 0xFC", in("rax") inside_line, options(nostack, preserves_flags));
+        ensure!(lines.0[64..128].iter().all(|b| std::ptr::read_volatile(b) == 0), "CLZERO did not zero the selected line");
+        ensure!(lines.0[..64].iter().chain(&lines.0[128..]).all(|b| std::ptr::read_volatile(b) == 0xA5), "CLZERO changed a neighboring line");
+        Ok(())
+    });
+
     check("kernelx: GetConsoleType / XSystemGetDeviceType", || unsafe {
         ensure!(GetConsoleType() == 6, "GetConsoleType = {}", GetConsoleType());
         ensure!(XSystemGetDeviceType() == 7, "device type = {}", XSystemGetDeviceType());
