@@ -78,3 +78,18 @@ detiling optimization and our bounded CLWB loop handling. The first accelerated
 flush covered 129,600 iterations. The runtime comparison measures the combined
 build. A BC5 storage refusal and a 16 KiB graphics-memory copy refusal still
 appeared during the intro.
+
+## Optional BC5 decoding
+
+The experimental launcher can use the separate reference process for single-stage
+BC5 texture requests. XCL checks the helper's reported input consumption, output
+length, lane counts, and reconstruction status before copying the result to the
+requested destination. This mode uses fitted history and has no console decoder
+comparison. A run without a helper keeps the normal decompression error.
+
+Thirteen distinct 64 KiB requests captured during the intro matched their source
+file ranges and consumed their exact input in the independent entropy check. The
+separate reference helper produced matching outputs in two local runs. The suite
+includes a game-free BC5 control, a virtual memory destination and a file-backed
+request spanning two physical pages. Set `XCL_BCPACK_EXTERNAL_DECODER` to the
+absolute helper path to include those two process tests in the packaged build.

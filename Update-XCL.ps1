@@ -178,7 +178,10 @@ try {
     $env:XCL_DXC_THREADS = '2'
     $env:XCL_NETWORK = '0'
     $savedLazyCompute = [Environment]::GetEnvironmentVariable('XCL_LAZY_COMPUTE', 'Process')
+    $savedExternalDecoder = [Environment]::GetEnvironmentVariable('XCL_BCPACK_EXTERNAL_DECODER', 'Process')
+    $bc5HelperTests = 0
     try {
+    [Environment]::SetEnvironmentVariable('XCL_BCPACK_EXTERNAL_DECODER', $null, 'Process')
     # Baseline checks exercise eager compute; the opt-in mode gets its own check below.
     $env:XCL_LAZY_COMPUTE = '0'
     if ($patchedBuild) {
@@ -187,7 +190,16 @@ try {
     if ($branch -eq $patchBranch) {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'clzero_batch', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'sse4a', '--', '--test-threads=1', '--nocapture') -CountTests
-        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'dstorage', '--', '--test-threads=1', '--nocapture', '--skip', 'external_pipe_parent', '--skip', 'external_pipe_descendant') -CountTests
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'dstorage', '--', '--test-threads=1', '--nocapture', '--skip', 'external_pipe_parent', '--skip', 'external_pipe_descendant', '--skip', 'bc5_external_') -CountTests
+        if ($savedExternalDecoder) {
+            $env:XCL_BCPACK_EXTERNAL_DECODER = $savedExternalDecoder
+            try {
+                $passedBeforeHelper = $testPassed
+                Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'bc5_external_', '--', '--ignored', '--test-threads=1', '--nocapture') -CountTests
+                $bc5HelperTests = $testPassed - $passedBeforeHelper
+            }
+            finally { [Environment]::SetEnvironmentVariable('XCL_BCPACK_EXTERNAL_DECODER', $null, 'Process') }
+        }
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::d3d12x::title_textures::mirror_tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_depth_buffers_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'real::depth_regression_tests', '--', '--test-threads=1', '--nocapture') -CountTests
@@ -214,6 +226,7 @@ try {
     }
     }
     finally {
+        [Environment]::SetEnvironmentVariable('XCL_BCPACK_EXTERNAL_DECODER', $savedExternalDecoder, 'Process')
         if ($null -eq $savedLazyCompute) { Remove-Item -LiteralPath Env:\XCL_LAZY_COMPUTE -ErrorAction SilentlyContinue }
         else { $env:XCL_LAZY_COMPUTE = $savedLazyCompute }
     }
@@ -244,6 +257,7 @@ try {
         build_command = 'cargo build --locked --release --workspace'
         tests_passed = $testPassed
         tests_ignored = $testIgnored
+        optional_bc5_helper_tests_passed = $bc5HelperTests
         gpu_skip_reasons = @($testSkips)
         test_suites = @('disasm_e2e', 'e2e', 'rpf_e2e', 'gpu_compute_e2e')
     }
@@ -318,6 +332,7 @@ try {
         $info.test_suites = @('clwb', 'real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
         $info.test_suites = @('console_depth_buffers_become_pc_ones', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'console_mesh_streams_become_pc_ones', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
         $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
+        if ($bc5HelperTests -gt 0) { $info.test_suites += 'bc5_external_ (separate reference helper)' }
         $patchNote += "`r`nIncludes PR #163 depth fixes ($pr163Revision) and PR #170 mesh pipeline fixes ($pr170Revision)."
         $patchNote += "`r`nIncludes PR #192 texture tiling ($pr192Revision) and PR #195 graphics changes ($pr195Revision)."
         $patchNote += "`r`nIncludes PR #162 first-use pipelines ($pr162Revision); compute first-use is disabled by default and can be enabled per title with lazy_compute_pipelines. XCL_LAZY_COMPUTE overrides that setting."
