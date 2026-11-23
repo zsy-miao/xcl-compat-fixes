@@ -127,6 +127,10 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let fails: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[FAIL]")).collect();
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
+    assert!(
+        stdout.contains("[PASS] CPU: CLZERO batches preserve guarded bytes, registers and CMP flags"),
+        "the CLZERO batch regression did not execute: {stdout}"
+    );
     assert!(out.status.success(), "exit code {:?}", out.status.code());
 
     // (2) the game folder is untouched

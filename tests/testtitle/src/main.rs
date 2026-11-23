@@ -284,6 +284,80 @@ fn main() {
         Ok(())
     });
 
+    check("CPU: CLZERO batches preserve guarded bytes, registers and CMP flags", || unsafe {
+        const MARKER: u64 = 0x98AB_CDEF_7654_3210;
+        // Each body is the genuine retail do-while loop, including its short branch back
+        // to CLZERO. The handler may finish one bounded batch, then resumes at native CMP.
+        unsafe fn run_loop(register: u8, start: usize, bound: usize) -> (usize, usize, u64, u64) {
+            let mut cursor = start;
+            let mut limit = bound;
+            let mut marker = MARKER;
+            let flags: u64;
+            macro_rules! body {
+                ($reg:literal, $compare:literal) => {
+                    std::arch::asm!(
+                        ".byte 0x0F, 0x01, 0xFC",
+                        ".byte 0x48, 0x83, 0xC0, 0x40",
+                        $compare,
+                        ".byte 0x72, 0xF4",
+                        "pushfq",
+                        "pop rcx",
+                        inout("rax") cursor,
+                        inout($reg) limit,
+                        inout("r11") marker,
+                        lateout("rcx") flags,
+                    )
+                };
+            }
+            match register {
+                10 => body!("r10", ".byte 0x4C, 0x39, 0xD0"),
+                9 => body!("r9", ".byte 0x4C, 0x39, 0xC8"),
+                8 => body!("r8", ".byte 0x4C, 0x39, 0xC0"),
+                2 => body!("rdx", ".byte 0x48, 0x39, 0xD0"),
+                _ => unreachable!(),
+            }
+            (cursor, limit, marker, flags)
+        }
+
+        // A nonaligned bound, exact equality, and empty/backwards bounds check do-while
+        // semantics. The last case crosses the handler's 1 MiB cap and must take two batches.
+        for (register, name) in [(10, "r10"), (9, "r9"), (8, "r8"), (2, "rdx")] {
+            for (case, cleared_bytes, bound_delta) in [
+                ("nonaligned end", 192usize, 185isize),
+                ("equal final pointer", 192, 192),
+                ("equal initial bound", 64, 0),
+                ("backwards bound", 64, -17),
+                ("multiple bounded batches", (1 << 20) + 128, (1 << 20) + 121),
+            ] {
+                let mut bytes = vec![0xA5u8; cleared_bytes + 256];
+                let base = bytes.as_mut_ptr() as usize;
+                let first_line = (base + 127) & !63;
+                let start = first_line + 17;
+                let bound = if bound_delta >= 0 { start + bound_delta as usize } else { start - (-bound_delta) as usize };
+                let expected_cursor = start + cleared_bytes;
+                let (cursor, returned_bound, marker, flags) = run_loop(register, start, bound);
+                ensure!(cursor == expected_cursor, "CLZERO {name}, {case}: RAX {cursor:#x}, expected {expected_cursor:#x}");
+                ensure!(returned_bound == bound && marker == MARKER, "CLZERO {name}, {case}: changed another register");
+
+                let expected_flags: u64;
+                std::arch::asm!(
+                    "cmp {left}, {right}", "pushfq", "pop {flags}",
+                    left = in(reg) expected_cursor,
+                    right = in(reg) bound,
+                    flags = lateout(reg) expected_flags,
+                );
+                const CMP_FLAGS: u64 = 0x8D5; // CF, PF, AF, ZF, SF, OF
+                ensure!(flags & CMP_FLAGS == expected_flags & CMP_FLAGS, "CLZERO {name}, {case}: CMP flags {flags:#x}, expected {expected_flags:#x}");
+                let first = first_line - base;
+                for (offset, byte) in bytes.iter().enumerate() {
+                    let expected = if (first..first + cleared_bytes).contains(&offset) { 0 } else { 0xA5 };
+                    ensure!(std::ptr::read_volatile(byte) == expected, "CLZERO {name}, {case}: wrong byte at {offset:#x}");
+                }
+            }
+        }
+        Ok(())
+    });
+
     check("kernelx: GetConsoleType / XSystemGetDeviceType", || unsafe {
         ensure!(GetConsoleType() == 6, "GetConsoleType = {}", GetConsoleType());
         ensure!(XSystemGetDeviceType() == 7, "device type = {}", XSystemGetDeviceType());
