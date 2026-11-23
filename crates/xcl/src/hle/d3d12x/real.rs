@@ -525,6 +525,32 @@ pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
     !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
 }
 
+/// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
+/// this, return buffer, ...), false when `b` is (the C way: return buffer, this, ...). A return
+/// buffer on the stack can hold a stale copy of an object's vtable pointer and look adopted
+/// itself: a retail game's C-way allocation query then wrote its result over the device.
+/// From upstream ivall/xcl 7a033c8cd13194900cd49c01ed60a59c6c9559c7.
+pub(super) unsafe fn this_first(a: *mut c_void, b: *mut c_void) -> bool {
+    match (is_adopted(a), is_adopted(b)) {
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => {
+            let (mut lo, mut hi) = (0usize, 0usize);
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);
+            let on_stack = |p: *mut c_void| (lo..hi).contains(&(p as usize));
+            let dev = device_raw();
+            if on_stack(a) != on_stack(b) {
+                on_stack(b)
+            } else if a == dev || b == dev {
+                a == dev
+            } else {
+                true
+            }
+        }
+        (false, false) => false,
+    }
+}
+
 fn is_ext(v: usize) -> bool {
     EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
 }
@@ -5213,3 +5239,41 @@ mod depth_gpu_regression_tests;
 #[cfg(test)]
 #[path = "real_mesh_refusal_tests.rs"]
 mod mesh_refusal_tests;
+
+#[cfg(test)]
+mod this_first_tests {
+    use super::*;
+
+    /// PR263 (ryosen0), test commit 2f5979ecdf686436c90c479727f2dcc16973072d,
+    /// reviewed head 130a14387196432caa3a37786dbd847667b1d0ab. Synthetic objects;
+    /// no GPU or title. The stale stack copy must never be mistaken for `this`.
+    #[test]
+    fn a_return_buffer_with_a_stale_vtable_copy_is_not_the_object() {
+        let pc = [0usize; 32];
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        let plain = 0x1234_5678usize;
+        let p = &plain as *const usize as *mut c_void;
+        let obj = Box::into_raw(Box::new([vtbl])) as *mut c_void;
+        let buf = [vtbl];
+        let b = buf.as_ptr() as *mut c_void;
+        unsafe {
+            assert!(is_adopted(obj) && is_adopted(b), "both look adopted");
+            assert!(this_first(obj, p));
+            assert!(!this_first(p, obj));
+            assert!(!this_first(p, p) && !this_first(std::ptr::null_mut(), std::ptr::null_mut()));
+            assert!(this_first(obj, std::ptr::null_mut()));
+            assert!(!this_first(std::ptr::null_mut(), obj));
+            assert!(this_first(obj, b));
+            assert!(!this_first(b, obj));
+            let stale = [vtbl];
+            let s = stale.as_ptr() as *mut c_void;
+            assert!(this_first(b, s) && this_first(s, b));
+            drop(Box::from_raw(obj as *mut [usize; 1]));
+        }
+        if let Some(g) = EXTS.lock().unwrap().as_mut() {
+            g.remove(&vtbl);
+        }
+    }
+}

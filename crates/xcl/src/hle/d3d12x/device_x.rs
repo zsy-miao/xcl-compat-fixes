@@ -729,7 +729,7 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
 /// Textures get the console's size (XG: what the title then places them in); buffers and
 /// what XG does not model the PC's.
 pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x38]) -> *mut [u64; 2] {
-    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
+    let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
     type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
     let pc: F = std::mem::transmute(real::orig_fn(this, 25));
     let (mut size, mut align) = (0u64, 0u64);
@@ -766,12 +766,12 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
 /// each resource's {offset, alignment, size} goes to the last argument when there is one.
 pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
     real::note_newer_device_method(108);
-    let ret = if real::is_adopted(a) { b } else { a } as *mut [u64; 2];
+    let ret = if real::this_first(a, b) { b } else { a } as *mut [u64; 2];
     let (mut size, mut align) = (0u64, 0u64);
     for k in 0..n as usize {
         let mut r = [0u64; 2];
         let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
-        let (x, y) = if real::is_adopted(a) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
+        let (x, y) = if real::this_first(a, b) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
         get_resource_allocation_info_x(x, y, mask, 1, d);
         if r[0] == u64::MAX || r[1] == 0 {
             size = u64::MAX;
@@ -794,7 +794,7 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_v
 /// returned through a hidden pointer - like #25 called the C way (a retail game: return buffer, device,
 /// ...) or the C++ way.
 pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void, b: *mut c_void, mask: u32, ty: u32) -> *mut [u32; 5] {
-    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u32; 5]) } else { (b, a as *mut [u32; 5]) };
+    let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u32; 5]) } else { (b, a as *mut [u32; 5]) };
     type F = unsafe extern "system" fn(*mut c_void, *mut [u32; 5], u32, u32) -> *mut [u32; 5];
     let pc: F = std::mem::transmute(real::orig_fn(this, 26));
     let mut r = [0u32; 5];
