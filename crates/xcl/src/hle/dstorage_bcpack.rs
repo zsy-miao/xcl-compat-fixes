@@ -3,14 +3,23 @@
 
 #[path = "bcpack.rs"]
 mod entropy;
-#[path = "bcpack_bc7.rs"]
+#[path = "bcpack_bc7_general.rs"]
 mod bc7;
 
 use std::io::{Read, Write};
-use std::os::windows::process::CommandExt;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::JobObjects::{CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject};
+use windows_sys::Win32::System::Threading::{CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT};
 
 pub(super) const MAX_DESTINATION: usize = entropy::MAX_OUTPUT_SYMBOLS / 2;
 
@@ -24,7 +33,7 @@ pub(super) fn decode(source: &[u8], destination: usize) -> Result<Vec<u8>, Strin
         return Err("BC7 BCPack sizes exceed the bounded decoder or are not whole blocks".into());
     }
     let lanes = entropy::decode_bc7_entropy(source, destination / 16).map_err(|e| e.to_string())?;
-    match bc7::reconstruct_mode6(&lanes) {
+    match bc7::reconstruct(&lanes) {
         Ok(bytes) => Ok(bytes),
         Err(native_error) => {
             let Some(executable) = std::env::var_os("XCL_BCPACK_EXTERNAL_DECODER").filter(|s| !s.is_empty()) else {
@@ -56,54 +65,282 @@ fn validate_response(bytes: Vec<u8>, expected: usize, diagnostics: &[u8]) -> Res
 }
 
 fn external(executable: &Path, lanes: &[Vec<u8>; 16], expected: usize) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     // The separate research tool has a smaller per-request limit. Never split a
     // packet: the predictor history and entropy clocks belong to the whole tile.
-    if !executable.is_absolute() || !executable.is_file() || expected > 65536 {
-        return Err("external BC7 decoder requires an absolute executable path and at most 64 KiB output".into());
+    if !executable.is_absolute() || !executable.is_file() || expected > MAX_DESTINATION {
+        return Err("external BC7 decoder requires an absolute executable path and bounded output".into());
     }
-    let request = serde_json::to_vec(&serde_json::json!({ "lanes": lanes, "expected_bytes": expected }))
-        .map_err(|e| e.to_string())?;
-    if request.len() > 4 << 20 { return Err("external BC7 decoder request exceeds 4 MiB".into()); }
-    let mut child = Command::new(executable).arg("--stdio").creation_flags(0x0800_0000)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-        .map_err(|e| format!("external BC7 decoder could not start: {e}"))?;
-    let mut input = child.stdin.take().unwrap();
-    let output = child.stdout.take().unwrap();
-    let errors = child.stderr.take().unwrap();
-    let writer = std::thread::spawn(move || input.write_all(&request));
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        output.take(expected as u64 + 1).read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let diagnostics = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        errors.take(8193).read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break Err("external BC7 decoder timed out".to_string()),
-            Err(error) => break Err(format!("external BC7 decoder wait failed: {error}")),
-        }
-    };
-    if status.is_err() { let _ = child.kill(); let _ = child.wait(); }
-    let write_result = writer.join().map_err(|_| "external BC7 input writer failed".to_string())?;
-    let output = reader.join().map_err(|_| "external BC7 output reader failed".to_string())?
-        .map_err(|e| e.to_string())?;
-    let diagnostics = diagnostics.join().map_err(|_| "external BC7 diagnostics reader failed".to_string())?
-        .map_err(|e| e.to_string())?;
-    let status = status?;
-    if !status.success() || write_result.is_err() || diagnostics.len() > 8192 {
-        return Err(format!("external BC7 decoder refused the request ({status})"));
-    }
+    let capacity = lanes.iter().try_fold(0usize, |sum, lane| sum.checked_add(lane.len()))
+        .and_then(|symbols| symbols.checked_mul(4)).and_then(|bytes| bytes.checked_add(128))
+        .filter(|&bytes| bytes <= 80 << 20).ok_or_else(|| "external BC7 decoder request is too large".to_string())?;
+    let mut request = Vec::new();
+    request.try_reserve_exact(capacity).map_err(|_| "external BC7 decoder request allocation failed".to_string())?;
+    write!(&mut request, "{{\"expected_bytes\":{expected},\"lanes\":").map_err(|e| e.to_string())?;
+    // Serialize the borrowed lanes directly. A json! Value would clone every
+    // symbol into a much larger tree while the title is already under memory load.
+    serde_json::to_writer(&mut request, lanes).map_err(|e| e.to_string())?;
+    request.push(b'}');
+    if request.len() > 80 << 20 { return Err("external BC7 decoder request exceeds 80 MiB".into()); }
+    let (output, diagnostics) = run_external(executable, &[OsStr::new("--stdio")], request, expected, deadline)?;
     validate_response(output, expected, &diagnostics)
+}
+
+/// The job is assigned by CreateProcessW itself, before the helper can execute
+/// or spawn descendants. AssignProcessToJobObject after spawn has a race here.
+struct HelperJob(OwnedHandle);
+
+impl HelperJob {
+    fn new() -> std::io::Result<Self> {
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() { return Err(std::io::Error::last_os_error()); }
+            let job = Self(OwnedHandle::from_raw_handle(handle));
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(handle, JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _, std::mem::size_of_val(&limits) as u32) == 0
+            { return Err(std::io::Error::last_os_error()); }
+            Ok(job)
+        }
+    }
+}
+
+impl Drop for HelperJob {
+    fn drop(&mut self) {
+        // No breakaway flags are enabled, so this includes inherited-pipe descendants.
+        unsafe { TerminateJobObject(self.0.as_raw_handle(), 1); }
+        // OwnedHandle closes the final, non-inheritable job handle as a second guard.
+    }
+}
+
+struct AttributeList(Vec<usize>);
+
+impl AttributeList {
+    fn new() -> std::io::Result<Self> {
+        unsafe {
+            let mut bytes = 0;
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut bytes);
+            if bytes == 0 { return Err(std::io::Error::last_os_error()); }
+            let mut storage = vec![0; bytes.div_ceil(std::mem::size_of::<usize>())];
+            if InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 2, 0, &mut bytes) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(storage))
+        }
+    }
+}
+
+impl Drop for AttributeList {
+    fn drop(&mut self) { unsafe { DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast()); } }
+}
+
+fn command_line(executable: &Path, arguments: &[&OsStr]) -> Vec<u16> {
+    let mut line = Vec::new();
+    for argument in std::iter::once(executable.as_os_str()).chain(arguments.iter().copied()) {
+        if !line.is_empty() { line.push(b' ' as u16); }
+        line.push(b'"' as u16);
+        let mut slashes = 0;
+        for unit in argument.encode_wide() {
+            if unit == b'\\' as u16 { slashes += 1; continue; }
+            line.extend(std::iter::repeat_n(b'\\' as u16, if unit == b'"' as u16 { slashes * 2 + 1 } else { slashes }));
+            line.push(unit);
+            slashes = 0;
+        }
+        line.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
+        line.push(b'"' as u16);
+    }
+    line.push(0);
+    line
+}
+
+fn spawn_helper(executable: &Path, arguments: &[&OsStr], job: &HelperJob)
+    -> std::io::Result<(OwnedHandle, std::io::PipeWriter, std::io::PipeReader, std::io::PipeReader)>
+{
+    let (input, writer) = std::io::pipe()?;
+    let (reader, output) = std::io::pipe()?;
+    let (errors, diagnostics) = std::io::pipe()?;
+    let inherited = [input.as_raw_handle(), output.as_raw_handle(), diagnostics.as_raw_handle()];
+    let jobs = [job.0.as_raw_handle()];
+    let mut attributes = AttributeList::new()?;
+    unsafe {
+        for &handle in &inherited {
+            if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        for (key, ptr, size) in [
+            (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.as_ptr().cast(), std::mem::size_of_val(&inherited)),
+            (PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs.as_ptr().cast(), std::mem::size_of_val(&jobs)),
+        ] {
+            if UpdateProcThreadAttribute(attributes.0.as_mut_ptr().cast(), 0, key as usize,
+                ptr, size, std::ptr::null_mut(), std::ptr::null()) == 0
+            { return Err(std::io::Error::last_os_error()); }
+        }
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        startup.StartupInfo.hStdInput = inherited[0];
+        startup.StartupInfo.hStdOutput = inherited[1];
+        startup.StartupInfo.hStdError = inherited[2];
+        startup.lpAttributeList = attributes.0.as_mut_ptr().cast();
+        let application: Vec<u16> = executable.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut command = command_line(executable, arguments);
+        let mut process = PROCESS_INFORMATION::default();
+        if CreateProcessW(application.as_ptr(), command.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1,
+            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, std::ptr::null(), std::ptr::null(),
+            &startup.StartupInfo, &mut process) == 0
+        { return Err(std::io::Error::last_os_error()); }
+        let process_handle = OwnedHandle::from_raw_handle(process.hProcess);
+        drop(OwnedHandle::from_raw_handle(process.hThread));
+        Ok((process_handle, writer, reader, errors))
+    }
+}
+
+enum PipeResult {
+    Input(std::io::Result<()>),
+    Output(std::io::Result<Vec<u8>>),
+    Diagnostics(std::io::Result<Vec<u8>>),
+}
+
+fn run_external(executable: &Path, arguments: &[&OsStr], request: Vec<u8>, expected: usize, deadline: Instant)
+    -> Result<(Vec<u8>, Vec<u8>), String>
+{
+    let io_error = |e: std::io::Error| format!("external BC7 decoder I/O failed: {e}");
+    let job = HelperJob::new().map_err(io_error)?;
+    let (process, mut input, output, diagnostics) = spawn_helper(executable, arguments, &job).map_err(io_error)?;
+    let (send, receive) = mpsc::channel();
+    let input_send = send.clone();
+    std::thread::Builder::new().name("bc7-input".into()).spawn(move || {
+        let result = input.write_all(&request);
+        drop(input);
+        let _ = input_send.send(PipeResult::Input(result));
+    }).map_err(io_error)?;
+    let output_send = send.clone();
+    std::thread::Builder::new().name("bc7-output".into()).spawn(move || {
+        let mut bytes = Vec::new();
+        let result = output.take(expected as u64 + 1).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = output_send.send(PipeResult::Output(result));
+    }).map_err(io_error)?;
+    std::thread::Builder::new().name("bc7-errors".into()).spawn(move || {
+        let mut bytes = Vec::new();
+        let result = diagnostics.take(8193).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = send.send(PipeResult::Diagnostics(result));
+    }).map_err(io_error)?;
+    let (mut wrote, mut bytes, mut report, mut exited) = (false, None, None, false);
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .ok_or_else(|| "external BC7 decoder timed out (including pipe I/O)".to_string())?;
+        if !exited {
+            match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => {
+                    let mut code = 0;
+                    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+                        return Err(io_error(std::io::Error::last_os_error()));
+                    }
+                    if code != 0 { return Err(format!("external BC7 decoder refused the request (exit {code})")); }
+                    exited = true;
+                }
+                WAIT_TIMEOUT => {}
+                _ => return Err(io_error(std::io::Error::last_os_error())),
+            }
+        }
+        if exited && wrote && bytes.is_some() && report.is_some() {
+            return Ok((bytes.unwrap(), report.unwrap()));
+        }
+        match receive.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(PipeResult::Input(result)) => { result.map_err(io_error)?; wrote = true; }
+            Ok(PipeResult::Output(result)) => {
+                let value = result.map_err(io_error)?;
+                if value.len() != expected { return Err("external BC7 decoder returned the wrong output length".into()); }
+                bytes = Some(value);
+            }
+            Ok(PipeResult::Diagnostics(result)) => {
+                let value = result.map_err(io_error)?;
+                if value.len() > 8192 { return Err("external BC7 decoder exceeded the diagnostics limit".into()); }
+                report = Some(value);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if wrote && bytes.is_some() && report.is_some() => {
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("external BC7 decoder pipe worker stopped".into()),
+        }
+        // No thread joins: every return kills the job, closing descendant pipe ends.
+        // The shared deadline also bounds callers if an I/O worker cannot finish.
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subprocess_test_name(name: &str) -> String {
+        let module = module_path!().split_once("::").unwrap().1;
+        format!("{module}::{name}")
+    }
+
+    fn pipe_helper_marker() -> std::path::PathBuf {
+        let args: Vec<_> = std::env::args().collect();
+        let index = args.iter().position(|arg| arg == "--skip").expect("pipe helper marker argument");
+        std::env::temp_dir().join(&args[index + 1])
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture, launched only by external_timeout_includes_inherited_pipes"]
+    fn external_pipe_descendant() {
+        std::fs::write(pipe_helper_marker(), std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture, launched only by external_timeout_includes_inherited_pipes"]
+    fn external_pipe_parent() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let marker = pipe_helper_marker();
+        let name = marker.file_name().unwrap();
+        let descendant = Command::new(std::env::current_exe().unwrap())
+            .args([OsStr::new("--ignored"), OsStr::new("--exact"),
+                OsStr::new(&subprocess_test_name("external_pipe_descendant")), OsStr::new("--nocapture"),
+                OsStr::new("--skip"), name])
+            .stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
+            .creation_flags(CREATE_NO_WINDOW).spawn().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert!(marker.exists(), "descendant must hold the inherited pipes before the parent exits");
+        drop(descendant); // Child::drop does not terminate the descendant.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn external_timeout_includes_inherited_pipes() {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let marker = format!("xcl-bc7-pipes-{}-{nonce}", std::process::id());
+        let executable = std::env::current_exe().unwrap();
+        let helper = subprocess_test_name("external_pipe_parent");
+        let start = Instant::now();
+        // The parent exits 0 after starting a sleeping descendant. No process
+        // reads the input, so a large write stalls too; the descendant also keeps
+        // stdout/stderr open. Waiting only for the parent misses all three pipes.
+        let result = run_external(&executable, &[OsStr::new("--ignored"), OsStr::new("--exact"),
+            OsStr::new(&helper), OsStr::new("--nocapture"), OsStr::new("--skip"), OsStr::new(&marker)],
+            vec![b'x'; 1 << 20], 65536, start + Duration::from_secs(2));
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(4), "pipe I/O must not add an unbounded wait");
+        let marker_path = std::env::temp_dir().join(marker);
+        let pid: u32 = std::fs::read_to_string(&marker_path).expect("descendant started and inherited the pipes").parse().unwrap();
+        std::fs::remove_file(marker_path).unwrap();
+        unsafe {
+            let raw = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !raw.is_null() {
+                let descendant = OwnedHandle::from_raw_handle(raw);
+                assert_eq!(WaitForSingleObject(descendant.as_raw_handle(), 1000), WAIT_OBJECT_0,
+                    "timed-out helper descendants must terminate with their job");
+            }
+        }
+    }
 
     fn control() -> Vec<u8> {
         // Fixed MIT Xbox2Windows issue-442 packet, without game data/history.
