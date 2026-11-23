@@ -813,6 +813,24 @@ struct Away {
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
+/// A live physical mapping exists at this 64 KiB page even before lazy backing is
+/// touched/committed. Consult the mapping table, not the host virtual-memory state.
+pub fn physical_page_at(va: usize) -> bool {
+    AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
+}
+
+static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn gpu_view_map_gen() -> u64 {
+    GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
+}
+
+fn note_mapping_at(va: usize) {
+    if mirrors::source(va).is_some() {
+        GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Page numbers count 4 KiB frames, as on the console: a 64 KiB page's is a multiple of 16 (a retail game
 /// packs them shifted right by 4). Index 0 of unified memory is page 16 - 0 means "no page".
 const FRAMES: usize = PHYS_PAGE >> 12;
@@ -954,6 +972,7 @@ fn reserved_page(a: usize) -> bool {
 unsafe fn unmap_away(away: &mut Away, at: usize) {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
+        note_mapping_at(at);
         // Never touched: the page still consists of zeros at its uncommitted home.
         if lazy::unmark(at) {
             return;
@@ -1024,6 +1043,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
+                note_mapping_at(at);
             }
         }
     }
@@ -1112,6 +1132,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         if fresh && plain && reserved_page(at) && !committed_page(home) && lazy::mark(at) {
             away.at.insert(at, p);
             away.page.insert(p, at);
+            note_mapping_at(at);
             continue;
         }
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
@@ -1129,6 +1150,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
+        note_mapping_at(at);
     }
     // a range chosen here (no address given), all of it unmapped: back to the sparse windows
     if pages.iter().all(|&p| p == 0) {

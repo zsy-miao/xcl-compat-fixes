@@ -42,6 +42,8 @@ struct Entry {
     va: usize,
     /// The CPU view to read/watch when the GPU view has no mapped pages (PR #283).
     src: usize,
+    /// Recheck the source when physical mappings of this GPU view change.
+    in_gpu_view: bool,
     tex: Arc<xg::Texture>,
     /// the state the texture was created in (uploads leave it there)
     state: D3D12_RESOURCE_STATES,
@@ -94,7 +96,8 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
             crate::xlog_info!("D3D12.X: a texture at {va:#x} lies in a GPU view of the title's CPU memory: kept in step with {src:#x} ({n} so far)");
         }
     }
-    let e = Entry { device: device as usize, va, src, tex: Arc::new(tex), state, pending: true, gpu_written: false };
+    let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let e = Entry { device: device as usize, va, src, in_gpu_view, tex: Arc::new(tex), state, pending: true, gpu_written: false };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -112,10 +115,46 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
 /// A mapped GPU view owns its data; otherwise read the paired CPU view's same offset.
 fn mirror_source(va: usize) -> usize {
     let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
+    if crate::hle::kernelx::physical_page_at(va) {
+        return va;
+    }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
     if mapped { va } else { src }
+}
+
+/// PR #283 review correction (a2bfbed): a later physical mapping can replace the
+/// CPU mirror, including a lazy page still reserved until its first CPU touch.
+fn recheck_gpu_view_sources() {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let gen = crate::hle::kernelx::gpu_view_map_gen();
+    if SEEN.swap(gen, Ordering::AcqRel) == gen {
+        return;
+    }
+    let mut changed = false;
+    for e in TEXTURES.lock().unwrap().values_mut() {
+        changed |= recheck_source(e);
+    }
+    if changed {
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn recheck_source(e: &mut Entry) -> bool {
+    if !e.in_gpu_view {
+        return false;
+    }
+    let src = mirror_source(e.va);
+    if src == e.src {
+        return false;
+    }
+    e.src = src;
+    if !e.pending {
+        e.pending = true;
+        PENDING.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
@@ -226,6 +265,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
+    recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);

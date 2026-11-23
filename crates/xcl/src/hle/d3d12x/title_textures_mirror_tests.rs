@@ -19,6 +19,18 @@ impl Drop for Reservation {
     }
 }
 
+struct PhysicalPage { id: usize, at: usize }
+impl Drop for PhysicalPage {
+    fn drop(&mut self) {
+        unsafe {
+            if kernelx::physical_page_at(self.at) {
+                kernelx::MapTitlePhysicalPages(self.at as *mut c_void, 1, 0, 4, std::ptr::null_mut());
+            }
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut self.id);
+        }
+    }
+}
+
 unsafe fn reserve(flags: u32, protect: u32) -> Reservation {
     let at = kernelx::VirtualAlloc(std::ptr::null(), RESERVATION, flags, protect) as usize;
     assert_ne!(at, 0, "reserve-only fallback must succeed");
@@ -31,7 +43,7 @@ unsafe fn reserve(flags: u32, protect: u32) -> Reservation {
 
 #[test]
 fn gpu_visible_fallback_is_forced_and_reports_cpu_writes() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         for (flags, protect) in [(0x2040_2000, mem::PAGE_READWRITE), (0x2000_2000, 0x2404), (kernelx::MEM_GRAPHICS | mem::MEM_RESERVE, mem::PAGE_READWRITE)] {
             let r = reserve(flags, protect);
@@ -53,7 +65,7 @@ fn gpu_visible_fallback_is_forced_and_reports_cpu_writes() {
 
 #[test]
 fn gpu_mirror_pairing_preserves_offsets_and_release() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (cpu, gpu, other, size) = (0x6A00_0000_0000, 0x6A10_0000_0000, 0x6A20_0000_0000, 0x80_0000);
     mirrors::reserved(cpu, size, 0x2040_2000, mem::PAGE_READWRITE);
     mirrors::reserved(other, size / 2, 0x2040_2000, mem::PAGE_READWRITE);
@@ -113,7 +125,8 @@ unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D12Re
 
 #[test]
 fn gpu_mirror_texture_reads_cpu_view_and_refreshes_after_cpu_write() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(super::super::backend(), super::super::Backend::Real, "initialize the real D3D12 backend before using its device");
     unsafe {
         let raw_device = super::super::real::device_raw();
         let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
@@ -150,10 +163,33 @@ fn gpu_mirror_texture_reads_cpu_view_and_refreshes_after_cpu_write() {
             assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "GPU contents must follow CPU writes through the mirror");
             assert_eq!(address(key), Some(va));
         }
+        let (mut count, mut id) = (1usize, 0usize);
+        assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id), 1);
+        let mut mapped = PhysicalPage { id, at: va };
+        let before = kernelx::gpu_view_map_gen();
+        assert_eq!(kernelx::MapTitlePhysicalPages(va as *mut c_void, 1, 0, 4, &mut mapped.id) as usize, va);
+        assert_ne!(kernelx::gpu_view_map_gen(), before);
+        assert!(kernelx::physical_page_at(va), "the real mapping table identifies the live page");
+        let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        assert_ne!(mem::VirtualQuery(va as *const c_void, &mut info, std::mem::size_of_val(&info)), 0);
+        assert_eq!(info.State, mem::MEM_RESERVE, "exercise a mapped page before its first touch");
+        assert_eq!(mirror_source(va), va, "a mapped lazy page must not read the CPU mirror");
+        refresh(queue.as_raw());
+        assert_eq!(TEXTURES.lock().unwrap().get(&key).unwrap().src, va, "an existing texture follows the new mapping");
+        assert_eq!(read_r8(dev, &queue, &texture), vec![0; 64 * 64], "the untouched physical page contains logical zeros");
+        std::ptr::write_bytes(va as *mut u8, 0xC7, PAGE);
+        refresh(queue.as_raw());
+        assert_eq!(read_r8(dev, &queue, &texture), vec![0xC7; 64 * 64]);
+        assert_eq!(kernelx::MapTitlePhysicalPages(va as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, va);
+        assert!(!kernelx::physical_page_at(va));
+        refresh(queue.as_raw());
+        assert_eq!(TEXTURES.lock().unwrap().get(&key).unwrap().src, src);
+        assert_eq!(read_r8(dev, &queue, &texture), vec![0x9A; 64 * 64], "unmapping restores the original CPU view");
+        assert_eq!(address(key), Some(va));
+        drop(mapped);
         forget(key);
         assert_eq!(address(key), None);
-        // A new registration with already mapped GPU memory uses that view, as in
-        // PR #283. Existing entries deliberately retain their registration-time src.
+        // An already committed GPU view is selected for a new registration too.
         assert_eq!(kernelx::VirtualAlloc(va as *const c_void, PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize, va);
         assert_eq!(mirror_source(va), va);
         register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
