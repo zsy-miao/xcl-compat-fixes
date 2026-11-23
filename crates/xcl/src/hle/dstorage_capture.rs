@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const MAX_SAMPLES: usize = 8;
+const MAX_SAMPLES: usize = 32;
 const MAX_BYTES: u32 = 16 << 20;
 
 #[derive(Default)]
@@ -218,7 +218,7 @@ mod tests {
     fn bcpack_failure_capture_caps_samples_and_rejects_oversized_requests_before_reading() {
         let directory = TempDir::new();
         let mut captures = Captures::default();
-        for byte in 0..10u8 {
+        for byte in 0..(MAX_SAMPLES + 2) as u8 {
             let source = [byte; 4];
             let request = Request { options: SOURCE_MEMORY_BIT | (7 << BCPACK_SHIFT), source: source.as_ptr() as u64,
                 source_size: 4, destination: 0x1000, destination_size: 64, ..Default::default() };

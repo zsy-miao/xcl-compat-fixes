@@ -629,7 +629,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 bytes
             }
             Err(error) => {
-                warn_once("BCPack BC7", format_args!("refused without destination writes: {error}"));
+                warn_once("BCPack BC7", format_args!("refused without destination writes (src={}, dst={n}, file offset={:#x}): {error}", src.len(), r.offset));
                 return Err(E_DECOMPRESSION);
             }
         }
