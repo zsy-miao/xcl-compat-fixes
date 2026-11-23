@@ -371,6 +371,7 @@ type FnReplaceFileW = unsafe extern "system" fn(*const u16, *const u16, *const u
 static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
+static O_READ_FILE: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_A: AtomicUsize = AtomicUsize::new(0);
@@ -411,6 +412,14 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
         Target::Translated(p) => orig(wide(&p).as_ptr()),
         Target::Game { rel } => bool_result(v.remove_dir(&rel)),
     }
+}
+
+/// Kernel file reads cannot fault deferred destination pages into the title.
+unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
+    let orig = orig!(O_READ_FILE as F);
+    if !buf.is_null() { crate::hle::kernelx::lazy::ensure(buf as usize, n as usize); }
+    orig(h, buf, n, read, ov)
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
@@ -1046,6 +1055,7 @@ pub fn install() -> Result<(), String> {
         ("CreateDirectoryW", hk_create_dir_w as usize, &O_CREATE_DIR_W),
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
+        ("ReadFile", hk_read_file as usize, &O_READ_FILE),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),
@@ -1088,6 +1098,32 @@ mod tests {
     use std::path::PathBuf;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::{CopyFile2, CopyFileExW, CopyFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS};
+
+    #[test]
+    fn read_file_commits_a_lazy_destination_before_kernel_io() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
+        struct RestoreOriginal(usize);
+        impl Drop for RestoreOriginal {
+            fn drop(&mut self) { O_READ_FILE.store(self.0, Ordering::Release); }
+        }
+        let fixture = HookFixture::new("lazy_read");
+        let file = std::fs::File::open(fixture.game().join("data").join("hello.txt")).unwrap();
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x10000, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!page.is_null());
+            assert!(crate::hle::kernelx::lazy::mark(page as usize));
+            let previous = O_READ_FILE.load(Ordering::Acquire);
+            let _restore = RestoreOriginal(previous);
+            if previous == 0 { O_READ_FILE.store(ReadFile as usize, Ordering::Release); }
+            let mut read = 0u32;
+            assert_ne!(hk_read_file(file.as_raw_handle(), page, 8, &mut read, std::ptr::null_mut()), 0);
+            assert_eq!(read, 8);
+            assert_eq!(std::slice::from_raw_parts(page as *const u8, 8), b"original");
+            assert_eq!(crate::hle::kernelx::VirtualFree(page, 0, 0x8000), 1);
+        }
+    }
 
     struct HookFixture {
         dir: PathBuf,

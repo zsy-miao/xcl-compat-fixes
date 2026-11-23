@@ -83,6 +83,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
 
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
+    crate::hle::kernelx::lazy::ensure(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;

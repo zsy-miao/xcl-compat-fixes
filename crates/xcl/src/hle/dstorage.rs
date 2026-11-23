@@ -529,6 +529,7 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
+    crate::hle::kernelx::lazy::ensure(p, n);
     let mut at = p;
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

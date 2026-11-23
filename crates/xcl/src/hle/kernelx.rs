@@ -101,6 +101,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
 mod placeholders;
+pub mod lazy;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
@@ -360,6 +361,9 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         return 1;
     }
     let ok = mem::VirtualFree(addr, size, t);
+    if ok != 0 && t & mem::MEM_RELEASE != 0 {
+        lazy::forget_released(addr as usize);
+    }
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
     }
@@ -367,13 +371,9 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
-    if proc_ == thr::GetCurrentProcess() {
-        let a = addr as usize;
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
-            || (t & 0x8000 != 0 && in_graphics_reservation(a))
-        {
-            return VirtualFree(addr, size, t);
-        }
+    // This also clears lazy-page metadata for plain reservations in this process.
+    if proc_ == thr::GetCurrentProcess() || thr::GetProcessId(proc_) == thr::GetCurrentProcessId() {
+        return VirtualFree(addr, size, t);
     }
     mem::VirtualFreeEx(proc_, addr, size, t)
 }
@@ -878,10 +878,25 @@ fn committed_page(a: usize) -> bool {
     unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
 }
 
+/// Deferral must not turn an invalid address (or a partially committed page) into
+/// a successful physical mapping. The whole destination page must be reserved.
+fn reserved_page(a: usize) -> bool {
+    let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    unsafe {
+        mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
+            && m.State == mem::MEM_RESERVE
+            && a.checked_add(PHYS_PAGE).is_some_and(|end| (m.BaseAddress as usize).checked_add(m.RegionSize).is_some_and(|limit| end <= limit))
+    }
+}
+
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted).
 unsafe fn unmap_away(away: &mut Away, at: usize) {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
+        // Never touched: the page still consists of zeros at its uncommitted home.
+        if lazy::unmark(at) {
+            return;
+        }
         // (a home this call has not given back yet is still committed)
         let pending = away.gone.len();
         away.gone.retain(|&h| Some(h) != page_home(page));
@@ -1030,11 +1045,18 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             unmap_away(away, old);
         }
         let fresh = !in_uma(at) && !committed_page(at);
+        let home = page_home(p).unwrap();
+        // Only CPU-only reservations may defer backing. Sparse UMA needs its GPU tiles now.
+        let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
+        if fresh && plain && reserved_page(at) && !committed_page(home) && lazy::mark(at) {
+            away.at.insert(at, p);
+            away.page.insert(p, at);
+            continue;
+        }
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
         }
-        let home = page_home(p).unwrap();
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
             move_home_away(away, home);
@@ -1562,6 +1584,59 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_pages_reject_an_unreserved_plain_destination() {
+        unsafe {
+            crate::gpu::uma::get().expect("UMA must initialize for the physical-page API test");
+            let mut count = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let destination = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!destination.is_null());
+            assert_ne!(mem::VirtualFree(destination, 0, mem::MEM_RELEASE), 0);
+            assert!(MapTitlePhysicalPages(destination, 1, 0, 0, pages.as_mut_ptr()).is_null());
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_ADDRESS);
+            let away = AWAY.lock().unwrap();
+            assert!(!away.as_ref().is_some_and(|a| a.at.contains_key(&(destination as usize)) || a.page.contains_key(&pages[0])));
+            drop(away);
+            assert!(!lazy::unmark(destination as usize), "invalid mapping left no deferred page");
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    /// The real physical-page API defers only untouched CPU-only destinations, then
+    /// preserves written contents through unmapping/remapping and untouched zeros.
+    #[test]
+    fn physical_pages_in_plain_reservations_are_lazy_and_round_trip() {
+        unsafe {
+            let u = crate::gpu::uma::get().expect("UMA must initialize for the physical-page API test");
+            let destination = mem::VirtualAlloc(std::ptr::null(), 3 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(destination, 0);
+            assert!(!u.contains(destination), "the test must use a plain CPU reservation");
+            let mut count = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            assert_eq!(MapTitlePhysicalPages(destination as *mut c_void, 3, 0, 0, pages.as_mut_ptr()) as usize, destination);
+            for i in 0..3 { assert!(!committed_page(destination + i * PHYS_PAGE), "mapped zeros stay reserved until used"); }
+            assert_eq!(std::ptr::read_volatile(destination as *const u32), 0);
+            std::ptr::write_volatile(destination as *mut u32, 0x55AA);
+            lazy::ensure(destination + PHYS_PAGE + 4, 4);
+            assert!(committed_page(destination) && committed_page(destination + PHYS_PAGE));
+            std::ptr::write_volatile((destination + PHYS_PAGE + 4) as *mut u32, 0x7711);
+            assert!(!committed_page(destination + 2 * PHYS_PAGE));
+            assert_eq!(MapTitlePhysicalPages(destination as *mut c_void, 3, 0, 0, std::ptr::null_mut()) as usize, destination);
+            assert!(!committed_page(page_home(pages[2]).unwrap()), "unmapping untouched zeros does not commit their home");
+            assert_eq!(MapTitlePhysicalPages(destination as *mut c_void, 3, 0, 0, pages.as_mut_ptr()) as usize, destination);
+            assert_eq!(std::ptr::read_volatile(destination as *const u32), 0x55AA);
+            assert_eq!(std::ptr::read_volatile((destination + PHYS_PAGE + 4) as *const u32), 0x7711);
+            assert!(!committed_page(destination + 2 * PHYS_PAGE));
+            assert_eq!(std::ptr::read_volatile((destination + 2 * PHYS_PAGE) as *const u32), 0);
+            assert_eq!(MapTitlePhysicalPages(destination as *mut c_void, 3, 0, 0, std::ptr::null_mut()) as usize, destination);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(destination as *mut c_void, 0, mem::MEM_RELEASE), 1);
+        }
+    }
 
     /// The GDK thunks' device type lookup: RegOpenKeyW(HKLM\…\OEM) + RegQueryValueExW(ConsoleMode).
     #[test]
