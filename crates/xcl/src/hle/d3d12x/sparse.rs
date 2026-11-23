@@ -181,10 +181,15 @@ fn decommit_tiles(
             }
         }
     }
-    if !unmapped.is_empty() {
-        to_zero.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
-    }
     unmapped
+}
+
+/// Drop the runs of `to_zero` whose tile is no longer mapped – once, where the runs are taken.
+/// (Pruning at every decommit that unmapped a tile walked the whole list each time: it grows
+/// until the next ExecuteCommandLists, and a title mapping gigabytes of physical pages while it
+/// loads – GTA VI – spent seconds there, its watchdog ended the game.)
+fn prune_zero_runs(mapped: &FxHashMap<usize, TileEntry>, runs: &mut Vec<(usize, usize)>) {
+    runs.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
 }
 
 struct UploadSlot {
@@ -1103,7 +1108,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = std::mem::take(&mut s.to_zero);
+    let mut zeroed = std::mem::take(&mut s.to_zero);
+    prune_zero_runs(&s.mapped, &mut zeroed);
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
@@ -1246,7 +1252,8 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let mut zero_runs = std::mem::take(&mut s.to_zero);
+    prune_zero_runs(&s.mapped, &mut zero_runs);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
@@ -1608,6 +1615,7 @@ mod tests {
         assert_eq!(unmapped, vec![t0]);
         assert!(!mapped.contains_key(&t0));
         assert_eq!(free, vec![(0, 10)]);
+        prune_zero_runs(&mapped, &mut to_zero);
         assert!(to_zero.is_empty(), "stale to_zero entries for the unmapped tile must be pruned");
 
         // 2. Sixteen individual 4 KiB decommits in reverse order.
@@ -1623,6 +1631,7 @@ mod tests {
         assert_eq!(u, vec![t1]);
         assert!(!mapped.contains_key(&t1));
         assert_eq!(free, vec![(0, 11)]);
+        prune_zero_runs(&mapped, &mut to_zero);
         assert!(to_zero.is_empty());
 
         // 3. Pinned tile decommitted in two halves: unmapped from `mapped`, NOT returned to `free`.
@@ -1635,6 +1644,7 @@ mod tests {
         assert_eq!(u, vec![t2]);
         assert!(!mapped.contains_key(&t2));
         assert!(free.is_empty(), "pinned pool tile must not return to free list");
+        prune_zero_runs(&mapped, &mut to_zero);
         assert!(to_zero.is_empty());
 
         // 4. Single-committed-page tile decommit reclaims tile without dropping another tile's to_zero.

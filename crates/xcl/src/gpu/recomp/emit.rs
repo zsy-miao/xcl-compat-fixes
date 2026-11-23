@@ -4475,7 +4475,8 @@ impl Em {
             }
         }
         if windows > 1 {
-            h = windowed(&h, windows);
+            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
         }
         h
     }
@@ -4807,7 +4808,9 @@ const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Lo
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
 /// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
 /// definitions replace the placeholder.
-fn windowed(h: &str, windows: u32) -> String {
+/// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
+/// (`Options::heap_windows`) instead of switching over the root UAVs.
+fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem.") {
@@ -4825,11 +4828,11 @@ fn windowed(h: &str, windows: u32) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
-fn mem_accessors(windows: u32) -> String {
+fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     let mut sigs: Vec<(&str, String, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a"),
         ("uint2", "Load2".into(), "uint a", "a"),
@@ -4854,6 +4857,17 @@ fn mem_accessors(windows: u32) -> String {
         }
     }
     let mut s = String::new();
+    if let Some(coherent) = heap {
+        // one access: window k is descriptor MEM_HEAP_BASE + k (a window the program does not
+        // have reads window 0, as the switch's default did)
+        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + (xcl_w < {windows}u ? xcl_w : 0u))]", super::MEM_HEAP_BASE);
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args) in sigs {
+            let r = if ret == "void" { "" } else { "return " };
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ XCL_MW; {r}m.{name}({args}); }}");
+        }
+        return s;
+    }
     let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
     for k in 1..windows {
         let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");

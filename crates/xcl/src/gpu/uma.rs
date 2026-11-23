@@ -682,6 +682,22 @@ pub fn get() -> Option<&'static Uma> {
 mod tests {
     use super::*;
 
+    /// The retail game's black image (HANDOFF "Retail game bring-up"): ~5.7 GB of physical pages
+    /// whose homes took sparse-window space, then the title's own 6 GiB reservation they are
+    /// mapped into – both did not fit the windows' 11.5 GiB, and the reservation went to
+    /// plain Windows memory the GPU does not see. With homes in CPU memory
+    /// (`kernelx::AllocateTitlePhysicalPages`) the reservation fits.
+    #[test]
+    fn a_6_gib_reservation_fits_once_page_homes_take_no_window_space() {
+        let Some(u) = Uma::for_runtime(64 << 20) else { return };
+        let homes = 5_700_000_000usize.next_multiple_of(GRAIN);
+        let (h, _) = u.sparse_alloc(homes, GRAIN).expect("the homes alone fit");
+        assert!(u.sparse_reserve(6 << 30).is_none(), "homes in the windows: no room for the reservation");
+        u.sparse_release(h);
+        let r = u.sparse_reserve(6 << 30).expect("without the homes the reservation fits");
+        assert!(u.is_sparse(r) && u.is_sparse(r + (6 << 30) - 1));
+    }
+
     /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
     /// back to it when freed.
     #[test]

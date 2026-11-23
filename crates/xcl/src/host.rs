@@ -99,6 +99,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         crate::xlog_error!("hook RtlPcToFileHeader: {e} – C++ exceptions in the game may not work");
     }
     crate::eh::install_crash_handler();
+    crate::alloc_trace::install();
     crate::eh::start_probes();
     HOST_MODE.store(true, Ordering::Release);
 

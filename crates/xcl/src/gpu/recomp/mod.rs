@@ -61,6 +61,16 @@ pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod aperture_tests;
+
+/// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
+/// window k is raw UAV `MEM_HEAP_BASE + k`.
+pub const MEM_HEAP_BASE: u32 = 0;
+
+/// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
+/// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
+pub const HEAP_WINDOWS: u32 = 0x100;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -485,6 +495,11 @@ pub struct Options {
     /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
     /// every access from the high address bits
     pub mem_windows: u32,
+    /// with `mem_windows` > 1: reach window k through descriptor `MEM_HEAP_BASE + k` of the
+    /// shader-visible heap (a raw UAV of the window, `ResourceDescriptorHeap`) – one access per
+    /// site instead of a `switch` over the root UAVs `mem`, `mem1`.., which inlines every
+    /// access once per window (HANDOFF: twice the DXC + driver time with 4 windows)
+    pub heap_windows: bool,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
@@ -492,7 +507,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
     }
 }
 
@@ -1289,6 +1304,13 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let normalized;
+    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
+        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+        &normalized
+    } else {
+        opt
+    };
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {

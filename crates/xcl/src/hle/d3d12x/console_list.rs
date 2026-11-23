@@ -666,6 +666,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
+    // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
+    let mut heaps_set = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -691,6 +693,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                 }
                 list.SetDescriptorHeaps(&heaps);
+                heaps_set = true;
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
@@ -793,6 +796,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
+                        }
+                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
+                            if let Some(g) = super::console_heap::global_heap() {
+                                list.SetDescriptorHeaps(&[Some(g)]);
+                                heaps_set = true;
+                            }
                         }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));

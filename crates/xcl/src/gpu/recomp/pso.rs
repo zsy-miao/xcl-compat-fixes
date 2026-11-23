@@ -73,9 +73,24 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
     Some(Fspx { threads, rsrc1: u32_at(head, 0x14)?, rsrc2: u32_at(head, 0x18)?, code: &code[..4 * (end + 1)] })
 }
 
-/// Memory windows of the title's unified memory (1 without it).
+/// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
+/// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
-    crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32)
+    let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
+    if n > 1 && heap_windows() {
+        n | super::HEAP_WINDOWS
+    } else {
+        n
+    }
+}
+
+/// Whether translated shaders reach the memory windows through the shared descriptor heap
+/// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
+/// instead of a `switch` over root UAVs. On unless `XCL_HEAP_WINDOWS=0` or the views could not
+/// be made (no shared heap: then the switch, as before).
+pub fn heap_windows() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").map_or(true, |v| v != "0")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.

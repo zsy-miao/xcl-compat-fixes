@@ -27,6 +27,7 @@
 
 use std::sync::Mutex;
 
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// bytes of a CBV/SRV/UAV slot (T# / V#) and of a sampler slot (S#)
@@ -157,11 +158,44 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            next: 0,
+            // the memory windows' raw UAVs (`set_window_views`) come first
+            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32,
             free: Vec::new(),
         });
     }
     true
+}
+
+static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the memory windows could not be put in the shared heap (`set_window_views`):
+/// translated shaders then switch over root UAVs (`pso::heap_windows`).
+pub fn window_views_failed() -> bool {
+    WINDOW_VIEWS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
+/// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
+/// A window without a buffer gets window 0's. False (and the shaders keep the switch): no
+/// shared heap.
+pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
+    let ok = !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
+        let g = GLOBAL.lock().unwrap();
+        let s = g.as_ref().unwrap();
+        for k in 0..crate::gpu::uma::MAX_WINDOWS {
+            let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
+            let raw = raw as *mut std::ffi::c_void;
+            let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (s.cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * s.inc as u64) as usize };
+            s.dev.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
+        }
+        true
+    };
+    if !ok {
+        WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::xlog_warn!("memory windows: not in the shared descriptor heap – translated shaders switch over the windows' root UAVs");
+    }
+    ok
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or

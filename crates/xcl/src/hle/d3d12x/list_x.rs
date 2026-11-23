@@ -1719,6 +1719,26 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
     out
 }
 
+/// Translated shaders with heap windows (`pso::heap_windows`) read the memory windows from the
+/// shared heap: a list that set no heaps (a dispatch with no views) gets it before the bind.
+pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
+    if !crate::gpu::recomp::pso::heap_windows() {
+        return;
+    }
+    let Some(g) = super::console_heap::global_heap() else { return };
+    let mut set = false;
+    with_bindings(this, |b| {
+        if b.heaps.is_empty() {
+            b.heaps = vec![g.as_raw() as usize];
+            set = true;
+        }
+    });
+    if set {
+        let raw = [g.as_raw() as usize];
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, 1, raw.as_ptr());
+    }
+}
+
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
@@ -2915,12 +2935,14 @@ mod tests {
         }
         unsafe extern "system" fn fake_noop_ptr(_this: *mut c_void, _p: *mut c_void) {}
         unsafe extern "system" fn fake_noop_uav(_this: *mut c_void, _slot: u32, _va: u64) {}
+        unsafe extern "system" fn fake_set_heaps(_this: *mut c_void, _n: u32, _heaps: *const usize) {}
 
         let mut orig_vt = [0usize; 64];
         orig_vt[1] = fake_add_ref as usize;
         orig_vt[2] = fake_release as usize;
         orig_vt[13] = fake_draw_indexed as usize;
         orig_vt[25] = fake_noop_ptr as usize; // SetPipelineState
+        orig_vt[28] = fake_set_heaps as usize; // SetDescriptorHeaps (memory windows from the heap)
         orig_vt[30] = fake_noop_ptr as usize; // SetGraphicsRootSignature
         orig_vt[42] = fake_noop_uav as usize; // SetGraphicsRootUnorderedAccessView
         orig_vt[43] = fake_set_ib as usize;

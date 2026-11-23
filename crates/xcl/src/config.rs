@@ -48,6 +48,9 @@ pub struct Config {
     pub d3d12_adapter: String,
     /// Enable the D3D12 debug layer (needs Graphics Tools).
     pub d3d12_debug: bool,
+    /// Build console compute pipelines at their first dispatch instead of while loading.
+    /// Opt-in per title; `XCL_LAZY_COMPUTE=1` / `0` overrides this setting.
+    pub lazy_compute_pipelines: bool,
     /// "auto" (show the title's frames in an XCL window) or "off".
     pub present: String,
     /// Raytracing tier reported by `CheckFeatureSupport(D3D12_OPTIONS5)`:
@@ -165,6 +168,7 @@ impl Default for Config {
             graphics: "d3d12".into(),
             d3d12_adapter: "auto".into(),
             d3d12_debug: false,
+            lazy_compute_pipelines: false,
             present: "auto".into(),
             raytracing: "auto".into(),
             window_width: 1280,
@@ -289,6 +293,17 @@ mod tests {
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
         assert_eq!(c.raytracing, "auto");
+        assert!(!c.lazy_compute_pipelines, "existing title configs keep eager compute creation");
+    }
+
+    #[test]
+    fn compute_first_use_is_a_persistent_per_title_opt_in() {
+        assert!(!Config::default().lazy_compute_pipelines);
+        let c: Config = toml::from_str("lazy_compute_pipelines = true\n").unwrap();
+        assert!(c.lazy_compute_pipelines);
+        let saved = toml::to_string_pretty(&c).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert!(loaded.lazy_compute_pipelines);
     }
 
     #[test]

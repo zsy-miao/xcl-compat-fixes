@@ -112,6 +112,18 @@ pub fn lazy() -> bool {
     *ON.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
 }
 
+/// Compute first-use builds are opt-in: other titles retain eager compute creation.
+/// The first bind waits for the real pipeline, so a dispatch cannot use its stand-in.
+pub fn lazy_compute() -> bool {
+    let configured = crate::state::config().lazy_compute_pipelines;
+    let override_value = std::env::var("XCL_LAZY_COMPUTE").ok().and_then(|v| match v.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value => value.parse::<bool>().ok(),
+    });
+    lazy() && override_value.unwrap_or(configured)
+}
+
 /// `submit`, the build waiting for the stand-in's first use (`resolve`, `resolve_wait`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
     pending(standin, compute, job);

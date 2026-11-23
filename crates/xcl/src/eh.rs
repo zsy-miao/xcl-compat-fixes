@@ -105,6 +105,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         );
         crate::xlog_error!("{msg}");
         crate::report::write_final(Some(msg));
+        // the other threads now: a title crash handler (Breakpad) can keep the process for
+        // minutes before it ends (GTA VI's watchdog: what was its silent thread doing?)
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::AcqRel) {
+            dump_threads();
+        }
         crate::log::flush();
     }
     match TITLE_FILTER.load(Ordering::Acquire) {
