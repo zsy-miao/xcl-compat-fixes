@@ -224,6 +224,34 @@ pub fn readable(p: usize, len: usize) -> bool {
     true
 }
 
+/// Is the whole range currently committed and writable? Instruction emulation must
+/// validate every region before writing a batch, including guard and read-only pages.
+/// Query the OS afresh so decommit/free/protection changes cannot leave a stale proof.
+pub(crate) fn writable(p: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    if p == 0 || len == 0 || len > 256 << 20 {
+        return false;
+    }
+    let Some(end) = p.checked_add(len) else { return false };
+    let mut cur = p;
+    while cur < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of_val(&mbi)) };
+        if n == 0 || mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || !matches!(mbi.Protect & 0xff, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+        {
+            return false;
+        }
+        let Some(next) = (mbi.BaseAddress as usize).checked_add(mbi.RegionSize) else { return false };
+        if next <= cur { return false; }
+        cur = next;
+    }
+    true
+}
+
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
 pub fn capture(stage: &str, ptr: usize, len: usize) {
     if ptr == 0 && len == 0 {
@@ -449,5 +477,59 @@ mod tests {
         assert!(!readable(0x10, 10));
         let v = vec![1u8; 100];
         assert!(readable(v.as_ptr() as usize, 100));
+    }
+
+    mod clzero_batch_tests {
+        use super::*;
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE,
+            MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        };
+
+        const PAGE: usize = 0x1000;
+
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) { unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE); } }
+        }
+
+        #[test]
+        fn writable_checks_every_native_region_and_current_protection() {
+            unsafe {
+                let r = Reservation(VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize);
+                assert_ne!(r.0, 0);
+                assert!(!writable(r.0, PAGE), "reserved pages are not writable");
+                assert!(!VirtualAlloc(r.0 as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                assert!(writable(r.0 + 17, 2 * PAGE - 17));
+                assert!(!writable(r.0, 2 * PAGE + 1), "reject a reserved tail");
+                let mut old = 0;
+                assert_ne!(VirtualProtect((r.0 + PAGE) as *const _, PAGE, PAGE_READONLY, &mut old), 0);
+                assert!(readable(r.0 + PAGE, PAGE));
+                assert!(!writable(r.0, 2 * PAGE), "reject a read-only tail");
+                assert!(writable(r.0, PAGE));
+                for protect in [PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD] {
+                    assert_ne!(VirtualProtect(r.0 as *const _, PAGE, protect, &mut old), 0);
+                    assert!(!writable(r.0, 64), "reject protection {protect:#x}");
+                }
+                assert_ne!(VirtualProtect(r.0 as *const _, PAGE, PAGE_READWRITE, &mut old), 0);
+                assert!(writable(r.0, 64), "a new query observes restored protection");
+                assert_ne!(VirtualFree(r.0 as *mut _, PAGE, MEM_DECOMMIT), 0);
+                assert!(!writable(r.0, 64), "a new query observes decommit");
+            }
+        }
+
+        #[test]
+        fn writable_rejects_invalid_ranges_and_released_pages() {
+            assert!(!writable(0, 64));
+            assert!(!writable(1, 0));
+            assert!(!writable(usize::MAX - 31, 64));
+            unsafe {
+                let r = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+                assert_ne!(r, 0);
+                assert!(writable(r, 64));
+                assert_ne!(VirtualFree(r as *mut _, 0, MEM_RELEASE), 0);
+                assert!(!writable(r, 64), "a new query observes release");
+            }
+        }
     }
 }
