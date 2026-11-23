@@ -60,3 +60,21 @@ A later `CopyMemoryToMemoryX` request was refused because its CPU-mirrored sourc
 lies outside UMA. Its role in the remaining stall is unproven. Supporting that
 path requires correctly ordered GPU staging; it should not be replaced by an
 immediate CPU copy. See [contributor findings](CONTRIBUTOR-FINDINGS.md).
+
+## Account selection and intro timing
+
+Two offline runs on an i5-10400 and RTX 3060 Ti used the same five-minute limit,
+frame capture interval, and Y and A inputs at 155 and 180 seconds. Both exited
+at the timer with no reported crash or pipeline/compiler failures.
+
+| Build | Frames in 300 seconds | Frames from 200 to 280 seconds |
+| --- | ---: | ---: |
+| `4734b40` | 455 | 4 |
+| `cb8e15f` | 834 | 173 |
+
+The later run displayed the six-star transition and the full-color intro after
+account selection. It combined ivall's struct-return fix, gw1337x's texture
+detiling optimization and our bounded CLWB loop handling. The first accelerated
+flush covered 129,600 iterations. The runtime comparison measures the combined
+build. A BC5 storage refusal and a 16 KiB graphics-memory copy refusal still
+appeared during the intro.
