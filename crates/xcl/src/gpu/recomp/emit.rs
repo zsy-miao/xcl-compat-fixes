@@ -4709,15 +4709,24 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
 /// D3D12's limit on what one mesh shader group outputs (vertex + primitive attributes).
 const MESH_OUTPUT_BYTES: u32 = 32768;
 
+/// Vertices the pass-through puts in one mesh group: the vertex output budget divided by the
+/// stride, and DXC accounts whole chunks of 32 vertices even when fewer are declared (78
+/// vertices with 22 rows are accounted as 96). Measured with dxc 1.8.2502 (ms_6_6): every
+/// boundary from 9 to 26 float4 rows agrees.
+fn passthrough_max_vertices(vbytes: u32) -> u32 {
+    (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
+}
+
 /// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
 /// mesh output limit as they are, else the triangles are split into runs whose own vertex
 /// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
+    let cap = passthrough_max_vertices(vbytes);
+    if ms.max_vertices <= cap {
         return 1;
     }
-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
+    let ppg = (cap / 3).max(1);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 
