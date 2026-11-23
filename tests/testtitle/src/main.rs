@@ -294,7 +294,7 @@ fn main() {
             let mut marker = MARKER;
             let flags: u64;
             macro_rules! body {
-                ($reg:literal, $compare:literal) => {
+                ($reg:tt, $compare:literal) => {
                     std::arch::asm!(
                         ".byte 0x0F, 0x01, 0xFC",
                         ".byte 0x48, 0x83, 0xC0, 0x40",
