@@ -153,3 +153,10 @@ part of the repository.
 machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, AnyPS5,
 libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
 repository contains no headers or binaries from the console SDK.
+
+The local BCPack research decoder uses the MIT-licensed [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs)
+entropy model tables by Ahmet Dedeler, derived from Microsoft's MIT-licensed
+silicon-rans model. The bounded fragment handling and synthetic controls are
+from the MIT-licensed [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows)
+research. Their notices are retained in the decoder source. BC7 block
+reconstruction remains limited to explicitly validated configurations.

@@ -103,6 +103,8 @@ const FENCE_SIGNAL: usize = 10;
 
 #[path = "dstorage_capture.rs"]
 mod bcpack_capture;
+#[path = "dstorage_bcpack.rs"]
+mod bcpack;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![DStorageGetFactory]
@@ -498,10 +500,14 @@ impl Request {
                 );
                 return Err(E_DECOMPRESSION);
             }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
+            // Single-stage BC7 is decoded transactionally by the worker. Other
+            // formats and the zlib/swizzle combinations remain unsupported.
             (false, bc) => {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
+                }
+                if bc == 7 && bcpack::supported_sizes(self.source_size as usize, self.destination_size as usize) {
+                    return Ok(());
                 }
                 warn_once("BCPack", format_args!("BCPack mode {bc} unsupported (src={}, dst={})", self.source_size, self.destination_size));
                 return Err(E_DECOMPRESSION);
@@ -608,11 +614,26 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && (r.bcpack() != 7 || r.zlib())) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    let payload: Vec<u8> = if r.bcpack() == 7 {
+        match bcpack::decode(&src, n) {
+            Ok(bytes) => {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 8 || count.is_power_of_two() {
+                    crate::xlog_info!("DirectStorage: decoded BCPack BC7 request #{count}: {} source bytes -> {} BC7 bytes", src.len(), bytes.len());
+                }
+                bytes
+            }
+            Err(error) => {
+                warn_once("BCPack BC7", format_args!("refused without destination writes: {error}"));
+                return Err(E_DECOMPRESSION);
+            }
+        }
+    } else if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         if d.len() != stage1_len {
@@ -968,10 +989,10 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         return;
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
+    if r.bcpack() == 7 {
+        bcpack_capture::capture_refused(&r);
+    }
     if let Err(hr) = r.check(q.source_memory) {
-        if hr == E_DECOMPRESSION && r.bcpack() == 7 {
-            bcpack_capture::capture_refused(&r);
-        }
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         return q.enqueue(Entry::Refused { hr, req: r, file: None });
     }

@@ -1,4 +1,4 @@
-//! Opt-in local fixtures for unsupported BCPack mode 7 requests. No decoding or destination writes.
+//! Opt-in local fixtures for BCPack mode 7 requests. No decoding or destination writes.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +14,7 @@ struct Captures {
     initialized: bool,
 }
 
-/// Called while the title's source is still valid at EnqueueRequest, before its normal refusal.
+/// Called while the title's source is still valid at EnqueueRequest, before queueing.
 pub(super) unsafe fn capture_refused(request: &Request) {
     let Some(directory) = std::env::var_os("XCL_BCPACK_CAPTURE_DIR").filter(|v| !v.is_empty()) else { return };
     static STATE: OnceLock<Mutex<HashMap<PathBuf, Captures>>> = OnceLock::new();
@@ -22,7 +22,7 @@ pub(super) unsafe fn capture_refused(request: &Request) {
     let mut state = STATE.get_or_init(Default::default).lock().unwrap();
     let captures = state.entry(directory.clone()).or_default();
     match capture_to(&directory, captures, request) {
-        Ok(Some(path)) => crate::xlog_info!("DirectStorage: captured unsupported BCPack mode 7 source locally: {}", path.display()),
+        Ok(Some(path)) => crate::xlog_info!("DirectStorage: captured BCPack mode 7 source locally: {}", path.display()),
         Ok(None) => {}
         Err(error) => warn_once("BCPack capture", format_args!("local fixture capture failed: {error}")),
     }
@@ -175,7 +175,8 @@ mod tests {
         let destination = [0xA5u8; 64];
         let request = Request { options: SOURCE_MEMORY_BIT | (7 << BCPACK_SHIFT), source: source.as_ptr() as u64,
             source_size: source.len() as u32, destination: destination.as_ptr() as u64, destination_size: 64, ..Default::default() };
-        assert_eq!(request.check(true), Err(E_DECOMPRESSION));
+        assert_eq!(request.check(true), Ok(()));
+        assert_eq!(unsafe { execute(&request, None, None, None) }, Err(E_DECOMPRESSION));
         let mut captures = Captures::default();
         let binary = unsafe { capture_to(&directory.0, &mut captures, &request) }.unwrap().unwrap();
         assert_eq!(std::fs::read(&binary).unwrap(), source);
@@ -186,7 +187,8 @@ mod tests {
         assert_eq!(metadata["destination_size"], 64);
         assert_eq!(metadata["source_kind"], "memory");
         assert_eq!(destination, [0xA5; 64]);
-        assert_eq!(request.check(true), Err(E_DECOMPRESSION));
+        assert_eq!(request.check(true), Ok(()));
+        assert_eq!(unsafe { execute(&request, None, None, None) }, Err(E_DECOMPRESSION));
     }
 
     #[test]
@@ -207,7 +209,7 @@ mod tests {
             assert_eq!(metadata["source_kind"], "file");
             assert_eq!(metadata["source_offset"], 6);
             assert_eq!(metadata["destination_is_physical_pages"], true);
-            assert_eq!(request.check(false), Err(E_DECOMPRESSION));
+            assert_eq!(request.check(false), Ok(()));
             release::<FileInner>(object);
         }
     }
