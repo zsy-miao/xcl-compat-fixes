@@ -667,26 +667,22 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
 /// family (118 D16_UNORM_S8_UINT, 119 R16_UNORM_X8_TYPELESS, 120 X16_TYPELESS_G8_UINT) as the
 /// 24-bit one (45, 46, 47). The PC driver refuses them: GTA VI's depth buffer got no size
 /// (GetResourceAllocationInfo) and the title stopped on its assertion.
+///
+/// 86 (B5G5R5A1_UNORM) is a PC format, but not one a PC driver takes for a render target that
+/// is also a UAV (a retail title's 2560x1440 target, flags 0x5: CreatePlacedResource refused it,
+/// E_INVALIDARG, and the title stopped). It becomes R8G8B8A8_UNORM (28): what shaders write to
+/// it and read from it is the same, with more bits; its memory is twice the console's.
 pub fn pc_format(f: u32) -> u32 {
     match f {
+        // B5G5R5A1 (86) and B4G4R4A4 (115) render targets (the same title's 2560x1440 ones)
+        86 | 115 => 28,
+        // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: half floats hold them
+        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,
         f => f,
     }
-}
-
-/// A copy of the clear value with its format as the PC's (`pc_format`), when that differs.
-unsafe fn pc_clear_value(clear: *const c_void) -> Option<D3D12_CLEAR_VALUE> {
-    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, std::mem::size_of::<D3D12_CLEAR_VALUE>()) {
-        return None;
-    }
-    let mut c = (clear as *const D3D12_CLEAR_VALUE).read_unaligned();
-    let f = pc_format(c.Format.0 as u32);
-    (f != c.Format.0 as u32).then(|| {
-        c.Format.0 = f as i32;
-        c
-    })
 }
 
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
@@ -787,6 +783,22 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
     }
 }
 
+/// A D3D12_CLEAR_VALUE (format, then 16 bytes of colour or depth + stencil) with a console-only
+/// format as the PC's (`pc_format`); None: nothing to change (or no clear value).
+pub(super) unsafe fn pc_clear_value(clear: *const c_void) -> Option<[u8; 20]> {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
+        return None;
+    }
+    let mut c = (clear as *const [u8; 20]).read_unaligned();
+    let f = u32::from_le_bytes(c[0..4].try_into().unwrap());
+    let pc = pc_format(f);
+    if pc == f {
+        return None;
+    }
+    c[0..4].copy_from_slice(&pc.to_le_bytes());
+    Some(c)
+}
+
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -799,14 +811,14 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    // the clear value names the console's format too (a 1024x1024 D16S8 depth buffer: 118 with
+    // the desc already 45 – the PC refused the pair, E_INVALIDARG, and the title stopped)
+    let pc_clear = pc_clear_value(clear);
+    let clear = pc_clear.as_ref().map_or(clear, |c| c.as_ptr() as *const c_void);
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
-    // its clear value in the PC's format too (`pc_format`): D16S8 (118) against the resource's
-    // D24S8 was refused (GTA VI's 1024x1024 depth buffers, E_INVALIDARG, then its assertion)
-    let clear_pc = pc_clear_value(clear);
-    let clear = clear_pc.as_ref().map_or(clear, |c| c as *const D3D12_CLEAR_VALUE as *const c_void);
     // a depth buffer is no UAV on the PC (`pc_resource_desc`): its unordered-access initial state
     // (GTA VI's 768x768x6 shadow maps: 0x8) is refused – it starts as a depth target
     if u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) & 0x2 != 0 && state & 0x8 != 0 {
@@ -822,6 +834,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if !buffer && super::vram::gpu_owned(flags) {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, riid, ppv) {
+            if hr >= 0 && !(*ppv).is_null() {
+                real::note_title_address(*ppv as usize, va as usize);
+            }
             return hr;
         }
     }
@@ -830,7 +845,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
-            Ok(()) => return hr,
+            Ok(()) => {
+                real::note_title_address(*ppv as usize, va as usize);
+                return hr;
+            }
             Err(e) if once(&M, 4) => {
                 let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
                 crate::xlog_warn!(

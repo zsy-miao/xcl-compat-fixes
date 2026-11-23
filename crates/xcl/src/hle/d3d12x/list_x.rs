@@ -257,6 +257,20 @@ struct Bindings {
     vertex_titles: std::collections::BTreeMap<u32, (u64, u32, u32)>,
     /// the title's (address, bytes, format) of the index buffer (`XCL_TRACE_FRAME`)
     index_title: Option<(u64, u32, i32)>,
+    /// the title set the console's rect list topology
+    rect_list: bool,
+}
+
+/// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
+pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, u32), Option<D3D12_VERTEX_BUFFER_VIEW>)>> {
+    let g = LISTS.lock().unwrap();
+    let b = &g.as_ref()?.get(&(list as usize))?.bindings;
+    b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
+}
+
+/// `pc_va` for other modules.
+pub(super) fn pc_va_of(va: u64) -> u64 {
+    pc_va(va)
 }
 
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
@@ -415,8 +429,12 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
             crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
         }
     }
+    let rect = t == RECT_LIST;
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
-    with_bindings(this, |b| b.topology = Some(t));
+    with_bindings(this, |b| {
+        b.topology = Some(t);
+        b.rect_list = rect;
+    });
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t)
 }
 
@@ -1516,6 +1534,158 @@ fn pc_va(va: u64) -> u64 {
     real::uma_va_of(va as usize).unwrap_or(va)
 }
 
+/// `pc_va` for an index or vertex buffer of `bytes` bytes bound on `list`. A retail title also
+/// binds buffers in its ordinary memory (a private allocation outside the unified-memory
+/// windows – on the console the GPU reads all of the title's memory). The PC's GPU has no
+/// address for that (IASetIndexBuffer of it: debug layer message 725, then the device hangs,
+/// 0x887a0006), so the bytes are copied into the list's upload memory as they are at the bind;
+/// what the title writes there afterwards is not seen.
+///
+/// A buffer that stays bound (`mirror`) gets one block of unified memory for good – its
+/// *mirror*, the same for every bind of that address and size – and each draw copies the part
+/// it reads there first (`sync_title_buffers`), as the title wrote it by then. (A copy of the
+/// whole buffer at every bind filled unified memory within two minutes of a retail title's
+/// menus, and missed what the title wrote after the bind.)
+unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> u64 {
+    let t = pc_va(va);
+    if t != va || va == 0 || bytes == 0 {
+        return t;
+    }
+    // in a window by number: a PC resource's GPU address
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+        return t;
+    }
+    if mirror {
+        if let Some(p) = mirror_of(va, bytes, what) {
+            return pc_va(p as u64);
+        }
+    }
+    let p = super::bind::allocate_upload_memory(list, bytes, 16);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if p.is_null() {
+        if n < 4 {
+            crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory and there is no room for a copy");
+        }
+        return t;
+    }
+    std::ptr::copy_nonoverlapping(va as *const u8, p, bytes);
+    if n < 4 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
+    }
+    pc_va(p as u64)
+}
+
+/// Ranges of the title's memory with a mirror in unified memory: (start, bytes, mirror). A
+/// title binds one buffer at many offsets (a ring it fills through the frame: a retail title's
+/// views all end at the buffer's end), so a mirror covers a 64 KiB-aligned range and a view
+/// inside a mirrored range uses that mirror at its offset.
+static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+/// bytes of mirrors made (never freed)
+static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Where `[va, va + bytes)` is in a mirror, if it is in one.
+fn mirrored(va: u64, bytes: usize) -> Option<usize> {
+    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+}
+
+/// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
+/// once) the first time.
+unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
+    if let Some(p) = mirrored(va, bytes) {
+        return Some(p);
+    }
+    let mut g = MIRRORS.lock().unwrap();
+    let start = va & !0xffff;
+    let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
+    // only as much as is the title's readable memory (the view itself is)
+    let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
+    if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    let p = match u.has_sparse().then(|| super::sparse::alloc(len, 0x1_0000)).flatten() {
+        Some((p, _)) => p,
+        None => u.alloc(len, 0x1_0000)? as usize,
+    };
+    std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    g.push((start, len, p));
+    let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+    if g.len() <= 8 || g.len().is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – {start:#x}..{:#x} mirrored at {p:#x}, each draw copies what it reads ({} mirrors, {} MB)", start + len as u64, g.len(), total >> 20);
+    }
+    Some(p + (va - start) as usize)
+}
+
+/// Before a draw on `list`: the parts of mirrored buffers it reads are copied from the title's
+/// memory. `indexed`: (first index, index count, base vertex); else `first_vertex`, `vertices`.
+pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
+    if MIRROR_BYTES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let (vbs, ib) = {
+        let g = LISTS.lock().unwrap();
+        let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
+        (b.vertex_titles.values().copied().collect::<Vec<_>>(), b.index_title)
+    };
+    let mirrors: Vec<Option<usize>> = {
+        let mut v: Vec<Option<usize>> = vbs.iter().map(|&(va, bytes, _)| mirrored(va, bytes as usize)).collect();
+        v.push(ib.and_then(|(va, bytes, _)| mirrored(va, bytes as usize)));
+        if v.iter().all(Option::is_none) {
+            return;
+        }
+        v
+    };
+    let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
+        let from = from.min(bytes as u64);
+        let len = len.min(bytes as u64 - from) as usize;
+        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
+            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        }
+    };
+    // the vertices read: [lo, hi)
+    let (lo, hi) = match (indexed, ib) {
+        (Some((first, count, base)), Some((va, bytes, format))) => {
+            let size: u64 = if format == DXGI_FORMAT_R32_UINT.0 { 4 } else { 2 };
+            let (from, len) = (first as u64 * size, count as u64 * size);
+            if let Some(m) = mirrors[vbs.len()] {
+                copy(va, m, bytes, from, len);
+            }
+            let n = (len.min((bytes as u64).saturating_sub(from)) / size) as usize;
+            if n == 0 || !crate::gpu::shader::readable((va + from) as usize, n * size as usize) {
+                (0, u64::MAX)
+            } else {
+                let at = (va + from) as *const u8;
+                let (mut lo, mut hi) = (u32::MAX, 0u32);
+                for k in 0..n {
+                    let i = if size == 4 { at.add(4 * k).cast::<u32>().read_unaligned() } else { at.add(2 * k).cast::<u16>().read_unaligned() as u32 };
+                    // strip cut values are not vertices
+                    if i == u32::MAX || (size == 2 && i == 0xffff) {
+                        continue;
+                    }
+                    lo = lo.min(i);
+                    hi = hi.max(i);
+                }
+                if lo > hi {
+                    return;
+                }
+                ((lo as i64 + base as i64).max(0) as u64, (hi as i64 + base as i64 + 1).max(0) as u64)
+            }
+        }
+        (Some(_), None) => (0, u64::MAX),
+        (None, _) => (first_vertex as u64, first_vertex as u64 + vertices as u64),
+    };
+    for (k, &(va, bytes, stride)) in vbs.iter().enumerate() {
+        let Some(m) = mirrors[k] else { continue };
+        // a buffer stepped by instance is not told apart: with instances, all of it
+        if instances > 1 || hi == u64::MAX || stride == 0 {
+            copy(va, m, bytes, 0, bytes as u64);
+        } else {
+            copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
+        }
+    }
+}
+
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
@@ -1580,7 +1750,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
-            v.BufferLocation = pc_va(v.BufferLocation);
+            v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -1626,9 +1796,11 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     }
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
-    v.BufferLocation = pc_va(v.BufferLocation);
-    s.index_buffer = Some(v);
     drop(g);
+    v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+        s.index_buffer = Some(v);
+    }
     set_index_buffer(this, Some(&v));
 }
 
@@ -1648,7 +1820,8 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
         return;
     };
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
-    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
+    sync_title_buffers(this, None, 0, 0, 2);
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());

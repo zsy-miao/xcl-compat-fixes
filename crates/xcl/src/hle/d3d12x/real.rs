@@ -39,6 +39,10 @@ const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
 
+#[cfg(test)]
+#[path = "real_texture_tests.rs"]
+mod texture_regression_tests;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
     Device,
@@ -419,10 +423,24 @@ pub fn init() -> Result<String, String> {
     }
 }
 
-/// A debug layer message: errors and warnings into the log (the first 200).
+/// A debug layer message: errors and warnings into the log – the first 8 of each message id
+/// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
+/// errors of a retail title, 14 s before the message that came with its device removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 || N.fetch_add(1, Ordering::Relaxed) >= 200 {
+    static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+        return;
+    }
+    {
+        let mut g = PER_ID.lock().unwrap();
+        let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
+        *n += 1;
+        if *n > 8 {
+            return;
+        }
+    }
+    if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
         return;
     }
     let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
@@ -1361,7 +1379,9 @@ static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 /// The title address a resource stands for (buffers in unified memory, placed resources).
 pub(super) fn title_address(res: usize) -> Option<usize> {
-    console_buffer(res).map(|b| b.0).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
+    console_buffer(res).map(|b| b.0)
+        .or_else(|| super::title_textures::address(res))
+        .or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
 }
 
 pub(super) fn note_title_address(res: usize, va: usize) {
@@ -1394,6 +1414,11 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
+        }
+        let owned = TEXTURE_MEMORY.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+        if let Some(p) = owned {
+            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
         }
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
@@ -1488,13 +1513,119 @@ fn forget_pso(pso: usize) {
     drop(gone);
 }
 
-/// resource #11 GetGPUVirtualAddress for console code
+/// resource #11 GetGPUVirtualAddress for console code. On the console a texture has an address
+/// too: a texture the title placed at its own address answers with it (`title_address`) where
+/// the PC's answer is 0 – a retail game turns a texture's address into the CPU pointer it
+/// clears it through, and wrote 256 KB at address 0.
+/// Memory for a texture the title did not place itself (a committed one), given the first time
+/// the title asks for its address. On the console every texture is in unified memory and has
+/// an address; a retail title uses it as the CPU pointer it clears the texture through
+/// (`memset(address, 0, w * h * 4)` – with the PC's 0, a write to address 0).
+///
+/// The block is plain zeroed process memory of a generous size for the PC description: the
+/// title's writes land somewhere, but they are NOT uploaded to the texture (it is not one of
+/// `title_textures`) – enough for the clears of GPU-written targets seen so far, not for a
+/// texture the title fills on the CPU. Only these fallback allocations are owned by XCL;
+/// they are freed when the resource's final Release completes.
+static TEXTURE_MEMORY: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// Conservative CPU backing size, including mip levels, array slices and sample count.
+/// Each level is rounded to 64 KiB to leave room for the console layout's padding.
+fn texture_memory_bytes(d: &D3D12_RESOURCE_DESC) -> Option<usize> {
+    const BLOCK: u64 = 0x1_0000;
+    const LIMIT: u64 = 1 << 30;
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d.Width == 0 || d.Height == 0 {
+        return None;
+    }
+    let bpt: u64 = match d.Format.0 {
+        1..=4 => 16,
+        5..=8 => 12,
+        9..=22 => 8,
+        23..=47 => 4,
+        48..=59 => 2,
+        60..=65 => 1,
+        70..=84 | 94..=99 => 1,
+        85..=93 => 4,
+        _ => 16,
+    };
+    let volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let mut depth = if volume { d.DepthOrArraySize.max(1) as u64 } else { 1 };
+    let slices = if volume { 1 } else { d.DepthOrArraySize.max(1) as u64 };
+    let samples = d.SampleDesc.Count.max(1) as u64;
+    let (mut w, mut h) = (d.Width, d.Height as u64);
+    let full_mips = 64 - w.max(h).max(depth).leading_zeros();
+    let mips = if d.MipLevels == 0 { full_mips } else { u32::from(d.MipLevels).min(full_mips) };
+    let mut bytes = BLOCK; // padding after the final level
+    for _ in 0..mips {
+        let level = w.checked_mul(h)?.checked_mul(depth)?.checked_mul(bpt)?.checked_mul(samples)?;
+        let padded = level.checked_add(BLOCK - 1)? & !(BLOCK - 1);
+        bytes = bytes.checked_add(padded.checked_mul(slices)?)?;
+        if bytes > LIMIT {
+            return None;
+        }
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        depth = (depth / 2).max(1);
+    }
+    usize::try_from(bytes).ok()
+}
+
+unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap();
+    if let Some(p) = title_address(res as usize) {
+        return Some(p);
+    }
+    let r = ID3D12Resource::from_raw_borrowed(&res)?;
+    let d = r.GetDesc();
+    let bytes = texture_memory_bytes(&d)?;
+    let p = VirtualAlloc(std::ptr::null(), bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize;
+    if p == 0 {
+        return None;
+    }
+    TEXTURE_MEMORY.lock().unwrap().get_or_insert_with(HashMap::new).insert(res as usize, p);
+    note_title_address(res as usize, p);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        crate::xlog_info!(
+            "D3D12.X: GetGPUVirtualAddress of a committed {}x{} texture (format {}, flags {:#x}, {} mips): {bytes:#x} bytes of memory at {p:#x} for the title to write through (not uploaded)",
+            d.Width,
+            d.Height,
+            d.Format.0,
+            d.Flags.0,
+            d.MipLevels
+        );
+    }
+    Some(p)
+}
+
 unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
         return p as u64;
     }
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
-    f(this)
+    match f(this) {
+        0 => {
+            let mut va = title_address(this as usize).map_or(0, |va| va as u64);
+            if va == 0 {
+                va = texture_memory(this).map_or(0, |p| p as u64);
+            }
+            if va == 0 {
+                // a texture with no address for the title: it may go on to write through it
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 12 {
+                    let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+                    crate::xlog_warn!(
+                        "D3D12.X: GetGPUVirtualAddress of {this:p} is 0 – not a buffer, not placed at a title address: {:?}",
+                        d.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0))
+                    );
+                }
+            }
+            va
+        }
+        va => va,
+    }
 }
 
 fn note_buffer_view() {
@@ -1626,20 +1757,78 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
     n
 }
 
-unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
-    let mut pc_view = pc_view_desc(desc);
-    if let (Some(rd), Some(mut v)) = (ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()), pc_view.or_else(|| desc.as_ref().copied())) {
-        if let Some((format, plane)) = depth_srv_format(rd.Format.0 as u32, v.Format.0 as u32) {
-            v.Format.0 = format as i32;
-            match v.ViewDimension {
-                D3D12_SRV_DIMENSION_TEXTURE2D => v.Anonymous.Texture2D.PlaneSlice = plane,
-                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => v.Anonymous.Texture2DArray.PlaneSlice = plane,
-                _ => {}
-            }
-            pc_view = Some(v);
+/// A view description (its format is its first field) whose format is one `pc_format` replaces,
+/// with the PC's: the resource was made with it, and a view in the console's format is refused.
+unsafe fn pc_view_format<T>(desc: *const T) -> Option<T> {
+    if desc.is_null() {
+        return None;
+    }
+    let f = (desc as *const u32).read_unaligned();
+    let pc = super::device_x::pc_format(f);
+    if pc == f {
+        return None;
+    }
+    let mut v = std::ptr::read_unaligned(desc);
+    (&mut v as *mut T as *mut u32).write_unaligned(pc);
+    Some(v)
+}
+
+/// The format name the PC wants for a shader's view of a depth buffer. The console takes the
+/// plain names (R32_FLOAT of a D32S8 buffer, R16_UNORM of a D16S8 one that is D24S8 here); the
+/// PC wants the family's own (R32_FLOAT_X8X24_TYPELESS, R24_UNORM_X8_TYPELESS …) and treats
+/// the plain ones as an illegal call (a retail title: device removal). `view` 0 is "the
+/// resource's format", which no typeless or depth resource can be viewed as.
+fn pc_depth_view_format(resource: i32, view: i32) -> i32 {
+    match (resource, view) {
+        // R32G8X24_TYPELESS / D32_FLOAT_S8X24_UINT: depth as 21, stencil as 22
+        (19..=22, 0 | 19 | 20 | 39 | 40 | 41) => 21,
+        (19..=22, 61 | 62) => 22,
+        // R24G8_TYPELESS / D24_UNORM_S8_UINT: depth as 46, stencil as 47
+        (44..=47, 0 | 44 | 45 | 41 | 53 | 54 | 55 | 56) => 46,
+        (44..=47, 61 | 62) => 47,
+        // R32_TYPELESS / D32_FLOAT, R16_TYPELESS / D16_UNORM
+        (39 | 40, 0 | 39 | 40) => 41,
+        (53 | 55, 0 | 53 | 55) => 56,
+        (_, v) => v,
+    }
+}
+
+/// `desc` with the PC's format name for a view of the depth buffer `res` (None: as it is).
+unsafe fn pc_depth_srv(res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let d = desc.as_ref()?;
+    let rf = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc().Format.0;
+    let f = pc_depth_view_format(rf, d.Format.0);
+    // the PC reads stencil from plane 1; the console takes plane 0 with a stencil format
+    let stencil = matches!(f, 22 | 47) && matches!(rf, 19..=22 | 44..=47);
+    if f == d.Format.0 && !stencil {
+        return None;
+    }
+    let mut v = std::ptr::read(d);
+    v.Format.0 = f;
+    if stencil {
+        if v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+            v.Anonymous.Texture2D.PlaneSlice = 1;
+        } else if v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
+            v.Anonymous.Texture2DArray.PlaneSlice = 1;
         }
     }
-    let desc = pc_view.as_ref().map_or(desc, |v| v as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
+    Some(v)
+}
+
+/// The PC's CreateDepthStencilView: a view in a console-only format (D16S8, 118) as the PC's.
+unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
+    let pc_view = pc_view_format(desc);
+    let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_DEPTH_STENCIL_VIEW_DESC);
+    f(this, res, desc, handle)
+}
+
+unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
+    let pc_view = pc_view_format(desc);
+    let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
+    let pc_depth = pc_depth_srv(res, desc);
+    let desc = pc_depth.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
@@ -1788,7 +1977,71 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
     crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
 }
 
+/// The view to create with no resource (a null UAV: writes go nowhere, reads give 0) when
+/// `res` is a texture the PC did not make with ALLOW_UNORDERED_ACCESS; None: `res` takes UAVs.
+///
+/// A retail title makes UAVs of its depth buffers (2560x1440 D16S8, 768² - 2048² shadow maps
+/// that are depth + UAV on the console). CreateUnorderedAccessView of them is "an illegal
+/// operation" to D3D12 and the device is removed (0x887a0001) – seen with the debug layer as
+/// message 340 just before RemoveDevice. What compute writes to those buffers is lost until
+/// they get a UAV twin kept in step with the depth buffer.
+unsafe fn pc_null_uav(res: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    let r = ID3D12Resource::from_raw_borrowed(&res)?;
+    let rd = r.GetDesc();
+    if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
+        return None;
+    }
+    let mut v: D3D12_UNORDERED_ACCESS_VIEW_DESC = match desc.as_ref() {
+        Some(d) => std::ptr::read(d),
+        None => {
+            let mut v: D3D12_UNORDERED_ACCESS_VIEW_DESC = std::mem::zeroed();
+            if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                v.Anonymous.Texture3D.WSize = rd.DepthOrArraySize as u32;
+            } else if rd.DepthOrArraySize > 1 {
+                v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                v.Anonymous.Texture2DArray.ArraySize = rd.DepthOrArraySize as u32;
+            } else {
+                v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            }
+            v
+        }
+    };
+    // a format a UAV may have: the view's own when it is a colour format, else by the family
+    // of the resource's (16-bit depth → R16_UNORM, the others → R32_FLOAT)
+    let f = if v.Format == DXGI_FORMAT_UNKNOWN { rd.Format } else { v.Format };
+    v.Format = match f.0 {
+        53..=55 => DXGI_FORMAT_R16_UNORM,                      // R16_TYPELESS, R16_FLOAT (kept below), D16_UNORM
+        19..=22 | 39 | 40 | 44..=47 | 0 => DXGI_FORMAT_R32_FLOAT, // D32S8 / D32 / D24S8 families, unknown
+        _ => f,
+    };
+    if f == DXGI_FORMAT_R16_FLOAT {
+        v.Format = f;
+    }
+    // a view of the stencil plane (plane 1): a null view has one plane
+    if v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+        v.Anonymous.Texture2D.PlaneSlice = 0;
+    } else if v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY {
+        v.Anonymous.Texture2DArray.PlaneSlice = 0;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 6 {
+        crate::xlog_warn!(
+            "D3D12.X: UAV of a {}x{} texture (format {}, flags {:#x}) the PC made without ALLOW_UNORDERED_ACCESS – a null UAV (format {}): compute writes to it are lost",
+            rd.Width,
+            rd.Height,
+            rd.Format.0,
+            rd.Flags.0,
+            v.Format.0
+        );
+    }
+    Some(v)
+}
+
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    let pc_view = pc_view_format(desc);
+    let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_UNORDERED_ACCESS_VIEW_DESC);
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     if super::present::trace_frame() {
@@ -1798,36 +2051,16 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
-    // a resource the PC has without unordered access (a console depth buffer that is also a UAV,
-    // `device_x::pc_resource_desc`): a null view of the same dimension – the view of it the
-    // driver was handed removed the device once a dispatch used it (GTA VI, ~25 s in)
-    let null_desc;
-    let (res_pc, counter, desc_pc) = match ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()) {
-        Some(rd) if rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 => {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_info!(
-                    "D3D12.X: UAV of a resource without unordered access ({}x{}, format {}, flags {:#x}) – a null view",
-                    rd.Width,
-                    rd.Height,
-                    rd.Format.0,
-                    rd.Flags.0
-                );
-            }
-            let mut d = desc.as_ref().copied().unwrap_or(D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION(resource_dim_to_view(&rd) as i32), ..Default::default() });
-            d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
-            match d.ViewDimension {
-                D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
-                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.PlaneSlice = 0,
-                _ => {}
-            }
-            null_desc = d;
-            (std::ptr::null_mut(), std::ptr::null_mut(), &null_desc as *const D3D12_UNORDERED_ACCESS_VIEW_DESC)
-        }
-        _ => (res, counter, desc),
+    // a UAV of a resource that is no UAV resource on the PC (a console depth buffer that is
+    // also written by compute – `pc_resource_desc` drops the flag, the PC refuses the pair):
+    // the call is illegal there and removes the device. The slot gets a null UAV instead.
+    let null_view = pc_null_uav(res, desc);
+    let (res_pc, counter_pc, desc_pc) = match &null_view {
+        Some(v) => (std::ptr::null_mut(), std::ptr::null_mut(), v as *const D3D12_UNORDERED_ACCESS_VIEW_DESC),
+        None => (res, counter, desc),
     };
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res_pc, counter, desc_pc, cpu) };
-    f(this, res_pc, counter, desc_pc, slot.pc_uav);
+    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res_pc, counter_pc, desc_pc, cpu) };
+    f(this, res_pc, counter_pc, desc_pc, slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
@@ -1861,18 +2094,15 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
     if dim == 4 {
+        let sf = pc_depth_view_format(rd.Format.0, if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format.0 } else { format.0 });
+        // the stencil of a depth buffer is the PC's plane 1
+        let plane = u32::from(matches!(sf, 22 | 47) && matches!(rd.Format.0, 19..=22 | 44..=47));
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(sf),
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 } },
         };
-        // (of a depth buffer: the PC format of its depth or stencil plane, `depth_srv_format`)
-        let mut srv = srv;
-        if let Some((format, plane)) = depth_srv_format(rd.Format.0 as u32, srv.Format.0 as u32) {
-            srv.Format.0 = format as i32;
-            srv.Anonymous.Texture2D.PlaneSlice = plane;
-        }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, res, &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
@@ -1948,6 +2178,9 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         );
         crate::xlog_info!("  desc (dwords): {:x?}", (0..16).map(|k| w(4 * k)).collect::<Vec<_>>());
     }
+    // a clear value in a console-only format (D16S8) as the PC's, like the desc's
+    let pc_clear = super::device_x::pc_clear_value(clear as *const c_void);
+    let clear = pc_clear.as_ref().map_or(clear, |c| c.as_ptr() as usize);
     // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
     let mut pc_desc = [0u8; 56];
@@ -3526,12 +3759,25 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     }
     if let Some(a) = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1)) {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        // Refused, the title got no pipeline and wrote to address 0 a moment later (a retail
+        // title, ~3 minutes in, five such pipelines). Its shader pack has no amplification
+        // programs at all – what sits in the AS slot is another mesh-stage container – so until
+        // the console's numbering here is known the pipeline is made from the MS slot alone:
+        // it exists (the title goes on), what it draws may be wrong.
         note_translation_error(format!(
-            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
+            "mesh pipeline with AS {:016x} (MS {:016x}) – the AS slot is ignored; subobjects {types:?}",
             crate::gpu::shader::fnv64(a),
             crate::gpu::shader::fnv64(ms)
         ));
-        return Some(E_INVALIDARG);
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "D3D12.X: mesh pipeline with a shader in the AS slot ({} B, console: {}) – made from its MS slot only ({} B)",
+                a.len(),
+                is_console(a),
+                ms.len()
+            );
+        }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, wave32_only(this))) {
@@ -4011,8 +4257,8 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
-    let pc_view = pc_view_desc(desc as *const D3D12_RENDER_TARGET_VIEW_DESC);
-    let desc = pc_view.as_ref().map_or(desc, |v| v as *const D3D12_RENDER_TARGET_VIEW_DESC as *const c_void);
+    let pc_view = pc_view_format(desc as *const D3D12_RENDER_TARGET_VIEW_DESC);
+    let desc = pc_view.as_ref().map_or(desc, |d| d as *const D3D12_RENDER_TARGET_VIEW_DESC as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
@@ -4022,45 +4268,6 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
             crate::xlog_info!("frame trace: CreateRenderTargetView {handle:#x} → {res:p} {d:?}");
         }
     }
-}
-
-/// CreateDepthStencilView with the PC's format (`device_x::pc_format`): GTA VI's D16S8 views
-/// (118) of its depth buffers, which are D24S8 on the PC, were invalid and the device was
-/// removed (~55 s in).
-unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, handle: usize) {
-    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
-    let pc_view = pc_view_desc(desc);
-    f(this, res, pc_view.as_ref().map_or(desc, |v| v as *const _), handle)
-}
-
-/// The SRV format (and plane) the PC takes for a view of a depth + stencil resource: the console
-/// reads the depth of a D32S8 (R32G8X24) as R32_FLOAT, of a D24S8 (D16S8 on the console) as
-/// R16_UNORM, its stencil as R8_UINT – each invalid on the PC (GTA VI: the device was removed).
-fn depth_srv_format(resource: u32, view: u32) -> Option<(u32, u32)> {
-    let stencil = matches!(view, 62 | 22 | 47 | 120);
-    let r = match (resource, stencil) {
-        (19 | 20, false) => (21, 0),
-        (19 | 20, true) => (22, 1),
-        (44 | 45, false) => (46, 0),
-        (44 | 45, true) => (47, 1),
-        _ => return None,
-    };
-    (r != (view, if stencil { 1 } else { 0 }) || r.0 != view).then_some(r)
-}
-
-/// A copy of a view desc (its DXGI_FORMAT first) with the PC's format, when that differs.
-unsafe fn pc_view_desc<T: Copy>(desc: *const T) -> Option<T> {
-    if desc.is_null() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<T>()) {
-        return None;
-    }
-    let mut v = desc.read_unaligned();
-    let at = &mut v as *mut T as *mut u32;
-    let f = super::device_x::pc_format(*at);
-    (f != *at).then(|| {
-        *at = f;
-        v
-    })
 }
 
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
@@ -4835,20 +5042,5 @@ mod stream_tests {
 }
 
 #[cfg(test)]
-mod depth_view_tests {
-    use super::depth_srv_format;
-
-    #[test]
-    fn console_depth_views_become_pc_ones() {
-        // D32S8 (R32G8X24_TYPELESS): depth as R32_FLOAT_X8X24_TYPELESS, stencil plane 1
-        assert_eq!(depth_srv_format(19, 41), Some((21, 0)));
-        assert_eq!(depth_srv_format(20, 62), Some((22, 1)));
-        // D24S8 (the console's D16S8): depth R24_UNORM_X8_TYPELESS, stencil X24_TYPELESS_G8_UINT
-        assert_eq!(depth_srv_format(45, 56), Some((46, 0)));
-        assert_eq!(depth_srv_format(45, 62), Some((47, 1)));
-        assert_eq!(depth_srv_format(45, 119), Some((46, 0)));
-        // already the PC's, or not a depth resource: unchanged
-        assert_eq!(depth_srv_format(45, 46), None);
-        assert_eq!(depth_srv_format(28, 28), None);
-    }
-}
+#[path = "real_depth_tests.rs"]
+mod depth_regression_tests;
