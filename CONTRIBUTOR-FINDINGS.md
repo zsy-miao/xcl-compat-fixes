@@ -1,9 +1,8 @@
 # Verified findings and work ownership
 
-These notes support focused contributions from our private working repositories.
-They separate observed behavior from hypotheses and retain the original owners'
-credits. No game files, captured packets, proprietary SDK material or credentials
-are included.
+This repository records the fixes we tested, their original authors, and what
+we observed on our own hardware. The game-free regression tests are reproducible
+from source. Retail captures stay on the test machine.
 
 ## BC7 controls and decoder scope
 
@@ -24,7 +23,7 @@ entropy-stage implementation would duplicate ongoing work. [PR #273](https://git
 handles BC1 and is not a replacement for BC7 reconstruction.
 
 Initial BC7 preset history is not included in native XCL. The optional
-[separate reference helper](https://github.com/Prime1997/xcl-bcpack-reference-helper)
+reference helper, maintained in a separate private repository,
 uses public fitted history and reports provisional output. A successful reference
 comparison is not a console/hardware comparison.
 

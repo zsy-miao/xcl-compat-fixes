@@ -11,7 +11,7 @@ $targetDirectory = Join-Path $projectDirectory 'target'
 $releaseDirectory = Join-Path $targetDirectory 'release'
 $packageDirectory = Join-Path $targetDirectory 'XCL-Windows-x64'
 $packageArchive = Join-Path $targetDirectory 'XCL-Windows-x64.zip'
-$sourceUrl = 'https://github.com/ivall/xcl.git'
+$sourceUrl = 'https://github.com/Prime1997/xcl-compat-fixes.git'
 $patchBranch = 'local/game-compat'
 $legacyPatchBranch = 'local/pr151-cpu-compat'
 $pr151Revision = '236cc74954798356426d1d7bb1232cb135d1c123'
@@ -199,7 +199,7 @@ try {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::xg::tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_mesh_streams_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'gpu_mesh_mode_two_passes', '--', '--test-threads=1', '--nocapture') -CountTests
-        foreach ($filter in @('gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
+        foreach ($filter in @('real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
             Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', $filter, '--', '--test-threads=1', '--nocapture') -CountTests
         }
     }
@@ -232,6 +232,7 @@ try {
     $info = [ordered]@{
         revision = $revision
         source_url = $sourceUrl
+        upstream_url = $remoteUrl
         branch = $branch
         upstream_revision = $upstreamRevision
         upstream_latest_seen = $upstreamLatestSeen
@@ -296,6 +297,19 @@ try {
             files = @('crates/xcl/src/insn.rs', 'crates/xcl/src/eh.rs')
             scope = 'SSE4a immediate/register INSERTQ and EXTRQ, including hardware-verified prefix behavior and upper-quadword results. Local floating-point context validation and the prior CLZERO batching remain; unrelated CPU hot-patching is not imported.'
         }
+        $info.upstream_integrations += [ordered]@{
+            source_commit = '7a033c8cd13194900cd49c01ed60a59c6c9559c7'
+            regression_commit = '2f5979ecdf686436c90c479727f2dcc16973072d'
+            url = 'https://github.com/ivall/xcl/pull/263'
+            scope = 'Disambiguate the hidden return buffer from the device when both arguments contain an adopted vtable pointer.'
+        }
+        $info.upstream_integrations += [ordered]@{
+            contributor = 'gw1337x'
+            url = 'https://github.com/ivall/xcl/pull/283#issuecomment-7116115692'
+            files = @('crates/xcl/src/gpu/tiling.rs')
+            scope = 'Copy contiguous texture rows and reuse per-block offsets for tiled data. Differential tests cover partial elements, uncommon base swizzles, mip tails and array slices.'
+        }
+        $info.test_suites = @('real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
         $info.test_suites = @('console_depth_buffers_become_pc_ones', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'console_mesh_streams_become_pc_ones', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
         $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
         $patchNote += "`r`nIncludes PR #163 depth fixes ($pr163Revision) and PR #170 mesh pipeline fixes ($pr170Revision)."
@@ -313,7 +327,8 @@ try {
     $startText = @"
 XCL - Windows x64 release build
 Source revision: $revision
-Source: https://github.com/ivall/xcl
+Source: https://github.com/Prime1997/xcl-compat-fixes/commit/$revision
+Upstream project: https://github.com/ivall/xcl
 $patchNote
 
 Extract the whole ZIP, then double-click xcl.exe. Choose your unpacked game's
