@@ -500,13 +500,13 @@ impl Request {
                 );
                 return Err(E_DECOMPRESSION);
             }
-            // Single-stage BC7 is decoded transactionally by the worker. Other
-            // formats and the zlib/swizzle combinations remain unsupported.
+            // Single-stage BC7, or explicitly configured external BC5, is decoded
+            // transactionally by the worker. Zlib/swizzle combinations stay unsupported.
             (false, bc) => {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
-                if bc == 7 && bcpack::supported_sizes(self.source_size as usize, self.destination_size as usize) {
+                if bcpack::supported_mode(bc, self.source_size as usize, self.destination_size as usize) {
                     return Ok(());
                 }
                 warn_once("BCPack", format_args!("BCPack mode {bc} unsupported (src={}, dst={})", self.source_size, self.destination_size));
@@ -614,11 +614,27 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || (r.bcpack() != 0 && (r.bcpack() != 7 || r.zlib())) {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && (!matches!(r.bcpack(), 5 | 7) || r.zlib())) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.bcpack() == 7 {
+    let payload: Vec<u8> = if r.bcpack() == 5 {
+        let source_len = src.len();
+        match bcpack::decode_bc5(src, n) {
+            Ok(bytes) => {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 8 || count.is_power_of_two() {
+                    crate::xlog_info!("DirectStorage: decoded BCPack BC5 request #{count}: {source_len} source bytes -> {} BC5 bytes (provisional external decoder)", bytes.len());
+                }
+                bytes
+            }
+            Err(error) => {
+                warn_once("BCPack BC5", format_args!("refused without destination writes (src={source_len}, dst={n}, file offset={:#x}): {error}", r.offset));
+                return Err(E_DECOMPRESSION);
+            }
+        }
+    } else if r.bcpack() == 7 {
         match bcpack::decode(&src, n) {
             Ok(bytes) => {
                 static COUNT: AtomicU32 = AtomicU32::new(0);

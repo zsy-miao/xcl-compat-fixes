@@ -1,5 +1,5 @@
-//! Bounded BC7 BCPack adapter. Exact native subsets run first; an explicitly
-//! configured separate research executable may supply fitted-history decoding.
+//! Bounded BCPack adapter. Exact native BC7 subsets run first; an explicitly
+//! configured separate research executable may supply provisional BC7/BC5 decoding.
 
 #[path = "bcpack.rs"]
 mod entropy;
@@ -28,6 +28,15 @@ pub(super) fn supported_sizes(source: usize, destination: usize) -> bool {
         && destination > 0 && destination <= MAX_DESTINATION && destination % 16 == 0
 }
 
+pub(super) fn supported_mode(mode: u8, source: usize, destination: usize) -> bool {
+    supported_sizes(source, destination)
+        && (mode == 7 || (mode == 5 && external_executable().is_some()))
+}
+
+fn external_executable() -> Option<std::ffi::OsString> {
+    std::env::var_os("XCL_BCPACK_EXTERNAL_DECODER").filter(|s| !s.is_empty())
+}
+
 pub(super) fn decode(source: &[u8], destination: usize) -> Result<Vec<u8>, String> {
     if !supported_sizes(source.len(), destination) {
         return Err("BC7 BCPack sizes exceed the bounded decoder or are not whole blocks".into());
@@ -36,12 +45,61 @@ pub(super) fn decode(source: &[u8], destination: usize) -> Result<Vec<u8>, Strin
     match bc7::reconstruct(&lanes) {
         Ok(bytes) => Ok(bytes),
         Err(native_error) => {
-            let Some(executable) = std::env::var_os("XCL_BCPACK_EXTERNAL_DECODER").filter(|s| !s.is_empty()) else {
+            let Some(executable) = external_executable() else {
                 return Err(native_error);
             };
             external(Path::new(&executable), &lanes, destination)
         }
     }
+}
+
+/// BC5 stays opt-in. The separate helper performs the strict twelve-lane entropy
+/// preflight itself; its report must certify exact input consumption before any
+/// reconstructed bytes can be published to either kind of title destination.
+pub(super) fn decode_bc5(source: Vec<u8>, destination: usize) -> Result<Vec<u8>, String> {
+    if !supported_sizes(source.len(), destination) {
+        return Err("BC5 BCPack sizes exceed the bounded decoder or are not whole blocks".into());
+    }
+    let executable = external_executable()
+        .ok_or_else(|| "BC5 BCPack requires XCL_BCPACK_EXTERNAL_DECODER".to_string())?;
+    let executable = Path::new(&executable);
+    if !executable.is_absolute() || !executable.is_file() {
+        return Err("external BC5 decoder requires an absolute executable path".into());
+    }
+    let source_len = source.len();
+    let expected_argument = destination.to_string();
+    let (output, diagnostics) = run_external(executable,
+        &[OsStr::new("--bc5-stdio"), OsStr::new(&expected_argument)],
+        source, destination, Instant::now() + Duration::from_secs(10))?;
+    validate_bc5_response(output, source_len, destination, &diagnostics)
+}
+
+fn validate_bc5_response(bytes: Vec<u8>, source: usize, expected: usize, diagnostics: &[u8]) -> Result<Vec<u8>, String> {
+    if !supported_sizes(source, expected) || bytes.len() != expected {
+        return Err("external BC5 decoder returned incomplete or unbounded output".into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(diagnostics)
+        .map_err(|_| "external BC5 decoder diagnostics are malformed".to_string())?;
+    if report["protocol"] != "xcl-bcpack-bc5-stdio-v1"
+        || report["format"] != "BC5"
+        || report["accepted"] != true || report["provisional"] != true
+        || report["entropy_consumption_applicable"] != true
+        || report["reference_revision"] != "8183ea3ca9b9fd26e9379b030efce1684c263c4f"
+        || report["input_bytes"].as_u64() != Some(source as u64)
+        || report["entropy_consumed_bytes"].as_u64() != Some(source as u64)
+        || report["expected_output_bytes"].as_u64() != Some(expected as u64)
+        || report["decoded_output_bytes"].as_u64() != Some(expected as u64)
+        || report["lane_count"].as_u64() != Some(12)
+        || report["symbols_per_lane"].as_u64() != Some((expected / 8) as u64)
+        || report["lost_mask_length"].as_u64() != Some((expected / 16) as u64)
+        || ["unknown_blocks", "inconsistent_blocks", "lost_blocks"].iter()
+            .any(|key| report[*key].as_u64() != Some(0))
+    {
+        return Err("external BC5 decoder did not certify the pinned provisional codec, complete entropy input, and exact clean output".into());
+    }
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| crate::xlog_warn!("DirectStorage: external BCPack BC5 reconstruction uses provisional fitted history; hardware-exact output is not established"));
+    Ok(bytes)
 }
 
 fn validate_response(bytes: Vec<u8>, expected: usize, diagnostics: &[u8]) -> Result<Vec<u8>, String> {
@@ -206,23 +264,23 @@ enum PipeResult {
 fn run_external(executable: &Path, arguments: &[&OsStr], request: Vec<u8>, expected: usize, deadline: Instant)
     -> Result<(Vec<u8>, Vec<u8>), String>
 {
-    let io_error = |e: std::io::Error| format!("external BC7 decoder I/O failed: {e}");
+    let io_error = |e: std::io::Error| format!("external BCPack decoder I/O failed: {e}");
     let job = HelperJob::new().map_err(io_error)?;
     let (process, mut input, output, diagnostics) = spawn_helper(executable, arguments, &job).map_err(io_error)?;
     let (send, receive) = mpsc::channel();
     let input_send = send.clone();
-    std::thread::Builder::new().name("bc7-input".into()).spawn(move || {
+    std::thread::Builder::new().name("bcpack-input".into()).spawn(move || {
         let result = input.write_all(&request);
         drop(input);
         let _ = input_send.send(PipeResult::Input(result));
     }).map_err(io_error)?;
     let output_send = send.clone();
-    std::thread::Builder::new().name("bc7-output".into()).spawn(move || {
+    std::thread::Builder::new().name("bcpack-output".into()).spawn(move || {
         let mut bytes = Vec::new();
         let result = output.take(expected as u64 + 1).read_to_end(&mut bytes).map(|_| bytes);
         let _ = output_send.send(PipeResult::Output(result));
     }).map_err(io_error)?;
-    std::thread::Builder::new().name("bc7-errors".into()).spawn(move || {
+    std::thread::Builder::new().name("bcpack-errors".into()).spawn(move || {
         let mut bytes = Vec::new();
         let result = diagnostics.take(8193).read_to_end(&mut bytes).map(|_| bytes);
         let _ = send.send(PipeResult::Diagnostics(result));
@@ -230,7 +288,7 @@ fn run_external(executable: &Path, arguments: &[&OsStr], request: Vec<u8>, expec
     let (mut wrote, mut bytes, mut report, mut exited) = (false, None, None, false);
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())
-            .ok_or_else(|| "external BC7 decoder timed out (including pipe I/O)".to_string())?;
+            .ok_or_else(|| "external BCPack decoder timed out (including pipe I/O)".to_string())?;
         if !exited {
             match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
                 WAIT_OBJECT_0 => {
@@ -238,7 +296,7 @@ fn run_external(executable: &Path, arguments: &[&OsStr], request: Vec<u8>, expec
                     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
                         return Err(io_error(std::io::Error::last_os_error()));
                     }
-                    if code != 0 { return Err(format!("external BC7 decoder refused the request (exit {code})")); }
+                    if code != 0 { return Err(format!("external BCPack decoder refused the request (exit {code})")); }
                     exited = true;
                 }
                 WAIT_TIMEOUT => {}
@@ -252,19 +310,19 @@ fn run_external(executable: &Path, arguments: &[&OsStr], request: Vec<u8>, expec
             Ok(PipeResult::Input(result)) => { result.map_err(io_error)?; wrote = true; }
             Ok(PipeResult::Output(result)) => {
                 let value = result.map_err(io_error)?;
-                if value.len() != expected { return Err("external BC7 decoder returned the wrong output length".into()); }
+                if value.len() != expected { return Err("external BCPack decoder returned the wrong output length".into()); }
                 bytes = Some(value);
             }
             Ok(PipeResult::Diagnostics(result)) => {
                 let value = result.map_err(io_error)?;
-                if value.len() > 8192 { return Err("external BC7 decoder exceeded the diagnostics limit".into()); }
+                if value.len() > 8192 { return Err("external BCPack decoder exceeded the diagnostics limit".into()); }
                 report = Some(value);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) if wrote && bytes.is_some() && report.is_some() => {
                 std::thread::sleep(remaining.min(Duration::from_millis(10)));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("external BC7 decoder pipe worker stopped".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("external BCPack decoder pipe worker stopped".into()),
         }
         // No thread joins: every return kills the job, closing descendant pipe ends.
         // The shared deadline also bounds callers if an I/O worker cannot finish.
@@ -346,6 +404,169 @@ mod tests {
         // Fixed MIT Xbox2Windows issue-442 packet, without game data/history.
         let text = "101010101010101004040303030304040101010101010140000000000000024002027546281800000101df5f4b7c03410202024110101010040404031010101040041001030303044001080001010104000000080000000041020994e4db27a4410511fe6b020005";
         text.as_bytes().chunks_exact(2).map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(),16).unwrap()).collect()
+    }
+
+    fn bc5_control() -> Vec<u8> {
+        // Synthetic zero-history packet: twelve lanes containing [0, 0], with
+        // alphabet widths [3,3,7,7,5,5,5,5,5,5,5,5]. Generated by an independent
+        // toy encoder adapted from MIT bcpack-rs c51ec521; contains no game data.
+        let text = "101010101010101004040404040404040101010110101010000002020808080802020000000000000101030309090909020202021111111110101010040404041010101008080808000000000909090911111111";
+        text.as_bytes().chunks_exact(2).map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(),16).unwrap()).collect()
+    }
+
+    const BC5_EXPECTED: [u8; 16] = [0x80,0x80,0,0,0,0,0,0,0x80,0x80,0,0,0,0,0,0];
+
+    fn bc5_report() -> serde_json::Value {
+        serde_json::json!({
+            "protocol": "xcl-bcpack-bc5-stdio-v1", "format": "BC5", "accepted": true, "provisional": true,
+            "input_bytes": 84, "expected_output_bytes": 16, "decoded_output_bytes": 16,
+            "entropy_consumed_bytes": 84, "entropy_consumption_applicable": true,
+            "lane_count": 12, "symbols_per_lane": 2, "unknown_blocks": 0,
+            "inconsistent_blocks": 0, "lost_blocks": 0, "lost_mask_length": 1,
+            "reference_revision": "8183ea3ca9b9fd26e9379b030efce1684c263c4f"
+        })
+    }
+
+    #[test]
+    fn bc5_response_requires_complete_pinned_provisional_entropy_and_output() {
+        let report = bc5_report();
+        let encoded = serde_json::to_vec(&report).unwrap();
+        assert_eq!(bc5_control().len(), 84);
+        assert_eq!(validate_bc5_response(BC5_EXPECTED.to_vec(),84,16,&encoded).unwrap(), BC5_EXPECTED);
+        // Unlike BC7, a zero first byte is a legal BC5 endpoint, not a mode prefix.
+        assert!(validate_bc5_response(vec![0;16],84,16,&encoded).is_ok());
+        assert!(validate_bc5_response(vec![0;15],84,16,&encoded).is_err());
+        assert!(validate_bc5_response(vec![0;17],84,16,&encoded).is_err());
+        assert!(validate_bc5_response(vec![0;16],83,16,&encoded).is_err());
+        assert!(validate_bc5_response(vec![0;16],84,17,&encoded).is_err());
+        assert!(validate_bc5_response(vec![0;16],84,16,b"not json").is_err());
+        // Every field is mandatory; a partial success report cannot authorize writes.
+        for key in report.as_object().unwrap().keys() {
+            let mut missing = report.clone(); missing.as_object_mut().unwrap().remove(key);
+            assert!(validate_bc5_response(BC5_EXPECTED.to_vec(),84,16,&serde_json::to_vec(&missing).unwrap()).is_err(), "missing {key}");
+        }
+        for (key, bad) in [
+            ("protocol", serde_json::json!("xcl-bcpack-bc5-stdio-v2")),
+            ("format", serde_json::json!("BC7")), ("accepted", serde_json::json!(false)),
+            ("provisional", serde_json::json!(false)), ("entropy_consumption_applicable", serde_json::json!(false)),
+            ("reference_revision", serde_json::json!("unverified")),
+            ("input_bytes", serde_json::json!(85)), ("entropy_consumed_bytes", serde_json::json!(83)),
+            ("expected_output_bytes", serde_json::json!(32)), ("decoded_output_bytes", serde_json::json!(32)),
+            ("lane_count", serde_json::json!(16)), ("symbols_per_lane", serde_json::json!(3)),
+            ("lost_mask_length", serde_json::json!(0)), ("unknown_blocks", serde_json::json!(1)),
+            ("inconsistent_blocks", serde_json::json!(1)), ("lost_blocks", serde_json::json!(1)),
+            ("unknown_blocks", serde_json::json!(-1)), ("lost_blocks", serde_json::json!("0")),
+        ] {
+            let mut invalid = report.clone(); invalid[key] = bad;
+            assert!(validate_bc5_response(BC5_EXPECTED.to_vec(),84,16,&serde_json::to_vec(&invalid).unwrap()).is_err(), "invalid {key}");
+        }
+    }
+
+    #[test]
+    fn bc5_refusal_without_configured_helper_preserves_virtual_and_physical_destinations() {
+        use super::super::{Request, execute, SOURCE_MEMORY_BIT, DEST_PHYS_PAGES_BIT, E_DECOMPRESSION};
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, read_physical_pages, write_physical_pages, PHYS_PAGE_SIZE};
+        // Isolate environment changes from parallel tests and from a central run
+        // that explicitly configured the optional helper for the positive cases.
+        const CHILD: &str = "XCL_TEST_BCPACK_BC5_UNCONFIGURED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::windows::process::CommandExt;
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &subprocess_test_name("bc5_refusal_without_configured_helper_preserves_virtual_and_physical_destinations"), "--nocapture"])
+                .env(CHILD,"1").env_remove("XCL_BCPACK_EXTERNAL_DECODER")
+                .creation_flags(CREATE_NO_WINDOW).output().unwrap();
+            assert!(result.status.success(), "isolated mode5 refusal failed: {}{}",
+                String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        assert!(external_executable().is_none());
+        assert!(!supported_mode(5,84,16));
+        assert!(supported_mode(7,84,16));
+        let source = bc5_control();
+        let mut destination = [0xA5u8;16];
+        let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
+            source_size: source.len() as u32, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
+        assert_eq!(request.check(true),Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
+        assert_eq!(destination,[0xA5;16]);
+        assert!(crate::gpu::uma::get().is_some(), "physical-page BC5 refusal requires the local UMA reservation");
+        unsafe {
+            let mut count = 2usize; let mut pages = [0usize;2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(),0,&mut count,pages.as_mut_ptr()),1);
+            let scattered = [pages[1],pages[0]];
+            let offset = PHYS_PAGE_SIZE - 8;
+            let seeded = write_physical_pages(&scattered,offset,&[0xA5;16]);
+            request.options |= DEST_PHYS_PAGES_BIT;
+            request.destination = scattered.as_ptr() as u64;
+            request.destination_page_offset = offset as u16;
+            let check = request.check(true);
+            let result = execute(&request,None,Some(&scattered),None);
+            let mut readback = [0u8;16];
+            let read = read_physical_pages(&scattered,offset,&mut readback);
+            let freed = FreeTitlePhysicalPages(std::ptr::null_mut(),count,pages.as_mut_ptr());
+            assert!(seeded && read); assert_eq!(freed,1);
+            assert_eq!(check,Err(E_DECOMPRESSION)); assert_eq!(result,Err(E_DECOMPRESSION)); assert_eq!(readback,[0xA5;16]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured XCL_BCPACK_EXTERNAL_DECODER with BC5 protocol v1"]
+    fn bc5_external_virtual_destination_is_transactional() {
+        use super::super::{Request, execute, SOURCE_MEMORY_BIT, E_DECOMPRESSION};
+        assert!(external_executable().is_some(), "set XCL_BCPACK_EXTERNAL_DECODER to the validated BC5 helper");
+        let mut source = bc5_control(); source.push(0);
+        let mut destination = [0xA5u8;16];
+        let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
+            source_size: 84, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
+        assert_eq!(request.check(true),Ok(()));
+        assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
+        assert_eq!(destination,BC5_EXPECTED);
+        // Neither truncated entropy nor an unconsumed zero tail may modify output.
+        for size in [83,85] {
+            destination.fill(0xA5); request.source_size = size;
+            assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
+            assert_eq!(destination,[0xA5;16]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured XCL_BCPACK_EXTERNAL_DECODER with BC5 protocol v1"]
+    fn bc5_external_file_packet_to_scattered_physical_pages_is_transactional() {
+        use super::super::{Request, FileInner, execute, DEST_PHYS_PAGES_BIT, E_DECOMPRESSION};
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, read_physical_pages, write_physical_pages, PHYS_PAGE_SIZE};
+        use std::sync::{Arc,Mutex};
+        assert!(external_executable().is_some(), "set XCL_BCPACK_EXTERNAL_DECODER to the validated BC5 helper");
+        assert!(crate::gpu::uma::get().is_some(), "physical-page BC5 regression requires the local UMA reservation");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("xcl-bc5-file-{}-{nonce}.bin", std::process::id()));
+        let mut file_bytes = b"prefix".to_vec(); file_bytes.extend(bc5_control()); file_bytes.push(0);
+        std::fs::write(&path,file_bytes).unwrap();
+        let file = FileInner { id: 1, path: crate::util::wide(&path.to_string_lossy()),
+            file: Mutex::new(Some(Arc::new(std::fs::File::open(&path).unwrap()))) };
+        let (mut checks, mut results, mut reads, mut outputs) = (Vec::new(),Vec::new(),Vec::new(),Vec::new());
+        let freed;
+        unsafe {
+            let mut count = 2usize; let mut pages = [0usize;2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(),0,&mut count,pages.as_mut_ptr()),1);
+            let scattered = [pages[1],pages[0]]; let offset = PHYS_PAGE_SIZE - 8;
+            let mut request = Request { options: DEST_PHYS_PAGES_BIT | (5 << 1), source: 0, offset: 6,
+                source_size: 84, destination: scattered.as_ptr() as u64, destination_page_offset: offset as u16,
+                destination_size: 16, ..Default::default() };
+            for size in [84,83,85] {
+                request.source_size = size;
+                reads.push(write_physical_pages(&scattered,offset,&[0xA5;16]));
+                checks.push(request.check(false));
+                results.push(execute(&request,Some(&file),Some(&scattered),None));
+                let mut readback = [0u8;16];
+                reads.push(read_physical_pages(&scattered,offset,&mut readback)); outputs.push(readback);
+            }
+            freed = FreeTitlePhysicalPages(std::ptr::null_mut(),count,pages.as_mut_ptr());
+        }
+        drop(file); std::fs::remove_file(path).unwrap();
+        assert_eq!(freed,1); assert!(reads.into_iter().all(|ok|ok));
+        assert_eq!(checks,vec![Ok(());3]);
+        assert_eq!(results,vec![Ok(()),Err(E_DECOMPRESSION),Err(E_DECOMPRESSION)]);
+        assert_eq!(outputs,vec![BC5_EXPECTED,[0xA5;16],[0xA5;16]]);
     }
 
     #[test]
