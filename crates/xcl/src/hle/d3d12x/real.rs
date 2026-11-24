@@ -33,7 +33,7 @@ use windows_sys::core::GUID;
 
 use super::layout::{self, Iface};
 use crate::stubs;
-use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
+use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, S_FALSE, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
@@ -362,7 +362,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
-    // PR #187: shaders taking memory windows from the descriptor heap need these views.
+    // shaders take the windows from the shared descriptor heap (`pso::heap_windows`)
     if n > 1 && crate::gpu::recomp::pso::heap_windows() {
         let views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
         if super::console_heap::set_window_views(device, &views) {
@@ -3443,15 +3443,66 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
 type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
 unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let mut hr = f(this, desc, riid, ppv);
+    let mut hr = driver_pso(f, this, desc, riid, ppv);
     if hr == E_NOINTERFACE {
         let iid = pc_iid(Kind::PipelineState);
-        hr = f(this, desc, &iid, ppv);
+        hr = driver_pso(f, this, desc, &iid, ppv);
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::PipelineState);
     }
     hr
+}
+
+thread_local! {
+    /// the driver ran out of memory on a pipeline with heap windows (`with_switch_fallback`)
+    static HEAP_WINDOW_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// heap-window driver calls still to fail with E_OUTOFMEMORY (`inject_heap_window_oom`)
+static INJECTED_OOM: AtomicU64 = AtomicU64::new(0);
+/// pipelines built in the switch form after the driver refused them with heap windows
+static SWITCH_FORM_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Tests: the next `n` driver pipeline calls with heap windows fail with E_OUTOFMEMORY without
+/// reaching the driver (0 stops it), as NVIDIA 616.92 refuses some big retail programs (#156).
+#[doc(hidden)]
+pub fn inject_heap_window_oom(n: u64) {
+    INJECTED_OOM.store(n, Ordering::SeqCst);
+}
+
+/// Pipelines built in the switch form because the driver refused them with heap windows.
+pub fn switch_form_retries() -> u64 {
+    SWITCH_FORM_RETRIES.load(Ordering::Relaxed)
+}
+
+/// A driver pipeline call; E_OUTOFMEMORY while this thread translates with heap windows is
+/// noted for `with_switch_fallback`.
+unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
+    if hr == E_OUTOFMEMORY && heap {
+        HEAP_WINDOW_OOM.with(|o| o.set(true));
+    }
+    hr
+}
+
+/// Build a translated pipeline (`build`: a `translated_*` path); when the driver ran out of
+/// memory on it with heap windows, translate it again in the switch form and build that.
+/// NVIDIA 616.92 refuses some big programs whose heap index depends on the window with
+/// E_OUTOFMEMORY in under a second, and builds the same programs in the switch form (#156).
+fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
+    HEAP_WINDOW_OOM.with(|o| o.set(false));
+    let r = build();
+    if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
+        return r;
+    }
+    let n = SWITCH_FORM_RETRIES.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n % 100 == 0 {
+        crate::xlog_warn!("D3D12.X: the driver ran out of memory on a pipeline with heap windows – building it in the switch form ({} so far)", n + 1);
+    }
+    crate::gpu::recomp::pso::in_switch_form(build)
 }
 
 thread_local! {
@@ -3471,6 +3522,10 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
 }
 
 fn note_translation_error(e: String) {
+    // a refusal `with_switch_fallback` builds again in the switch form (it says so itself)
+    if HEAP_WINDOW_OOM.with(|o| o.get()) {
+        return;
+    }
     if crate::gpu::recomp::dxc::in_cached_only() {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
@@ -3726,6 +3781,10 @@ mod big_compile_tests {
 }
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
+    with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
+}
+
+unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
@@ -4065,6 +4124,10 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
+}
+
+unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
@@ -4668,7 +4731,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.CS = bytecode(&tp.cs);
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let hc = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
+    let hc = driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
@@ -4851,6 +4914,10 @@ mod mesh_slot_tests {
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    with_switch_fallback(|| translated_mesh_stream_once(this, desc, riid, ppv))
+}
+
+unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_mesh, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;

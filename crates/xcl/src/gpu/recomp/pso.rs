@@ -77,11 +77,30 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() {
+    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
         n | super::HEAP_WINDOWS
     } else {
         n
     }
+}
+
+thread_local! {
+    /// this thread translates in the switch form (`in_switch_form`)
+    static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's translations in the switch form over root UAVs (`mem_windows`
+/// without `HEAP_WINDOWS`, so other cache keys): for a pipeline the driver would not build with
+/// heap windows. The root signature and the binds are the same for both forms.
+pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SWITCH_FORM.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SWITCH_FORM.with(|s| s.replace(true)));
+    f()
 }
 
 /// Whether translated shaders reach the memory windows through the shared descriptor heap

@@ -3486,11 +3486,15 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
-    if heaps.is_null() || super::console_heap::global_heap().is_none() {
-        if !heaps.is_null() {
-            let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
-            with_bindings(this, |b| b.heaps = given);
-        }
+    if heaps.is_null() || n == 0 {
+        // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
+        // before a translated draw or dispatch reads the memory windows from it)
+        with_bindings(this, |b| b.heaps.clear());
+        return f(this, n, heaps);
+    }
+    if super::console_heap::global_heap().is_none() {
+        let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
+        with_bindings(this, |b| b.heaps = given);
         return f(this, n, heaps);
     }
     let h = pc_heaps(n, heaps);
@@ -4859,6 +4863,47 @@ mod tests {
                 ]
             );
         });
+    }
+
+    /// SetDescriptorHeaps(0, NULL) unbinds every heap: the list must not still count the
+    /// shared heap as bound, or a translated draw after it reads the memory windows
+    /// (`ResourceDescriptorHeap[0..3]`) from no heap at all.
+    #[test]
+    fn unbinding_all_heaps_lets_the_shared_heap_be_bound_again() {
+        #[repr(C)]
+        struct FakeList {
+            vt: *const usize,
+            calls: Mutex<Vec<Vec<usize>>>,
+        }
+        unsafe extern "system" fn fake_set_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+            let v = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
+            (*(this as *const FakeList)).calls.lock().unwrap().push(v);
+        }
+        let mut orig_vt = [0usize; 64];
+        orig_vt[28] = fake_set_heaps as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeList { vt: unsafe { ext_vt.as_ptr().add(1) }, calls: Mutex::new(Vec::new()) });
+        let list = &*fake as *const FakeList as *mut c_void;
+        with_bindings(list, |b| b.heaps = vec![0x1234_0000]);
+        unsafe {
+            set_descriptor_heaps_x(list, 0, std::ptr::null());
+            let mut bound = Vec::new();
+            with_bindings(list, |b| bound = b.heaps.clone());
+            assert!(bound.is_empty(), "no heap is bound after SetDescriptorHeaps(0, NULL)");
+            assert_eq!(fake.calls.lock().unwrap().last(), Some(&Vec::new()));
+            ensure_view_heap(list);
+            with_bindings(list, |b| bound = b.heaps.clone());
+            match super::super::console_heap::global_heap() {
+                Some(g) if crate::gpu::recomp::pso::heap_windows() => {
+                    assert_eq!(bound, vec![g.as_raw() as usize], "the shared heap is bound again");
+                    assert_eq!(fake.calls.lock().unwrap().last(), Some(&vec![g.as_raw() as usize]));
+                }
+                _ => assert!(bound.is_empty()),
+            }
+        }
+        LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
     }
 
     #[test]

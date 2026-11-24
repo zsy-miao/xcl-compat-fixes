@@ -5136,6 +5136,8 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
 /// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
 /// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
 /// out-of-UMA pointers can never wrap onto live memory windows.
+/// `heap`: Some(storage class) – window k is taken from the descriptor heap
+/// (`Options::heap_windows`) and the same rule is one comparison before the access.
 fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
@@ -5162,13 +5164,15 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     }
     let mut s = String::new();
     if let Some(coherent) = heap {
-        // Validate the guest window before looking up its descriptor. This matches the
-        // root-UAV accessors, including zeroing the old value of out-of-range atomics.
+        // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
+        // does what the switch's `default` does
         let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ if (xcl_w >= {windows}u) return uint4(0u, 0u, 0u, 0u); XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
-        for (ret, name, params, args, fallback) in sigs {
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args, def) in sigs {
             let r = if ret == "void" { "" } else { "return " };
-            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ if (xcl_w >= {windows}u) {{ {fallback} }} XCL_MW; {r}m.{name}({args}); }}");
+            // (the switch's `break` leaves the accessor)
+            let outside = def.replace("break;", "return;");
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
         }
         return s;
     }

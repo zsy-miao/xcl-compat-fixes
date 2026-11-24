@@ -178,7 +178,12 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
     let raw = real::device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
     println!("backend device: {}", real::stats().adapter);
+    mirror_program_through_the_hook(&dev);
+}
 
+/// Hand the wave64 mirror program to the CreateComputePipelineState hook, dispatch the
+/// pipeline it built and check every thread's output.
+fn mirror_program_through_the_hook(dev: &ID3D12Device) {
     // user SGPRs 2, TGID_X + TGID_Y, thread ids v0 + v1
     let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
     assert!(xcl::gpu::xbox::is_xbox(&blob), "expected a console container");
@@ -223,6 +228,43 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
             assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
         }
     }
+}
+
+/// A driver that refuses a pipeline with heap windows (E_OUTOFMEMORY, as NVIDIA 616.92 does
+/// with some big retail programs, #156) gets the program again in the switch form, and the
+/// pipeline from it runs correctly. The refusals are injected (`real::inject_heap_window_oom`).
+#[test]
+fn heap_window_out_of_memory_falls_back_to_the_switch_form() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        println!("no real D3D12 device – skipping");
+        runner::skip_test("no GPU");
+        return;
+    }
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+    if xcl::gpu::recomp::pso::mem_windows() & xcl::gpu::recomp::HEAP_WINDOWS == 0 {
+        println!("no heap windows (opt-in: XCL_HEAP_WINDOWS=1; or no shared heap) – skipping");
+        runner::skip_test("no heap windows");
+        return;
+    }
+    struct StopInjecting;
+    impl Drop for StopInjecting {
+        fn drop(&mut self) {
+            real::inject_heap_window_oom(0);
+        }
+    }
+    let _stop = StopInjecting;
+    // every heap-window build fails, also the background one behind a stand-in
+    real::inject_heap_window_oom(u64::MAX);
+    let before = real::switch_form_retries();
+    mirror_program_through_the_hook(&dev);
+    assert!(real::switch_form_retries() > before, "the pipeline was not rebuilt in the switch form");
 }
 
 /// Cold DXIL cache: `CreateComputePipelineState` returns a stand-in immediately and compiles

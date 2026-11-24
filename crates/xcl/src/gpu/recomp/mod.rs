@@ -63,6 +63,7 @@ pub mod runner;
 mod tests;
 #[cfg(test)]
 mod aperture_tests;
+mod heap_window_tests;
 
 /// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
 /// window k is raw UAV `MEM_HEAP_BASE + k`.

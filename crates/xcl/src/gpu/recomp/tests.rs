@@ -3411,6 +3411,8 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     memory_windows_reject_out_of_uma_aliasing(false);
 }
 
+/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
+/// address outside them reads 0 and drops its stores and atomics there too.
 #[test]
 fn gpu_heap_windows_reject_out_of_uma_aliasing() {
     memory_windows_reject_out_of_uma_aliasing(true);
@@ -3471,6 +3473,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap_windows: bool) {
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows, ..Default::default() })).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap_windows);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
 
     let mut st = KernelState::default();

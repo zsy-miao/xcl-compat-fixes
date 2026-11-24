@@ -1350,11 +1350,15 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     }
 }
 
-/// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 4 GiB − 64 KiB –
-/// a raw view of exactly 4 GiB does not fit a 32-bit byte size (AMD's V# NUM_RECORDS, NVIDIA's
-/// view size: `aperture_tests`), and a window's last tile is never handed out.
+/// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 4 GiB − 32 bytes.
+/// An older D3D12 runtime (the one in Windows 11 23H2, D3D12Core 10.0.22621) refuses a raw view
+/// that ends above that from the start of its resource and removes the device; newer ones take
+/// 2^30 − 1 dwords (measured by CharlyRien on PR #680). The sparse windows hand out their last
+/// 64 KiB tile – a view of 4 GiB − 64 KiB left it unreachable (zeros, dropped stores); this one
+/// misses only the window's last 32 bytes
+/// (`heap_window_tests::gpu_raw_window_view_reaches_its_top`).
 pub fn raw_window_uav(bytes: u64) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    let bytes = bytes.min((1u64 << 32) - 0x1_0000);
+    let bytes = bytes.min((1u64 << 32) - 32);
     D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_UAV_DIMENSION_BUFFER,

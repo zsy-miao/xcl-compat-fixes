@@ -362,7 +362,8 @@ fn gpu_aperture_structured_rows_above_4_gib() {
 }
 
 /// The heap-window form (`Options::heap_windows`) on a real sparse window: a 4 GiB reserved
-/// buffer seen through `runner::raw_window_uav` (4 GiB − 64 KiB) reaches its last usable tile.
+/// buffer seen through `runner::raw_window_uav` reaches the original last usable tile. The
+/// official `heap_window_tests` additionally cover the widened view's final tile.
 #[test]
 fn gpu_raw_window_view_reaches_its_top() {
     let Some((dev, name)) = aperture_device(4 * GIB) else { return };
