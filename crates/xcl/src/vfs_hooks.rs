@@ -1744,6 +1744,10 @@ mod tests {
         before.sort();
         assert_eq!(before, vec![".", "..", "gone.txt", "hello.txt"]);
 
+        assert_eq!(v.remove_dir("data"), Err(vfs::ERROR_DIR_NOT_EMPTY));
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+
         // Removing `data` must make wildcard listing fail with ERROR_PATH_NOT_FOUND (no "." / "..").
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert_eq!(collect_game_entries(v, "data\\*", real_collect).err(), Some(vfs::ERROR_PATH_NOT_FOUND));

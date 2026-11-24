@@ -125,7 +125,9 @@ pub fn dxgi_format(f: u32) -> Option<(DXGI_FORMAT, [u32; 4])> {
         130 => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         132 => DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
         133 => return Some((DXGI_FORMAT_B5G6R5_UNORM, BGRA)),
-        135 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
+        // 1_5_5_5 (names list the fields from the top bit down): x in bits 0-4, w in bit 15.
+        // 5_5_5_1 (135) keeps its 1-bit field in bit 0, which no DXGI format has
+        134 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
         136 => return Some((DXGI_FORMAT_B4G4R4A4_UNORM, BGRA)),
         169 => DXGI_FORMAT_BC1_UNORM,
         170 => DXGI_FORMAT_BC1_UNORM_SRGB,
@@ -413,6 +415,10 @@ mod tests {
         assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
         assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
         assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
+        // 1_5_5_5 is B5G5R5A1 (and the format XCL writes into its views' T#s); 5_5_5_1 has none
+        assert_eq!(dxgi_format(134), Some((DXGI_FORMAT_B5G5R5A1_UNORM, [2, 1, 0, 3])));
+        assert!(dxgi_format(135).is_none());
+        assert_eq!(gfx10_format(DXGI_FORMAT_B5G5R5A1_UNORM), Some(134));
     }
 
     #[test]

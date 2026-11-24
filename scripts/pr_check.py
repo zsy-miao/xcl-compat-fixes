@@ -11,6 +11,14 @@ asks git instead of the GitHub API (whether a commit is on main, a blob's size).
 import argparse, os, re, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
+HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
+# placeholder lines copied verbatim from .github/pull_request_template.md (#965)
+TEMPLATE_PLACEHOLDERS = frozenset({
+    "hardware (GPU + driver, CPU), Rust version, debug / release:",
+    "`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)",
+    "`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: ...)",
+    "none / tool and model, and what it did",
+})
 # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
 BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)"
 # game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance")
@@ -58,6 +66,24 @@ def builds_runtime(path):
     return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
 
 
+def section_has_content(body, section):
+    """True when `**section**` exists and has at least one non-placeholder line."""
+    next_heading = "|".join(re.escape(h) for h in HEADINGS)
+    m = re.search(
+        r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)(?=\n\*\*(?:" + next_heading + r")\*\*|\Z)",
+        body,
+        re.S,
+    )
+    if not m:
+        return False
+    text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
+    for raw in text.splitlines():
+        line = re.sub(r"^\s*[-*•]+\s*", "", raw).strip()
+        if line and line not in TEMPLATE_PLACEHOLDERS:
+            return True
+    return False
+
+
 def check(body, head, files, is_main_ancestor, *, test_only=False):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
@@ -65,7 +91,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
-        if not re.search(r"\*\*" + section + r"\*\*\s*\n\s*\S", body):
+        if not section_has_content(body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
     ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
