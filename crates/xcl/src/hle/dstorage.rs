@@ -1041,6 +1041,31 @@ enum Entry {
 struct Pending {
     entries: Vec<Entry>,
     next_seq: u64,
+    /// requests whose destination page array had an entry of 0 at enqueue: until the title's own
+    /// `Submit`, a half-full queue does not submit by itself (a title fills such an entry after
+    /// `EnqueueRequest`, before its `Submit`; `refill_late_pages`)
+    late: usize,
+}
+
+/// The title's `Submit`: a destination page array entry that was 0 at enqueue is read again here,
+/// on the title's thread, where the title has filled it and the array is still its own. Entries
+/// that had a page keep the snapshot's value (#289); one still 0 is read again at the request's
+/// turn, as before.
+unsafe fn refill_late_pages(entries: &mut [Entry]) {
+    for e in entries {
+        if let Entry::Request { req, dest_pages: Some(pages), .. } = e {
+            if !pages.contains(&0) {
+                continue;
+            }
+            if let Ok(now) = snapshot_page_array(req.destination, req.destination_page_offset, req.destination_size) {
+                for (p, n) in pages.iter_mut().zip(now) {
+                    if *p == 0 {
+                        *p = n;
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct CancelRule {
@@ -1098,6 +1123,7 @@ impl QueueInner {
         rules.iter().any(|r| tag & r.mask == r.value)
     }
 
+    /// The title's Submit refills late page arrays before dispatch.
     fn submit(self: &Arc<Self>, origin: Origin) {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
@@ -1105,7 +1131,14 @@ impl QueueInner {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        let batch = {
+            let mut p = self.pending.lock().unwrap();
+            if origin == Origin::TitleSubmit && p.late > 0 {
+                unsafe { refill_late_pages(&mut p.entries) };
+            }
+            p.late = 0;
+            std::mem::take(&mut p.entries)
+        };
         if batch.is_empty() {
             return;
         }
@@ -1211,10 +1244,15 @@ impl QueueInner {
                 }
             }
             p.entries.push(e);
-            p.entries.len()
+            (p.entries.len(), p.late)
         };
-        // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        self.submit_if_half_full(n);
+    }
+
+    /// As on PC, a half-full queue submits by itself – unless a request in it is still waiting
+    /// for the title to fill its page array (`Pending::late`).
+    fn submit_if_half_full(self: &Arc<Self>, (n, late): (usize, usize)) {
+        if n >= (self.capacity / 2).max(1) && late == 0 {
             self.submit(Origin::HalfFull);
         }
     }
@@ -1227,12 +1265,13 @@ impl QueueInner {
             }
             let seq = p.next_seq;
             p.next_seq += 1;
+            if dest_pages.as_ref().is_some_and(|pages| pages.contains(&0)) {
+                p.late += 1;
+            }
             p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
-            p.entries.len()
+            (p.entries.len(), p.late)
         };
-        if n >= (self.capacity / 2).max(1) {
-            self.submit(Origin::HalfFull);
-        }
+        self.submit_if_half_full(n);
     }
 
     fn refuse(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>, stage: Stage, dest_pages: Option<&[usize]>) {
@@ -1302,7 +1341,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         desc: raw,
         source_memory: source == 1,
         capacity,
-        pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
+        pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1, late: 0 }),
         cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
         worker_active: (Mutex::new(false), Condvar::new()),
@@ -2065,6 +2104,77 @@ mod tests {
 
     /// A destination page array whose entry is still 0 at EnqueueRequest and gets its page
     /// before the request's turn: the data arrives (a retail title's streaming).
+    #[test]
+    fn a_late_page_array_holds_a_half_full_queue_until_the_titles_submit() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            // capacity 2: half full at one entry, so every enqueue would submit by itself
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&2u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                PHYS_PAGE_SIZE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 1, 0, 4, pages.as_mut_ptr()), reserved);
+
+            // the title's table has no page yet when the request is enqueued
+            let data: Vec<u8> = (0..0x400u32).map(|i| (i * 7 + 3) as u8).collect();
+            let mut table = Box::new([0usize]);
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
+            status(q, s, 0);
+            // the half-full queue did not run it while the page was missing
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!complete(s, 0), "the request ran before the title filled its page array");
+
+            // the title fills the entry, then submits
+            std::ptr::write_volatile(&mut table[0], pages[0]);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 0), S_OK);
+            let got = std::slice::from_raw_parts(reserved as *const u8, data.len());
+            assert_eq!(got, &data[..]);
+
+            MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
+            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
     #[test]
     fn a_destination_page_filled_in_after_enqueue() {
         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
