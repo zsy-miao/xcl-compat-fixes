@@ -175,14 +175,21 @@ machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, Any
 libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
 repository contains no headers or binaries from the console SDK.
 
-The local BCPack research decoder uses the MIT-licensed [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs)
-entropy model tables by Ahmet Dedeler, derived from Microsoft's MIT-licensed
-silicon-rans model. The bounded fragment handling and synthetic controls are
-from the MIT-licensed [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows)
-research. Their notices are retained in the decoder source. BC7 block
-reconstruction remains limited to explicitly validated configurations.
-The native BC1 path adapts [Kalmarv's PR #273](https://github.com/ivall/xcl/pull/273)
-with bcpack-rs's MIT fitted tables. These tables are estimates: unknown history
-entries are refused without destination writes, and hardware-exact colours are
-not established. BC1 is enabled for bounded single-stage requests; zlib + BC1
-and hardware swizzling remain refused in this integration.
+Normal BCPack requests use the official VIctory-derived decoder, including
+zlib followed by BCPack, under the author's GPL-2.0-only permission recorded in
+`THIRD_PARTY.md`. BC2 and hardware swizzling remain unsupported. The optional
+retail/reference comparison requires separately supplied samples; ordinary
+synthetic tests do not establish hardware-exact output.
+
+The retained local research modules use MIT-licensed
+[bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) entropy tables by Ahmet
+Dedeler, derived from Microsoft's silicon-rans model, and bounded fragment
+handling and synthetic controls from [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows).
+Their notices remain in the source. The older BC7 subset and separate BC5/BC7
+helper path are available only after official rejection and explicit research
+helper configuration; they do not replace successful official decoding. The
+helper is a separate program and is not included in the portable archive.
+Legacy BC1 tests retain [Kalmarv's PR #273](https://github.com/ivall/xcl/pull/273)
+and bcpack-rs's estimated MIT fitted tables as independent controls, rather
+than the normal request decoder. Unknown history slots remain refused by
+that legacy path; its fitted colours are not hardware-validated.
