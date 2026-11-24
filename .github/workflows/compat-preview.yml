@@ -1,0 +1,63 @@
+name: Windows compatibility preview
+
+on:
+  push:
+    tags: ['compat-preview-*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'Prime1997/xcl-compat-fixes'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select the tested toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup override set 1.100.0
+      - name: Run Windows checks
+        shell: pwsh
+        run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+      - name: Build the portable package
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p xcl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $archive = Join-Path $env:RUNNER_TEMP 'dxc_2026_09_29.zip'
+          Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip' -OutFile $archive
+          ./scripts/package-preview.ps1 -Executable target/release/xcl.exe -DxcArchive $archive -OutputDirectory target/preview
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-preview
+          path: |
+            target/preview/XCL-Windows-x64.zip
+            target/preview/XCL-Windows-x64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-preview
+          path: dist
+      - name: Publish the verified archive and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c XCL-Windows-x64.zip.sha256)
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          gh release create "$GITHUB_REF_NAME" dist/XCL-Windows-x64.zip dist/XCL-Windows-x64.zip.sha256 \
+            --verify-tag --prerelease --title "Windows compatibility preview $GITHUB_REF_NAME" --notes-from-tag
