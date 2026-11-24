@@ -839,11 +839,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     };
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
-        let mut batch = Vec::new();
+        let mut picked = Vec::new();
+        let mut snapshots = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -861,7 +862,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             device = dev;
             bytes += tex.size() as usize;
-            let subs = subresources_from(&mem, &tex);
+            picked.push((r, va, states, res_key, h));
+            snapshots.push((mem, tex));
+        }
+        let subs = subresources_of_all(snapshots, bytes);
+        let mut batch = Vec::with_capacity(picked.len());
+        for ((r, va, states, res_key, h), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
@@ -876,8 +882,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        let upload_items: Vec<_> = batch.iter().map(|(r, subs, states, _, _)| (r.clone(), subs.clone(), states.clone())).collect();
         let keys: Vec<_> = batch.iter().map(|(_, _, _, res, h)| (*res, *h)).collect();
+        // Transfer the detiled bytes; cloning every pixel here would double the batch.
+        let upload_items: Vec<_> = batch.into_iter().map(|(r, subs, states, _, _)| (r, subs, states)).collect();
         match own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &upload_items)
@@ -892,7 +899,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                         remember_upload(*res, *h);
                     }
                 }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                UPLOADS.fetch_add(upload_items.len() as u64, Ordering::Relaxed);
             }
             Err(e) => warn(&e),
         }
@@ -1071,6 +1078,50 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
             std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
         }
         p = end;
+    }
+    out
+}
+
+/// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
+const PARALLEL_BYTES: usize = 1 << 20;
+
+/// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
+/// when the batch is big. They were read and detiled one after another in the title's own
+/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
+fn subresources_of_all(picked: Vec<(Vec<u8>, Arc<xg::Texture>)>, bytes: usize) -> Vec<Vec<Subresource>> {
+    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
+    subresources_on(picked, threads)
+}
+
+/// Detile each owned snapshot in order, on up to `threads` workers. A worker drops its
+/// snapshot after that texture, so raw inputs do not live alongside the entire finished batch.
+fn subresources_on(picked: Vec<(Vec<u8>, Arc<xg::Texture>)>, threads: usize) -> Vec<Vec<Subresource>> {
+    let threads = threads.min(picked.len());
+    if threads <= 1 {
+        return picked.into_iter().map(|(mem, tex)| subresources_from(&mem, &tex)).collect();
+    }
+    // Take ownership of the next input under the short queue lock. No title-memory
+    // reads happen here: the same bytes were already hashed in upload_all (#504).
+    let mut out: Vec<Vec<Subresource>> = (0..picked.len()).map(|_| Vec::new()).collect();
+    let next = Mutex::new(picked.into_iter().enumerate());
+    let done: Vec<Vec<(usize, Vec<Subresource>)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let item = next.lock().unwrap().next();
+                        let Some((k, (mem, tex))) = item else { break };
+                        mine.push((k, subresources_from(&mem, &tex)));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    });
+    for (k, subs) in done.into_iter().flatten() {
+        out[k] = subs;
     }
     out
 }
@@ -1438,6 +1489,48 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+
+    /// The textures of a batch detiled on several threads come back as on one: complete and in
+    /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
+    #[test]
+    fn a_batch_detiled_on_several_threads_matches_one_thread() {
+        let descs = [
+            console_desc(3, 64, 64, 2, 3, 28, 0x105),
+            console_desc(3, 200, 72, 1, 5, 28, 0x105),
+            console_desc(4, 40, 24, 6, 3, 28, 0x105),
+            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
+            console_desc(3, 4, 4, 1, 1, 28, 0x105),
+            console_desc(3, 128, 32, 3, 2, 28, 0x105),
+            console_desc(3, 64, 64, 1, 1, 28, 0x105),
+        ];
+        let textures: Vec<Arc<xg::Texture>> = descs.iter().map(|d| Arc::new(xg::Texture::new(d).unwrap())).collect();
+        // each texture's console memory: distinct bytes per texture
+        let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
+        let picked = || mems.iter().zip(&textures).map(|(m, x)| (m.clone(), Arc::clone(x))).collect();
+        let one = subresources_on(picked(), 1);
+        assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
+        for threads in [2, 3, 8] {
+            assert!(subresources_on(picked(), threads) == one, "{threads} threads differ from one");
+        }
+    }
+
+    /// The merge with #451 must not read the title a second time after checking its hash.
+    #[test]
+    fn parallel_detiling_uses_the_hashed_snapshot_after_source_changes() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 3, 28, 0x105)).unwrap());
+        let mut source: Vec<u8> = (0..tex.size() as usize).map(|i| (i * 7 + 61) as u8).collect();
+        let snapshot = source.clone();
+        let hash = content_hash(&snapshot);
+        let expected = subresources_from(&snapshot, &tex);
+        let picked = vec![(snapshot.clone(), Arc::clone(&tex)), (snapshot, Arc::clone(&tex))];
+        source.fill(0);
+        assert_ne!(content_hash(&source), hash, "the live source changed after its snapshot");
+        let parallel = subresources_on(picked, 2);
+        assert_eq!(parallel.len(), 2);
+        for subs in parallel {
+            assert!(subs == expected, "parallel detiling must use the bytes that were hashed");
+        }
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {

@@ -201,28 +201,111 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     r
 }
 
+/// What `upload_batch` keeps for a queue between batches: its allocator and list, a fence, and
+/// one persistently mapped upload buffer the batches' texels go through. Making them for every
+/// batch – an upload buffer per texture, an allocator, a list and a fence per batch – cost a
+/// retail game most of its frame once it streamed textures: each of those D3D12 calls waits for
+/// the video memory manager, 200 – 650 ms apiece then.
+struct Uploader {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    value: u64,
+    /// (buffer, its mapped bytes, capacity)
+    staging: Option<(ID3D12Resource, *mut u8, u64)>,
+}
+
+// D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
+unsafe impl Send for Uploader {}
+
+/// queue (raw pointer) → its uploader, while no batch uses it
+static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
+
+/// the smallest upload buffer made, and the placement alignment of texture data in it
+const STAGING_MIN: u64 = 4 << 20;
+const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+
+impl Uploader {
+    unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+        list.Close().map_err(err)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+    }
+
+    /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
+    unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
+        if let Some((b, p, cap)) = &self.staging {
+            if *cap >= bytes {
+                return Ok((b.clone(), *p));
+            }
+        }
+        let cap = bytes.max(STAGING_MIN).next_power_of_two();
+        let b = buffer(dev, cap)?;
+        let mut p = std::ptr::null_mut();
+        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        self.staging = Some((b.clone(), p as *mut u8, cap));
+        Ok((b, p as *mut u8))
+    }
+}
+
 /// Several uploads on one list, one wait: (resource, subresources, states) each – the states
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
-/// order). A failure of one is returned with its index; the others still run.
+/// order). A failure of one is returned with its index; the others still run. The texels go
+/// through the queue's kept upload buffer (`Uploader`).
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
-    let mut staging = Vec::with_capacity(items.len());
+    let key = windows::core::Interface::as_raw(queue) as usize;
+    let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
+    let mut up = match taken {
+        Some(u) => u,
+        None => Uploader::new(dev)?,
+    };
+    // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
     for (k, (res, subs, states)) in items.iter().enumerate() {
-        match record_upload_states(dev, &list, res, subs, states, states) {
-            Ok(s) => staging.push(s),
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
             Err(e) => failed.push((k, e)),
         }
     }
-    list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
-    wait(dev, queue)?;
-    drop(staging);
+    if planned.is_empty() {
+        put_back(key, up);
+        return Ok(failed);
+    }
+    let (staging, mapped) = up.staging(dev, total)?;
+    up.alloc.Reset().map_err(err)?;
+    up.list.Reset(&up.alloc, None).map_err(err)?;
+    for (k, l, base) in &planned {
+        let (res, subs, states) = &items[*k];
+        record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
+    }
+    up.list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+    up.value += 1;
+    let copy_error = |e| format!("texture copy: {e}");
+    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
+        // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
+        // uploader next time) – freeing them under the GPU removed the device
+        std::mem::forget(up);
+        return Err(copy_error(e));
+    }
+    put_back(key, up);
     Ok(failed)
+}
+
+fn put_back(key: usize, up: Uploader) {
+    UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
 }
 
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
@@ -242,6 +325,25 @@ pub unsafe fn record_upload_states(
     before: &[D3D12_RESOURCE_STATES],
     after: &[D3D12_RESOURCE_STATES],
 ) -> Result<ID3D12Resource, String> {
+    let l = layout(dev, res, subs, before, after)?;
+    let up = buffer(dev, l.total)?;
+    let mut p = std::ptr::null_mut();
+    up.Map(0, None, Some(&mut p)).map_err(err)?;
+    record_into(list, res, subs, &l, before, after, &up, p as *mut u8, 0);
+    up.Unmap(0, None);
+    Ok(up)
+}
+
+/// Where the texels of an upload go in an upload buffer: each subresource's footprint (offsets
+/// from 0) and rows, and the bytes of all of them.
+struct Layout {
+    fps: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    total: u64,
+}
+
+/// The `Layout` of uploading `subs` into `res`, checked against the resource.
+unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource], before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES]) -> Result<Layout, String> {
     validate_subresources(subs)?;
     let rd = res.GetDesc();
     let n = subs.len();
@@ -264,40 +366,45 @@ pub unsafe fn record_upload_states(
             ));
         }
     }
-    let up = buffer(dev, total)?;
-    let mut p = std::ptr::null_mut();
-    up.Map(0, None, Some(&mut p)).map_err(err)?;
-    for ((s, fp), &nrows) in subs.iter().zip(&fps).zip(&rows) {
+    Ok(Layout { fps, rows, total })
+}
+
+/// Write `subs` into the mapped upload buffer `up` (`mapped`) from `base` (a multiple of
+/// D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) as `l` places them, and record their copies into
+/// `res` on `list` (barriers from `before` and back to `after`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, base: u64) {
+    let n = subs.len();
+    for ((s, fp), &nrows) in subs.iter().zip(&l.fps).zip(&l.rows) {
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
         // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
         let slice_pitch = pitch * nrows as usize;
         for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
             for y in 0..(nrows as usize).min(s.rows) {
-                let at = fp.Offset as usize + z * slice_pitch + y * pitch;
-                std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), (p as *mut u8).add(at), row);
+                let at = base as usize + fp.Offset as usize + z * slice_pitch + y * pitch;
+                std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), mapped.add(at), row);
             }
         }
     }
-    up.Unmap(0, None);
     let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
     if !to_copy.is_empty() {
         list.ResourceBarrier(&to_copy);
     }
-    for (k, fp) in fps.iter().enumerate() {
+    for (k, fp) in l.fps.iter().enumerate() {
         let dst = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(res),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 },
         };
-        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+        let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + fp.Offset, Footprint: fp.Footprint };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
     }
     let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
     if !back.is_empty() {
         list.ResourceBarrier(&back);
     }
-    Ok(up)
 }
 
 /// The transitions of `r`'s `n` subresources from `from` to `to` (each one state for all, or one
@@ -628,6 +735,65 @@ mod tests {
                     assert!(g == w, "format {} {:?} mode {} subresource {k} ({} × {} rows × {} B) differs", t.format, t.ty, t.swizzle_mode, w.depth, w.rows, w.row_bytes);
                 }
             }
+        }
+    }
+
+    /// Batches through one queue share its upload buffer (`Uploader`): two batches of three
+    /// textures (mips, an odd size, BC7) each read back what was uploaded, and the second batch
+    /// made no new upload buffer.
+    #[test]
+    fn gpu_upload_batches_reuse_the_queues_upload_buffer() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let make = |w: u64, h: u32, mips: u16, format| -> ID3D12Resource {
+                let rd = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: w,
+                    Height: h,
+                    DepthOrArraySize: 1,
+                    MipLevels: mips,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, SHADER_READ, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            // every subresource of `r`, filled with a pattern of `seed`
+            let subs = |r: &ID3D12Resource, seed: u8| -> Vec<Subresource> {
+                let rd = r.GetDesc();
+                let n = rd.MipLevels as usize;
+                let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+                let (mut rows, mut row_bytes) = (vec![0u32; n], vec![0u64; n]);
+                dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), None);
+                (0..n)
+                    .map(|k| {
+                        let (r, b, d) = (rows[k] as usize, row_bytes[k] as usize, fps[k].Footprint.Depth as usize);
+                        Subresource { rows: r, row_bytes: b, depth: d, data: (0..r * b * d).map(|i| (i as u8).wrapping_mul(31) ^ seed ^ k as u8).collect() }
+                    })
+                    .collect()
+            };
+            let textures = [make(64, 64, 7, DXGI_FORMAT_R8G8B8A8_UNORM), make(100, 30, 1, DXGI_FORMAT_R8G8B8A8_UNORM), make(256, 256, 9, DXGI_FORMAT_BC7_UNORM)];
+            let key = windows::core::Interface::as_raw(&queue) as usize;
+            let kept = || UPLOADERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)).and_then(|u| u.staging.as_ref()).map(|s| (windows::core::Interface::as_raw(&s.0) as usize, s.2));
+            let mut buffers = Vec::new();
+            for round in 0..2u8 {
+                let items: Vec<_> = textures.iter().enumerate().map(|(i, r)| (r.clone(), subs(r, round * 16 + i as u8), vec![SHADER_READ])).collect();
+                assert!(upload_batch(&dev, &queue, &items).unwrap().is_empty(), "round {round}: an upload failed");
+                for (i, (r, want, _)) in items.iter().enumerate() {
+                    let got = read_back(&dev, &queue, r, want);
+                    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+                        assert!(g == w, "round {round}, texture {i}, subresource {k} differs");
+                    }
+                }
+                buffers.push(kept().expect("the queue's upload buffer is kept"));
+            }
+            assert_eq!(buffers[0], buffers[1], "the second batch made a new upload buffer");
         }
     }
 
