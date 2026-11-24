@@ -138,6 +138,61 @@ fn device() -> Option<(ID3D12Device, String)> {
     }
 }
 
+fn aperture_fits(tier: D3D12_TILED_RESOURCES_TIER, bits: u32, bytes: u64) -> bool {
+    tier != D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED && bytes != 0 && (bits >= 64 || (bytes - 1) >> bits == 0)
+}
+
+fn aperture_device(bytes: u64) -> Option<(ID3D12Device, String)> {
+    let Some((dev, name)) = device() else {
+        super::runner::skip_test("no GPU");
+        return None;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let mut va = D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT::default();
+    unsafe {
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut options as *mut _ as _, std::mem::size_of_val(&options) as u32).unwrap();
+        dev.CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &mut va as *mut _ as _, std::mem::size_of_val(&va) as u32).unwrap();
+    }
+    println!("{name}: tiled resources {:?}, {} GPU VA bits per resource; aperture {bytes} bytes", options.TiledResourcesTier, va.MaxGPUVirtualAddressBitsPerResource);
+    if !aperture_fits(options.TiledResourcesTier, va.MaxGPUVirtualAddressBitsPerResource, bytes) {
+        super::runner::skip_test("no tiled-resource address space for this aperture");
+        return None;
+    }
+    Some((dev, name))
+}
+
+// Only failure to reserve the aperture itself is a capacity skip. Invalid descriptors,
+// device removal and every later allocation or shader/readback failure still fail the test.
+fn aperture_reserved(result: windows::core::Result<()>) -> windows::core::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[test]
+fn aperture_capability_checks_include_the_last_byte() {
+    assert!(!aperture_fits(D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED, 64, 4 * GIB));
+    assert!(!aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 31, 4 * GIB));
+    assert!(aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 32, 4 * GIB));
+    assert!(!aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 32, 4 * GIB + 1));
+    assert!(!aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 33, SIZE));
+    assert!(aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 34, SIZE));
+    assert!(!aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 64, 0));
+    assert!(aperture_fits(D3D12_TILED_RESOURCES_TIER_2, 64, u64::MAX));
+}
+
+#[test]
+fn aperture_reservation_only_skips_out_of_memory() {
+    use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+    assert!(aperture_reserved(Ok(())).unwrap());
+    assert!(!aperture_reserved(Err(windows::core::Error::from_hresult(E_OUTOFMEMORY))).unwrap());
+    for code in [E_INVALIDARG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET] {
+        assert_eq!(aperture_reserved(Err(windows::core::Error::from_hresult(code))).unwrap_err().code(), code);
+    }
+}
+
 /// One run (root UAV or heap view): the words read back through the shader and the tiles'
 /// contents copied straight out of the aperture.
 unsafe fn run(dev: &ID3D12Device, heap_view: bool) -> Result<(Vec<u32>, Vec<Vec<u32>>), String> {
@@ -310,8 +365,9 @@ fn gpu_aperture_structured_rows_above_4_gib() {
 /// buffer seen through `runner::raw_window_uav` (4 GiB − 64 KiB) reaches its last usable tile.
 #[test]
 fn gpu_raw_window_view_reaches_its_top() {
-    let Some((dev, name)) = device() else { return };
+    let Some((dev, name)) = aperture_device(4 * GIB) else { return };
     if super::dxc::location().is_err() {
+        super::runner::skip_test("no DXC");
         return;
     }
     let top = (4 * GIB) - 2 * TILE; // the last tile the view covers
@@ -352,7 +408,10 @@ void main(uint l : SV_GroupThreadID) {
             ..Default::default()
         };
         let mut win: Option<ID3D12Resource> = None;
-        dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut win).unwrap();
+        if !aperture_reserved(dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut win)).unwrap() {
+            super::runner::skip_test("insufficient resources for a 4 GiB reserved aperture");
+            return;
+        }
         let win = win.unwrap();
         let mut heap: Option<ID3D12Heap> = None;
         dev.CreateHeap(&D3D12_HEAP_DESC { SizeInBytes: 2 * TILE, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, Alignment: 0, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS }, &mut heap).unwrap();
@@ -403,8 +462,9 @@ void main(uint l : SV_GroupThreadID) {
 /// engine at offset 4 GiB + 64 KiB.
 #[test]
 fn gpu_aperture_probe_where_it_wraps() {
-    let Some((dev, name)) = device() else { return };
+    let Some((dev, name)) = aperture_device(SIZE) else { return };
     if super::dxc::location().is_err() {
+        super::runner::skip_test("no DXC");
         return;
     }
     let src = r#"
@@ -450,7 +510,10 @@ void main() {
             ..Default::default()
         };
         let mut ap: Option<ID3D12Resource> = None;
-        dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut ap).unwrap();
+        if !aperture_reserved(dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut ap)).unwrap() {
+            super::runner::skip_test("insufficient resources for a 16 GiB reserved aperture");
+            return;
+        }
         let ap = ap.unwrap();
         let mut heap: Option<ID3D12Heap> = None;
         dev.CreateHeap(&D3D12_HEAP_DESC { SizeInBytes: 2 * TILE, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, Alignment: 0, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS }, &mut heap).unwrap();
