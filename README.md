@@ -62,6 +62,9 @@ XCL works only on unpacked game files you already own. It does not download, dec
 
 ### Graphics
 
+On wrapped command lists, an eligible `Wait64BitValueX` (`>=`) after GPU work splits the
+recording so the prefix can run before the wait. Untracked counters still use a bounded CPU wait.
+
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |

@@ -2234,22 +2234,17 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
-/// Deferred mid-list split for `Wait32/64BitValueX` recorded after a `Write64BitValue*` in the
-/// same command list: closes `list` (preserving its earlier `Write64` signals on segment N) and
-/// opens/reuses a sibling PC command list on the same `ID3D12CommandAllocator` as segment N+1,
-/// carrying all bound D3D12 + XCL root-argument state across the split.
-///
-/// At `ExecuteCommandLists`, `title_list::push_segments` expands the wrapper into `[seg_0, seg_1, ...]`
-/// and `execute_with_waits_on` submits `seg_0` + emits `queue.Signal` for its `Write64`s BEFORE
-/// emitting `queue.Wait` for `seg_1`'s `Wait64`, preserving exact Xbox chronological order with
-/// zero artificial GPU cycles.
-unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
+/// Close the active PC segment before a recorded memory wait and open/reuse its continuation on
+/// the same command allocator, carrying bound D3D12 and XCL root-argument state across the split.
+/// The queue submits the prefix and signals any recorded Write64 values before waiting on the
+/// continuation. Ordinary work also needs that ordering even when it signals no Write64 fence.
+unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*mut c_void> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
         return None;
     }
     let wrapper = super::title_list::wrapper_of(list)?;
-    if !super::title_list::can_split(wrapper) {
+    if (!after_write64 && !super::title_list::has_recorded_work(wrapper)) || !super::title_list::can_split(wrapper) {
         return None;
     }
     let ty = list_type(list);
@@ -2426,7 +2421,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     static SPLITS: AtomicU64 = AtomicU64::new(0);
     let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || (n.is_power_of_two() && n <= 256) {
-        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", ty.0);
+        crate::xlog_info!("D3D12.X: split command list (type {}) at a recorded memory wait (#{n})", ty.0);
     }
     Some(next_pc)
 }
@@ -2436,8 +2431,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 /// If an earlier write in the same open list already targeted an overlapping UMA range, the
 /// `COMMON -> COPY_DEST -> COMMON` barrier around that write already orders subsequent work
 /// on the GPU, so we do not stall before submission (which would deadlock waiting on our own
-/// unsubmitted list). If this list already recorded a `Write64BitValue*` to a different cell,
-/// we split into a new deferred PC segment so earlier `Write64` signals run BEFORE this wait.
+/// unsubmitted list). Otherwise split after tracked Write64 signals or before a Wait64 GE that
+/// follows ordinary recorded work, so the wait gates only the continuation.
 unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = width as u64;
@@ -2457,19 +2452,21 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if comparison == D3D12_COMPARISON_FUNC_NEVER.0 as u32 {
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
-    let need_split = {
+    let positional_wait = width == 8 && comparison == D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32 && value != 0;
+    let after_write64 = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if s.has_prior_write(va, n) {
             return;
         }
-        if s.write64_signals.is_empty() {
+        let after_write64 = !s.write64_signals.is_empty();
+        if !after_write64 && !positional_wait {
             s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
             return;
         }
-        true
+        after_write64
     };
-    let target = if need_split { try_split_for_wait(list).unwrap_or(list) } else { list };
+    let target = try_split_for_wait(list, after_write64).unwrap_or(list);
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
@@ -2859,6 +2856,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    super::title_list::clear_recorded_work(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -3430,6 +3428,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     if hr < 0 {
         return hr;
     }
+    super::title_list::clear_recorded_work(this);
 
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
@@ -5827,6 +5826,125 @@ mod tests {
 
             crate::gpu::fence::wait(&done1, 1, &dev, None, 2000).expect("q1 must complete after watchdog CPU signal");
             crate::gpu::fence::wait(&done2, 1, &dev, None, 2000).expect("q2 must complete after watchdog CPU signal");
+        }
+    }
+
+    #[test]
+    fn ordinary_copy_runs_before_wait64_for_late_external_value() {
+        use super::super::{bind, title_list};
+        use crate::gpu::{fence, recomp::runner::skip_test};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        const DIRECT: D3D12_COMMAND_LIST_TYPE = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        const READY: u64 = 0x1_0000_0041;
+        const WORDS: [u64; 2] = [0x0102_0304_0506_0708, 0xA1B2_C3D4_E5F6_0798];
+
+        unsafe {
+            let mut dev = None;
+            if D3D12CreateDevice::<_, ID3D12Device>(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(DIRECT).unwrap();
+            let prefix_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let suffix_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 16,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let buffer = |heap, state| -> ID3D12Resource {
+                let props = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+                let mut res = None;
+                dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut res).unwrap();
+                res.unwrap()
+            };
+            let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let target = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+            let prefix = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            let suffix = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            let empty = D3D12_RANGE { Begin: 0, End: 0 };
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, Some(&empty), Some(&mut p)).unwrap();
+            p.cast::<[u64; 2]>().write_unaligned(WORDS);
+            upload.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }));
+            let read_word = |res: &ID3D12Resource| -> windows::core::Result<u64> {
+                let mut p = std::ptr::null_mut();
+                res.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 8 }), Some(&mut p))?;
+                let word = p.cast::<u64>().read_unaligned();
+                res.Unmap(0, Some(&empty));
+                Ok(word)
+            };
+
+            // Snapshot the same target after each batch. A suffix recorded into the prefix
+            // would overwrite the first word and be visible before the producer releases it.
+            let snapshot = |dst: &ID3D12Resource| -> ID3D12CommandList {
+                let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, DIRECT, &alloc, None).unwrap();
+                cl.CopyBufferRegion(dst, 0, &target, 0, 8);
+                cl.Close().unwrap();
+                cl.cast().unwrap()
+            };
+            let prefix_snapshot = [Some(snapshot(&prefix))];
+            let suffix_snapshot = [Some(snapshot(&suffix))];
+
+            let pc = real::create_raw_pc_command_list(dev.as_raw(), DIRECT, alloc.as_raw() as usize, 0).unwrap();
+            on_create(pc, alloc.as_raw() as usize, 0, DIRECT);
+            bind::reset(pc, alloc.as_raw() as usize, 0);
+            let list = ID3D12GraphicsCommandList::from_raw(title_list::wrap(pc));
+            let leading = AtomicU64::new(1);
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+            // The slot guard sees Rust callers as PC; enter the console Wait64 handler directly.
+            wait64_x(pc, &leading as *const AtomicU64 as u64, ge, 1, 0, 0);
+            assert_eq!(title_list::wrapper_of(pc), Some(list.as_raw()), "a leading Wait64 needs no split");
+            let counter = AtomicU64::new(0);
+            list.CopyBufferRegion(&target, 0, &upload, 0, 8);
+            wait64_x(pc, &counter as *const AtomicU64 as u64, ge, READY, 0, 0);
+            list.CopyBufferRegion(&target, 0, &upload, 8, 8);
+            list.Close().unwrap();
+
+            let mut segments = Vec::new();
+            assert!(title_list::push_segments(list.as_raw(), &mut segments));
+            let last = *segments.last().unwrap();
+            let exec = queue.vtable().ExecuteCommandLists;
+            let mut signal_error = None;
+            let (observed_prefix, early_suffix) = std::thread::scope(|scope| {
+                let producer = scope.spawn(|| {
+                    // Leave time for a real GPU copy, but release before the default CPU wait times out.
+                    let prefix = fence::wait(&prefix_done, 1, &dev, None, 1000).map(|()| read_word(&prefix));
+                    let suffix = prefix.is_ok().then(|| fence::wait(&suffix_done, 1, &dev, None, 100));
+                    // Release on RED as well, before reporting any observation error.
+                    counter.store(READY, Ordering::Release);
+                    (prefix, suffix)
+                });
+                execute_with_waits_on(queue.as_raw(), &segments, |chunk| {
+                    exec(queue.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    let (snapshot, done) = if chunk.contains(&last) {
+                        (&suffix_snapshot, &suffix_done)
+                    } else {
+                        (&prefix_snapshot, &prefix_done)
+                    };
+                    queue.ExecuteCommandLists(snapshot);
+                    if let Err(err) = queue.Signal(done, 1) {
+                        signal_error = Some(err);
+                    }
+                });
+                producer.join().unwrap()
+            });
+
+            let drained = fence::wait(&suffix_done, 1, &dev, None, 2000);
+            assert!(signal_error.is_none(), "signal copy completion: {signal_error:?}");
+            drained.expect("queue did not finish after the producer advanced");
+            let word = observed_prefix.expect("ordinary prefix copy did not finish before the producer advanced").unwrap();
+            assert_eq!(word, WORDS[0]);
+            assert!(matches!(early_suffix, Some(Err(fence::FenceError::Timeout(_)))), "suffix was not held before the producer advanced: {early_suffix:?}");
+            assert_eq!(read_word(&suffix).unwrap(), WORDS[1]);
         }
     }
 

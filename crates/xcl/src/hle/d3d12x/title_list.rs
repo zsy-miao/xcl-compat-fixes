@@ -36,6 +36,8 @@ const F_END: usize = 0x30;
 /// `XCL_LIST_TRACE`: the last `RING` slots called (u16 each) and a counter
 const F_RING: usize = 0x2000;
 const F_RING_AT: usize = 0x2100;
+/// Whether the active PC segment has recorded work. The title serializes recording on a list.
+const F_RECORDED_WORK: usize = 0x2108;
 const RING: usize = 64;
 /// Maximum number of mid-list split segments per command list recording.
 const MAX_EXTRA_SEGMENTS: usize = 32;
@@ -75,12 +77,23 @@ fn vtable() -> usize {
     .0
 }
 
-/// `mov rcx, [rcx + F_BACKING]; mov rax, [rcx]; jmp [rax + slot * 8]`
-fn forward(slot: usize) -> usize {
-    let mut c = vec![0x48, 0x8B, 0x89];
+fn append_forward(c: &mut Vec<u8>, slot: usize) {
+    // Draws, copies, barriers, queries, clears and known GPU console extensions. Keep slots
+    // 71–74 unmarked: they can be Wait32/64 in one or both layouts.
+    if matches!(slot, 11..=19 | 26..=30 | 51..=55 | 59..=66 | 69..=70 | 78 | 80..=81 | 83..=92 | 104..=105 | 108 | 146) {
+        c.extend_from_slice(&[0xC6, 0x81]); // mov byte ptr [rcx + F_RECORDED_WORK], 1
+        c.extend_from_slice(&(F_RECORDED_WORK as u32).to_le_bytes());
+        c.push(1);
+    }
+    c.extend_from_slice(&[0x48, 0x8B, 0x89]); // mov rcx, [rcx + F_BACKING]
     c.extend_from_slice(&(F_BACKING as u32).to_le_bytes());
-    c.extend_from_slice(&[0x48, 0x8B, 0x01, 0xFF, 0xA0]);
+    c.extend_from_slice(&[0x48, 0x8B, 0x01, 0xFF, 0xA0]); // mov rax, [rcx]; jmp [rax + slot * 8]
     c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+}
+
+fn forward(slot: usize) -> usize {
+    let mut c = Vec::with_capacity(23);
+    append_forward(&mut c, slot);
     let p = crate::stubs::alloc_code(c.len());
     unsafe {
         std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
@@ -105,10 +118,7 @@ fn forward_traced(slot: usize) -> usize {
     }
     c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68]); // add rsp, 0x68
     c.extend_from_slice(&[0x41, 0x59, 0x41, 0x58, 0x5A, 0x59]); // pop r9, r8, rdx, rcx
-    c.extend_from_slice(&[0x48, 0x8B, 0x89]);
-    c.extend_from_slice(&(F_BACKING as u32).to_le_bytes());
-    c.extend_from_slice(&[0x48, 0x8B, 0x01, 0xFF, 0xA0]);
-    c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+    append_forward(&mut c, slot);
     let p = crate::stubs::alloc_code(c.len());
     unsafe {
         std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
@@ -154,6 +164,7 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
     };
     if hr >= 0 {
         *((this as usize + F_BACKING) as *mut usize) = primary as usize;
+        *((this as usize + F_RECORDED_WORK) as *mut u8) = 0;
         let moved = {
             let mut sg = SEGMENTS.lock().unwrap();
             sg.as_mut()
@@ -237,6 +248,16 @@ pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
     WRAPPER_OF.lock().unwrap().as_ref()?.get(&(pc as usize)).map(|&w| w as *mut c_void)
 }
 
+pub(super) unsafe fn has_recorded_work(wrapper: *mut c_void) -> bool {
+    *((wrapper as usize + F_RECORDED_WORK) as *const u8) != 0
+}
+
+pub(super) unsafe fn clear_recorded_work(pc: *mut c_void) {
+    if let Some(wrapper) = wrapper_of(pc) {
+        *((wrapper as usize + F_RECORDED_WORK) as *mut u8) = 0;
+    }
+}
+
 /// Whether `wrapper` may allocate/activate another split segment for this recording.
 pub(super) fn can_split(wrapper: *mut c_void) -> bool {
     let sg = SEGMENTS.lock().unwrap();
@@ -254,6 +275,7 @@ pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
 /// Switch `wrapper` from closed segment `old_pc` to newly opened segment `new_pc`.
 pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void, new_pc: *mut c_void) {
     *((wrapper as usize + F_BACKING) as *mut usize) = new_pc as usize;
+    *((wrapper as usize + F_RECORDED_WORK) as *mut u8) = 0;
     {
         let mut sg = SEGMENTS.lock().unwrap();
         sg.get_or_insert_with(HashMap::new)
