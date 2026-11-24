@@ -4472,6 +4472,52 @@ unsafe fn unsupported_console_mesh_stream(desc: *const c_void) -> Option<String>
     None
 }
 
+/// The mesh and amplification shaders of a stream, as XCL translates them: a console MS
+/// container in the AS slot with no MS subobject (a retail game's minimap pipelines) is the
+/// mesh shader it says it is. It used to be refused – translated, the title rendered nothing
+/// from then on, which was the translated mesh shaders failing their output budget (ms_6_6),
+/// not the slot. With the chunk budget fixed they translate and the title keeps rendering.
+/// Returns (MS to translate, AS left): the moved shader is not an AS any more.
+fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    use crate::gpu::recomp::pso::is_console;
+    match (ms_slot, as_slot) {
+        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => {
+            crate::xlog_info!("D3D12.X: mesh pipeline with its MS {:016x} in the AS slot – translated as MS", crate::gpu::shader::fnv64(a));
+            (Some(a), None)
+        }
+        (ms, a) => (ms, a),
+    }
+}
+
+#[cfg(test)]
+mod mesh_slot_tests {
+    use super::mesh_shader_slots;
+    use crate::gpu::xbox::tests::{sample, fssm, CODE};
+
+    /// A console MS container alone in the AS slot becomes the MS; a real AS (console or PC),
+    /// an MS already present, or a PC shader in the AS slot are left as they are.
+    #[test]
+    fn a_console_ms_in_the_as_slot_is_the_mesh_shader() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
+        let pc = b"DXBC-not-a-console-container".to_vec();
+        // MS in the AS slot, no MS: moved, and not an AS any more
+        let (m, a) = mesh_shader_slots(None, Some(&ms));
+        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_none());
+        // an MS present: both slots untouched, whatever the AS holds
+        let (m, a) = mesh_shader_slots(Some(&ms), Some(&as_));
+        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
+        // a console AS (not an MS) stays in the AS slot
+        let (m, a) = mesh_shader_slots(None, Some(&as_));
+        assert!(m.is_none() && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
+        // a PC shader in the AS slot stays too
+        let (m, a) = mesh_shader_slots(None, Some(&pc));
+        assert!(m.is_none() && a.is_some());
+        // nothing: nothing
+        assert!(mesh_shader_slots(None, None) == (None, None));
+    }
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4486,17 +4532,8 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
-        }
-    }
-    let ms = ms_slot?;
+    let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
+    let Some(ms) = ms else { return None };
     if !is_console(ms) {
         return None;
     }
