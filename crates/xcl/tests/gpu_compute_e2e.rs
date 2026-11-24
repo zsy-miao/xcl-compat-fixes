@@ -81,6 +81,49 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
 
 const V: u64 = 256; // VALU source code of v0
 
+#[test]
+fn offline_compute_pipeline_is_reused_by_a_second_process() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU with 32- or 64-lane waves");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-offline-pso-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("kernel.bin"), console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1])).unwrap();
+    let run = |enabled: bool| {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
+            .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    run(false);
+    assert!(!cache.join("driver").exists());
+    run(true);
+    let dxil_file = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
+    let dxil = fs::read(dxil_file).unwrap();
+    let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
+    let driver_file = cache.join("driver").join(name);
+    assert!(driver_file.metadata().unwrap().len() > 0);
+    let warm = run(true);
+    // A blob from an earlier driver can be refused. The normal build must still succeed.
+    fs::write(&driver_file, b"invalid cached pipeline").unwrap();
+    run(true);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.

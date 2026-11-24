@@ -3596,7 +3596,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
-mod driver_cache {
+pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
