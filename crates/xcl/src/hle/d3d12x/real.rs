@@ -1551,6 +1551,9 @@ mod depth_regression_tests;
 #[path = "real_depth_gpu_tests.rs"]
 mod depth_gpu_regression_tests;
 #[cfg(test)]
+#[path = "real_rgb9e5_tests.rs"]
+mod rgb9e5_regression_tests;
+#[cfg(test)]
 #[path = "real_mesh_refusal_tests.rs"]
 mod mesh_refusal_tests;
 
