@@ -6,3 +6,8 @@ members = ["crates/xcl", "tests/testtitle", "tests/testgamedll"]
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
+
+# Keep full symbols in optimized alpha builds so release-only crashes can be
+# resolved to functions, files, and lines without a separate diagnostic build.
+[profile.release]
+debug = 2
