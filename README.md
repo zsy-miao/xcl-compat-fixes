@@ -46,7 +46,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **PE loader** | ✅ | relocations, imports by name / ordinal / delay-load, TLS callbacks, exception tables, game DLLs, data-driven import routing (HLE / Windows / stub) | the game's 16 console DLLs load with 0 unresolved imports |
-| **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
+| **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages retain explicitly committed data across unmap), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
 | **DirectStorage memory inputs** | ✅ | deferred zero-filled mappings are readable as memory sources and physical-page arrays; read preparation leaves other reservations and existing protections unchanged | CPU regressions for deferred sources, owned page snapshots and protected ranges |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |

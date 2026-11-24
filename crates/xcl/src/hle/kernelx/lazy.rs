@@ -97,6 +97,30 @@ pub(super) fn unmark(page: usize) -> bool {
     PAGES.write().unwrap_or_else(|e| e.into_inner()).remove(&page) == Some(PageState::Reserved)
 }
 
+/// Still deferred according to XCL; Windows may have explicitly committed part of it.
+#[cfg(test)]
+pub(super) fn uncommitted(page: usize) -> bool {
+    PAGES.read().unwrap_or_else(|e| e.into_inner()).get(&page) == Some(&PageState::Reserved)
+}
+
+/// Serialize deferred preservation with commit/ensure, retiring its state only on success.
+/// Direct native commits and writes still require the caller to synchronize with unmapping.
+pub(super) fn unmap_with(page: usize, unmap: impl FnOnce(bool) -> bool) -> bool {
+    let mut pages = PAGES.write().unwrap_or_else(|e| e.into_inner());
+    if pages.get(&page) == Some(&PageState::Reserved) {
+        let ok = unmap(true);
+        if ok { pages.remove(&page); }
+        ok
+    } else {
+        // Ordinary mapped pages keep their existing copy path. Do not hold this lock
+        // over a native copy that could itself fault and enter the lazy handler.
+        drop(pages);
+        let ok = unmap(false);
+        if ok { unmark(page); }
+        ok
+    }
+}
+
 /// Commit deferred pages that a kernel call or an XCL write will use.
 pub fn ensure(p: usize, len: usize) {
     let Some(end) = p.checked_add(len) else { return };
@@ -140,6 +164,31 @@ pub(crate) fn forget_released(at: usize) {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{VirtualFree, VirtualProtect, MEM_RELEASE, PAGE_GUARD, PAGE_READONLY};
+
+    #[test]
+    fn deferred_unmap_keeps_retry_state_until_preservation_succeeds() {
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(page, 0);
+            assert!(mark(page));
+            assert!(!unmap_with(page, |deferred| {
+                assert!(deferred);
+                assert!(PAGES.try_write().is_err(), "commit/ensure cannot race the deferred snapshot");
+                false
+            }));
+            assert!(uncommitted(page), "failed preservation must retain deferred ownership");
+            ensure(page, PAGE);
+            assert!(!uncommitted(page));
+            assert!(PAGES.read().unwrap().contains_key(&page), "committed retry metadata is retained");
+            assert!(unmap_with(page, |deferred| {
+                assert!(!deferred);
+                assert!(PAGES.try_write().is_ok(), "the ordinary copy cannot hold the fault-handler lock");
+                true
+            }));
+            assert!(!PAGES.read().unwrap().contains_key(&page));
+            assert_ne!(VirtualFree(page as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
 
     #[test]
     fn ensure_preserves_explicit_readonly_and_guard_protection() {
