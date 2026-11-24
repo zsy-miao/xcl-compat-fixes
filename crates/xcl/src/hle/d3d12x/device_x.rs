@@ -674,6 +674,12 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // The console's R9G9B9E5_SHAREDEXP becomes R11G11B10_FLOAT when the title asks for a
+    // render target or UAV: the PC device reports neither use for the shared-exponent format
+    // and rejects the resource with E_INVALIDARG. Both are 32 bpp and hold values above 1.0.
+    if format == 67 && flags & 0x5 != 0 {
+        d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -737,6 +743,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // a target made R11G11B10_FLOAT (`pc_resource_desc`) still gets views in 67
+        (26, 67) => 26,
         (_, v) => v,
     }
 }
@@ -1024,6 +1032,44 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_resource_and_view_formats() {
+        for (format, flags, expected) in [
+            (67u32, 0x0u32, 67u32),
+            (67, 0x1, 26),
+            (67, 0x4, 26),
+            (67, 0x5, 26),
+            (28, 0x5, 28),
+            (116, 0x5, 10),
+            (86, 0x5, 28),
+        ] {
+            let mut desc = [0u8; 0x38];
+            desc[0x00..0x04].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+            desc[0x10..0x18].copy_from_slice(&1920u64.to_le_bytes()); // Width
+            desc[0x18..0x1c].copy_from_slice(&1080u32.to_le_bytes()); // Height
+            desc[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes()); // DepthOrArraySize
+            desc[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes()); // MipLevels
+            desc[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes()); // SampleDesc.Count
+            desc[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+
+            let pc = super::pc_resource_desc(&desc);
+            assert_eq!(
+                u32::from_le_bytes(pc[0x20..0x24].try_into().unwrap()),
+                expected,
+                "resource format={format}, flags={flags:#x}"
+            );
+        }
+
+        for (resource, view, expected) in [(26, 67, 26), (28, 86, 28), (28, 99, 99)] {
+            assert_eq!(
+                super::pc_shader_view_format(resource, view),
+                expected,
+                "resource={resource}, view={view}"
+            );
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
