@@ -139,6 +139,41 @@ unsafe fn copy_texture(
 /// itself is not lossless for arbitrary shared-exponent values.
 #[test]
 fn shared_exponent_target_clear_copy_and_shader_views_preserve_hdr_values() {
+    // These hooks retain idle VRAM arenas for two seconds. Keep their lifetime in a
+    // separate process so unrelated tests measuring process-wide arena bytes cannot
+    // subtract an arena that expires while they are running.
+    const CHILD: &str = "XCL_RGB9E5_GPU_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hle::d3d12x::real::rgb9e5_regression_tests::shared_exponent_target_clear_copy_and_shader_views_preserve_hdr_values",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated RGB9E5 GPU test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "isolated GPU test: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+        let skipped = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter(|line| line.contains("SKIPPED"))
+            .collect::<Vec<_>>();
+        if skipped.is_empty() {
+            println!("RGB9E5: isolated console target, HDR RTV/UAV/copy/SRV and depth clear checks passed");
+        } else {
+            for line in skipped {
+                println!("{line}");
+            }
+        }
+        return;
+    }
     if crate::gpu::recomp::dxc::location().is_err() {
         crate::gpu::recomp::runner::skip_test("no DXC");
         return;
