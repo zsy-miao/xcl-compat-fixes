@@ -26,7 +26,7 @@ fn desc(stream: &StreamOut) -> [usize; 2] {
 }
 
 #[test]
-fn console_ms_in_as_slot_reaches_the_supported_mesh_translation() {
+fn console_ms_in_as_slot_is_refused_before_renumbering() {
     let ms = console_shader(13);
     assert!(crate::gpu::recomp::pso::is_console(&ms));
     assert_eq!(crate::gpu::xbox::parse(&ms).unwrap().stage, "MS");
@@ -35,10 +35,12 @@ fn console_ms_in_as_slot_reaches_the_supported_mesh_translation() {
     let descriptor = desc(&stream);
     let raw = descriptor.as_ptr() as *const c_void;
     unsafe {
-        assert!(unsupported_console_mesh_stream(raw).is_none(), "the early guard must allow #541's supported layout");
-        let (mesh, amplification) = mesh_shader_slots(None, Some(&ms));
-        assert_eq!(mesh, Some(ms.as_slice()));
-        assert!(amplification.is_none(), "the moved shader is not a real amplification shader");
+        assert!(unsupported_console_mesh_stream(raw).is_some());
+        let mut output = 1usize as *mut c_void;
+        // No device exists: the actual entry point must reject before accessing a device
+        // or translating/queuing the shader, and must not return a fake pipeline object.
+        assert_eq!(dev_create_pipeline_state(std::ptr::null_mut(), raw, &GUID::from_u128(0), &mut output), E_INVALIDARG);
+        assert!(output.is_null());
     }
 }
 
@@ -82,23 +84,5 @@ fn pc_amplification_and_mesh_stream_is_not_refused() {
     let descriptor = desc(&stream);
     unsafe {
         assert!(unsupported_console_mesh_stream(descriptor.as_ptr() as *const c_void).is_none());
-    }
-}
-
-#[test]
-fn a_pc_as_with_a_console_ms_is_still_refused_before_a_standin() {
-    let ms = console_shader(13);
-    let mut amplification = console_shader(14);
-    amplification[44 + 0x18..44 + 0x1C].copy_from_slice(b"PCBC");
-    let mut stream = StreamOut::default();
-    stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, &amplification);
-    stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
-    let descriptor = desc(&stream);
-    unsafe {
-        let raw = descriptor.as_ptr() as *const c_void;
-        assert!(unsupported_console_mesh_stream(raw).is_some());
-        let mut output = 1usize as *mut c_void;
-        assert_eq!(dev_create_pipeline_state(std::ptr::null_mut(), raw, &GUID::from_u128(0), &mut output), E_INVALIDARG);
-        assert!(output.is_null(), "the original AS must not disappear behind an async stand-in");
     }
 }

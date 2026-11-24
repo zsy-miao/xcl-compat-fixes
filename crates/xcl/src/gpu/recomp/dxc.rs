@@ -542,7 +542,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     }
 }
 
-pub(super) fn toolchain_identity() -> &'static str {
+fn toolchain_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
         let Ok(dir) = location() else {
