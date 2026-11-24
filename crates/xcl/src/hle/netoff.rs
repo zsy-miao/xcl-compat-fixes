@@ -1,8 +1,8 @@
 //! `XCL_NETWORK=0`: the title runs as on a console without a network. Its WinHTTP requests and
 //! its sockets fail as they do there (name not resolved / network unreachable); nothing is
 //! answered in a server's place. Loopback connections stay (titles make socket pairs), and so
-//! do lookups of the local names (none, this machine's, localhost). Only
-//! the title's own imports are concerned (the game's exe and DLLs); off by default.
+//! do lookups of the local names (none, this machine's, localhost). The process-wide hooks
+//! below cover direct calls into the Windows libraries too; off by default.
 //!
 //! For titles under bring-up: a crash reporter otherwise uploads a memory dump of the process
 //! on every crash.
@@ -24,6 +24,8 @@ pub const NETOFF: &str = "xcl-netoff.dll";
 const ERROR_WINHTTP_NAME_NOT_RESOLVED: u32 = 12007;
 const WSAENETUNREACH: i32 = 10051;
 const WSAHOST_NOT_FOUND: i32 = 11001;
+const WSAEOPNOTSUPP: i32 = 10045;
+const WSAEFAULT: i32 = 10014;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
 const WSAID_CONNECTEX: [u8; 16] = [
     0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46,
@@ -61,7 +63,7 @@ extern "system" {
 /// name, localhost – a console without a network still answers these (a retail game asks for
 /// its own name and none at start).
 fn local_name(name: &str) -> bool {
-    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with("127.") || name == "::1" {
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback()) {
         return true;
     }
     let mut buf = [0u8; 256];
@@ -134,7 +136,6 @@ static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
-static O_CONNECT_EX: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
@@ -281,20 +282,30 @@ unsafe extern "system" fn wsai_ioctl(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
-    let result = orig_wsai_ioctl(s, code, in_buf, in_len, out_buf, out_len, returned, overlapped, completion);
-    if result == 0
-        && code == SIO_GET_EXTENSION_FUNCTION_POINTER
+    let connect_ex_query = code == SIO_GET_EXTENSION_FUNCTION_POINTER
         && in_len >= WSAID_CONNECTEX.len() as u32
-        && out_len >= std::mem::size_of::<usize>() as u32
         && !in_buf.is_null()
-        && !out_buf.is_null()
-        && std::slice::from_raw_parts(in_buf as *const u8, WSAID_CONNECTEX.len()) == WSAID_CONNECTEX
-    {
-        let connect_ex = *(out_buf as *const usize);
-        if connect_ex != 0 {
-            O_CONNECT_EX.store(connect_ex, Ordering::Release);
-            *(out_buf as *mut usize) = connect_ex_detour as usize;
+        && std::slice::from_raw_parts(in_buf as *const u8, WSAID_CONNECTEX.len()) == WSAID_CONNECTEX;
+    // A pending request would write the original pointer after this detour returns. Refuse
+    // that acquisition in offline mode rather than let an unwrapped pointer escape. The
+    // usual synchronous extension query remains supported, including for loopback sockets.
+    if connect_ex_query && (!overlapped.is_null() || !completion.is_null()) {
+        WSASetLastError(WSAEOPNOTSUPP);
+        return -1;
+    }
+    let result = orig_wsai_ioctl(s, code, in_buf, in_len, out_buf, out_len, returned, overlapped, completion);
+    if result == 0 && connect_ex_query {
+        if out_len < std::mem::size_of::<usize>() as u32 || out_buf.is_null()
+            || returned.is_null() || *returned != std::mem::size_of::<usize>() as u32 {
+            WSASetLastError(WSAEFAULT);
+            return -1;
         }
+        let connect_ex = (out_buf as *const usize).read_unaligned();
+        if connect_ex == 0 {
+            WSASetLastError(WSAEFAULT);
+            return -1;
+        }
+        (out_buf as *mut usize).write_unaligned(connect_ex_detour as usize);
     }
     result
 }
@@ -314,16 +325,23 @@ unsafe extern "system" fn connect_ex_detour(
         WSASetLastError(WSAENETUNREACH);
         return 0;
     }
-    match O_CONNECT_EX.load(Ordering::Acquire) {
-        0 => {
-            WSASetLastError(WSAENETUNREACH);
-            0
-        }
-        f => std::mem::transmute::<
-            usize,
-            unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32,
-        >(f)(s, name, len, send_buf, send_len, bytes_sent, overlapped),
+    // Extension pointers belong to a service provider. Resolve through the original
+    // WSAIoctl for this socket, instead of using the last pointer requested by any socket.
+    let mut f = 0usize;
+    let mut returned = 0u32;
+    if orig_wsai_ioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, WSAID_CONNECTEX.as_ptr() as *const c_void,
+        WSAID_CONNECTEX.len() as u32, &mut f as *mut usize as *mut c_void,
+        std::mem::size_of::<usize>() as u32, &mut returned, std::ptr::null_mut(), std::ptr::null()) != 0 {
+        return 0;
     }
+    if returned != std::mem::size_of::<usize>() as u32 || f == 0 || f == connect_ex_detour as usize {
+        WSASetLastError(WSAENETUNREACH);
+        return 0;
+    }
+    std::mem::transmute::<
+        usize,
+        unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32,
+    >(f)(s, name, len, send_buf, send_len, bytes_sent, overlapped)
 }
 
 unsafe extern "system" fn sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32 {
@@ -382,77 +400,5 @@ unsafe extern "system" fn getaddrinfo_ex(_n: *const u16, _s: *const u16, _ns: u3
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_loopback_goes_through() {
-        let v4 = |a: [u8; 4]| [2, 0, 0, 80, a[0], a[1], a[2], a[3], 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut v6 = [0u8; 28];
-        v6[0] = 23;
-        v6[23] = 1;
-        unsafe {
-            assert!(loopback(v4([127, 0, 0, 1]).as_ptr(), 16));
-            assert!(!loopback(v4([8, 8, 8, 8]).as_ptr(), 16));
-            assert!(loopback(v6.as_ptr(), 28));
-            v6[8] = 0x20;
-            assert!(!loopback(v6.as_ptr(), 28));
-            assert_eq!(connect(usize::MAX, v4([8, 8, 8, 8]).as_ptr(), 16), -1);
-            assert_eq!(send_request(std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 0), 0);
-        }
-    }
-
-    /// With the system hooks, the system's own functions refuse – found the way a crash
-    /// reporter can find them, through GetProcAddress, not the title's imports (#305) – and
-    /// what may go through still reaches the original.
-    #[test]
-    fn the_systems_own_network_functions_refuse() {
-        use windows_sys::Win32::Foundation::GetLastError;
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-        #[link(name = "ws2_32", kind = "raw-dylib")]
-        unsafe extern "system" {
-            fn WSAStartup(version: u16, data: *mut u8) -> i32;
-            fn WSAGetLastError() -> i32;
-            fn socket(af: i32, ty: i32, protocol: i32) -> usize;
-            fn closesocket(s: usize) -> i32;
-        }
-        install_system_hooks();
-        unsafe {
-            let f = |dll: &str, name: &[u8]| GetProcAddress(LoadLibraryW(crate::util::wide(dll).as_ptr()), name.as_ptr()).expect("export") as usize;
-            let send: unsafe extern "system" fn(*mut c_void, *const u16, u32, *const c_void, u32, u32, usize) -> i32 = std::mem::transmute(f("winhttp.dll", b"WinHttpSendRequest\0"));
-            SetLastError(0);
-            assert_eq!(send(1 as *mut c_void, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0), 0);
-            assert_eq!(GetLastError(), ERROR_WINHTTP_NAME_NOT_RESOLVED);
-            let open_url: unsafe extern "system" fn(*mut c_void, *const u16, *const u16, u32, u32, usize) -> *mut c_void = std::mem::transmute(f("wininet.dll", b"InternetOpenUrlW\0"));
-            assert!(open_url(1 as *mut c_void, crate::util::wide("https://example.com/").as_ptr(), std::ptr::null(), 0, 0, 0).is_null());
-            // a name lookup is refused (11001) – a lookup of localhost reaches the original,
-            // which answers something else (an address, or 10093 without WSAStartup)
-            let gai: unsafe extern "system" fn(*const u8, *const u8, *const c_void, *mut *mut c_void) -> i32 = std::mem::transmute(f("ws2_32.dll", b"getaddrinfo\0"));
-            let mut out = std::ptr::null_mut();
-            assert_eq!(gai(b"example.com\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
-            assert!(out.is_null());
-            assert_ne!(gai(b"localhost\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
-
-            // ConnectEx is not an export: WSAIoctl hands the caller a function pointer.
-            // The system hook must replace that pointer, otherwise this path bypasses all
-            // network refusals (issue #444).
-            let mut wsa = [0u8; 512];
-            assert_eq!(WSAStartup(0x0202, wsa.as_mut_ptr()), 0);
-            let ioctl: unsafe extern "system" fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32 =
-                std::mem::transmute(f("ws2_32.dll", b"WSAIoctl\0"));
-            let s = socket(2, 1, 6);
-            assert_ne!(s, usize::MAX);
-            let mut connect_ex = 0usize;
-            let mut returned = 0u32;
-            assert_eq!(ioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, WSAID_CONNECTEX.as_ptr() as *const c_void, WSAID_CONNECTEX.len() as u32, &mut connect_ex as *mut usize as *mut c_void, std::mem::size_of::<usize>() as u32, &mut returned, std::ptr::null_mut(), std::ptr::null()), 0);
-            assert_eq!(connect_ex, connect_ex_detour as usize);
-            let connect_ex: unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32 = std::mem::transmute(connect_ex);
-            let mut external = [0u8; 16];
-            external[0] = 2;
-            external[4..8].copy_from_slice(&[8, 8, 8, 8]);
-            assert_eq!(connect_ex(s, external.as_ptr(), 16, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), 0);
-            assert_eq!(WSAGetLastError(), WSAENETUNREACH);
-            closesocket(s);
-        }
-    }
-}
+#[path = "netoff_tests.rs"]
+mod tests;
