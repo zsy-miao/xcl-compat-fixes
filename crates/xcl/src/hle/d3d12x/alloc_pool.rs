@@ -72,20 +72,38 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
     s.backings.entry(backing).or_default().users.insert(list);
 }
 
-/// `list` (of type `ty`; negative: not known) is reset on the title's allocator `alloc`: the
-/// PC allocator to give the PC list.
-pub fn for_list(list: usize, alloc: usize, ty: i32) -> usize {
-    if !enabled() || alloc == 0 {
-        return alloc;
+/// The PC list's final Release ended its recording. Submitted work still holds the backing
+/// through `marks`; removing the list must not remove those fences or the other users.
+pub(super) fn forget_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
+}
+
+/// Reset `list` on the title's allocator `alloc`, committing its new recording association
+/// only after native Reset succeeds. No pool lock is held across the driver call.
+pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
+    let backing = current(alloc);
+    let hr = reset(backing);
+    if hr < 0 || !enabled() || alloc == 0 {
+        return hr;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
     if ty >= 0 {
         s.types.insert(alloc, ty);
     }
-    let backing = s.cur.get(&alloc).copied().unwrap_or(alloc);
     move_list(s, list, backing);
-    backing
+    hr
+}
+
+#[cfg(test)]
+pub(super) fn recording_backing_for_test(list: usize) -> Option<usize> {
+    STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
 }
 
 /// The PC allocator the title's allocator `alloc` stands for now.
@@ -178,9 +196,14 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let a = alloc as usize;
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
+    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+}
+
+/// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
+unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
+    let a = alloc as usize;
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
         if let Some(b) = s.backings.get_mut(&c) {
@@ -189,20 +212,21 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         if c == a {
             return None;
         }
-        return Some(super::real::reset_pc_allocator(c as *mut c_void));
+        return Some(reset(c as *mut c_void));
     }
     let ty = *s.types.get(&a)?;
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
     let next = match reuse {
         Some(f) => {
+            // Keep ownership until Reset succeeds so a failure can be retried.
+            let hr = reset(f as *mut c_void);
+            if hr < 0 {
+                return Some(hr);
+            }
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
-            }
-            let hr = super::real::reset_pc_allocator(f as *mut c_void);
-            if hr < 0 {
-                return Some(hr);
             }
             f
         }
@@ -237,6 +261,112 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spare_whose_reset_fails_stays_available_for_retry() {
+        let (alloc, spare, list) = (0x1000usize, 0x2000usize, 0x3000usize);
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        move_list(&mut s, list, alloc);
+        s.aside.insert(alloc, vec![spare]);
+        s.backings.insert(spare, Backing::default());
+        let mut calls = Vec::new();
+
+        for _ in 0..2 {
+            let hr = unsafe {
+                title_reset_in(&mut s, alloc as *mut c_void, |raw| {
+                    calls.push(raw as usize);
+                    crate::util::E_FAIL
+                })
+            };
+            assert_eq!(hr, Some(crate::util::E_FAIL));
+            assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
+            assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
+            assert_eq!(s.of_list.get(&list), Some(&alloc));
+            assert!(s.backings[&alloc].users.contains(&list), "the old recording is still held");
+            assert_eq!((s.made, s.swaps), (0, 0));
+        }
+
+        let hr = unsafe {
+            title_reset_in(&mut s, alloc as *mut c_void, |raw| {
+                calls.push(raw as usize);
+                0
+            })
+        };
+        assert_eq!(hr, Some(0));
+        assert_eq!(calls, vec![spare; 3], "all attempts used the same spare without creating another");
+        assert_eq!(s.cur.get(&alloc), Some(&spare));
+        assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
+        assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
+        assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    /// Final-release cleanup drops only the recording's hold: another live list and a pending
+    /// GPU fence each still prevent reuse, then completion makes the backing reusable.
+    #[test]
+    fn released_lists_leave_only_live_recordings_and_gpu_work_holding_the_backing() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            releases: Cell<u32>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.releases.set(f.releases.get() + 1);
+            0
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), releases: Cell::new(0) };
+        let mut ids = Box::new([0u8; 3]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let (first, second) = (alloc + 1, alloc + 2);
+        created_on(first, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        created_on(second, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        {
+            let mut g = STATE.lock().unwrap();
+            let b = g.as_mut().unwrap().backings.get_mut(&alloc).unwrap();
+            // The map owns one synthetic fence reference, dropped by forget below.
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            b.marks.insert(1, (f, 7));
+        }
+
+        super::super::list_x::on_release(first);
+        let first_removed = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.of_list.contains_key(&first) && s.of_list.get(&second) == Some(&alloc)
+                && s.backings[&alloc].users == HashSet::from([second])
+                && !unsafe { s.backings[&alloc].free() }
+        };
+        super::super::list_x::on_release(second);
+        super::super::list_x::on_release(first); // duplicate cleanup is harmless
+        let pending_still_held = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
+                && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
+        };
+        fence.value.set(7);
+        let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
+        // Clean up the synthetic COM pointer before assertions, including on the old code.
+        unsafe { forget(alloc) };
+        assert!(first_removed, "another live recording must remain while the released list goes");
+        assert!(pending_still_held, "final list Release must retain the submitted-work fence");
+        assert!(reusable, "a released list cannot keep a completed backing busy");
+        assert_eq!(fence.releases.get(), 1);
+    }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
     /// recording is still there (the device is not removed), the title's allocator goes on with
@@ -283,10 +413,11 @@ mod tests {
             assert!(dev.GetDeviceRemovedReason().is_ok(), "the recording was still there");
 
             // the list is reset on the title's allocator: it records on the PC allocator in use
-            let pc = for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
-            assert_eq!(pc, second);
             let second_alloc = ID3D12CommandAllocator::from_raw_borrowed(&(second as *mut c_void)).unwrap().clone();
-            list.Reset(&second_alloc, None).unwrap();
+            assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
+                assert_eq!(pc, second);
+                list.Reset(&second_alloc, None).map_or_else(|e| e.code().0, |_| 0)
+            }), 0);
             list.Close().unwrap();
             queue.ExecuteCommandLists(&lists);
             executed(queue.as_raw(), &[l]);
@@ -299,8 +430,10 @@ mod tests {
 
             // the title's allocator goes while another PC allocator stands for it: nothing of
             // it stays (the next allocator at its address is its own)
-            list.Reset(&alloc, None).unwrap();
-            for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
+                assert_eq!(pc, a as usize);
+                list.Reset(&alloc, None).map_or_else(|e| e.code().0, |_| 0)
+            }), 0);
             list.Close().unwrap();
             alloc.Reset().unwrap();
             assert_ne!(current(a as usize), a as usize);
