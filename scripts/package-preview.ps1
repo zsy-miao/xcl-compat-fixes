@@ -53,8 +53,14 @@ try {
 
 $version = & (Join-Path $stage 'xcl.exe') --version
 if ($LASTEXITCODE -ne 0 -or "$version" -notmatch '^xcl ') { throw 'The staged executable failed its version check.' }
+$payload = @('xcl.exe','dxcompiler.dll','dxil.dll')
+$onDemandLauncher = Join-Path $root 'scripts/Play-On-Demand.cmd'
+if (Test-Path -LiteralPath $onDemandLauncher -PathType Leaf) {
+    Copy-Item -LiteralPath $onDemandLauncher -Destination $stage
+    $payload += 'Play-On-Demand.cmd'
+}
 $hashes = [ordered]@{}
-foreach ($filename in @('xcl.exe','dxcompiler.dll','dxil.dll')) {
+foreach ($filename in $payload) {
     $hashes[$filename] = (Get-FileHash -LiteralPath (Join-Path $stage $filename)).Hash.ToLowerInvariant()
 }
 $utf8 = [System.Text.UTF8Encoding]::new($false)
@@ -67,6 +73,9 @@ $build = [ordered]@{
 }
 [IO.File]::WriteAllText((Join-Path $stage 'BUILD-INFO.json'), ($build | ConvertTo-Json -Depth 3), $utf8)
 $start = "Extract the whole ZIP and start xcl.exe. Select your unpacked game's executable or MicrosoftGame.config. Keep both compiler DLLs beside xcl.exe. See the release notes for tested hardware, settings and known limitations."
+if ($hashes.Contains('Play-On-Demand.cmd')) {
+    $start = "Extract the whole ZIP. Start Play-On-Demand.cmd to use the offline settings tested on the RTX 3060 Ti. Select your unpacked game in XCL. These settings build pipelines when the game asks for them and disable speculative preloading. For the normal XCL settings, start xcl.exe. See the release notes for tested hardware and how far the game ran."
+}
 [IO.File]::WriteAllText((Join-Path $stage 'START-HERE.txt'), $start, $utf8)
 $lines = foreach ($filename in $hashes.Keys) { "$($hashes[$filename])  $filename" }
 [IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), [string[]]$lines, $utf8)
