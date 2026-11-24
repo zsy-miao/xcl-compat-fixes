@@ -24,11 +24,28 @@ pub const NETOFF: &str = "xcl-netoff.dll";
 const ERROR_WINHTTP_NAME_NOT_RESOLVED: u32 = 12007;
 const WSAENETUNREACH: i32 = 10051;
 const WSAHOST_NOT_FOUND: i32 = 11001;
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+const WSAID_CONNECTEX: [u8; 16] = [
+    0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46,
+    0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e,
+];
 
 #[link(name = "ws2_32", kind = "raw-dylib")]
 extern "system" {
     #[link_name = "connect"]
     fn real_connect(s: usize, name: *const u8, len: i32) -> i32;
+    #[link_name = "WSAIoctl"]
+    fn real_wsai_ioctl(
+        s: usize,
+        code: u32,
+        in_buf: *const c_void,
+        in_len: u32,
+        out_buf: *mut c_void,
+        out_len: u32,
+        returned: *mut u32,
+        overlapped: *mut c_void,
+        completion: *const c_void,
+    ) -> i32;
     #[link_name = "sendto"]
     fn real_sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
     fn WSASetLastError(e: i32);
@@ -116,6 +133,8 @@ static O_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
+static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
+static O_CONNECT_EX: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
@@ -131,6 +150,26 @@ unsafe fn orig_sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const
         0 => real_sendto(s, buf, len, flags, to, tolen),
         f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const u8, i32, i32, *const u8, i32) -> i32>(f)(s, buf, len, flags, to, tolen),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn orig_wsai_ioctl(
+    s: usize,
+    code: u32,
+    in_buf: *const c_void,
+    in_len: u32,
+    out_buf: *mut c_void,
+    out_len: u32,
+    returned: *mut u32,
+    overlapped: *mut c_void,
+    completion: *const c_void,
+) -> i32 {
+    let f = O_WSAIOCTL.load(Ordering::Acquire);
+    let f = if f == 0 { real_wsai_ioctl as usize } else { f };
+    std::mem::transmute::<
+        usize,
+        unsafe extern "system" fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32,
+    >(f)(s, code, in_buf, in_len, out_buf, out_len, returned, overlapped, completion)
 }
 
 unsafe fn orig_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32 {
@@ -154,7 +193,7 @@ pub fn install_system_hooks() {
     ONCE.call_once(|| unsafe {
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 18] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 19] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
             ("winhttp.dll", "WinHttpConnect", null_handle_winhttp as usize, spare()),
             ("wininet.dll", "InternetConnectA", null_handle_inet8 as usize, spare()),
@@ -168,6 +207,7 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "connect", connect as usize, &O_CONNECT),
             ("ws2_32.dll", "WSAConnect", wsa_connect as usize, spare()),
             ("ws2_32.dll", "sendto", sendto as usize, &O_SENDTO),
+            ("ws2_32.dll", "WSAIoctl", wsai_ioctl as usize, &O_WSAIOCTL),
             ("ws2_32.dll", "WSASendTo", wsa_send_to as usize, spare()),
             ("ws2_32.dll", "gethostbyname", gethostbyname as usize, spare()),
             ("ws2_32.dll", "getaddrinfo", getaddrinfo as usize, &O_GETADDRINFO),
@@ -227,6 +267,63 @@ unsafe extern "system" fn connect(s: usize, name: *const u8, len: i32) -> i32 {
         return orig_connect(s, name, len);
     }
     unreachable_net("connect")
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn wsai_ioctl(
+    s: usize,
+    code: u32,
+    in_buf: *const c_void,
+    in_len: u32,
+    out_buf: *mut c_void,
+    out_len: u32,
+    returned: *mut u32,
+    overlapped: *mut c_void,
+    completion: *const c_void,
+) -> i32 {
+    let result = orig_wsai_ioctl(s, code, in_buf, in_len, out_buf, out_len, returned, overlapped, completion);
+    if result == 0
+        && code == SIO_GET_EXTENSION_FUNCTION_POINTER
+        && in_len >= WSAID_CONNECTEX.len() as u32
+        && out_len >= std::mem::size_of::<usize>() as u32
+        && !in_buf.is_null()
+        && !out_buf.is_null()
+        && std::slice::from_raw_parts(in_buf as *const u8, WSAID_CONNECTEX.len()) == WSAID_CONNECTEX
+    {
+        let connect_ex = *(out_buf as *const usize);
+        if connect_ex != 0 {
+            O_CONNECT_EX.store(connect_ex, Ordering::Release);
+            *(out_buf as *mut usize) = connect_ex_detour as usize;
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn connect_ex_detour(
+    s: usize,
+    name: *const u8,
+    len: i32,
+    send_buf: *const c_void,
+    send_len: u32,
+    bytes_sent: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    if !loopback(name, len) {
+        note("ConnectEx");
+        WSASetLastError(WSAENETUNREACH);
+        return 0;
+    }
+    match O_CONNECT_EX.load(Ordering::Acquire) {
+        0 => {
+            WSASetLastError(WSAENETUNREACH);
+            0
+        }
+        f => std::mem::transmute::<
+            usize,
+            unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32,
+        >(f)(s, name, len, send_buf, send_len, bytes_sent, overlapped),
+    }
 }
 
 unsafe extern "system" fn sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32 {
@@ -312,6 +409,13 @@ mod tests {
     fn the_systems_own_network_functions_refuse() {
         use windows_sys::Win32::Foundation::GetLastError;
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        #[link(name = "ws2_32", kind = "raw-dylib")]
+        unsafe extern "system" {
+            fn WSAStartup(version: u16, data: *mut u8) -> i32;
+            fn WSAGetLastError() -> i32;
+            fn socket(af: i32, ty: i32, protocol: i32) -> usize;
+            fn closesocket(s: usize) -> i32;
+        }
         install_system_hooks();
         unsafe {
             let f = |dll: &str, name: &[u8]| GetProcAddress(LoadLibraryW(crate::util::wide(dll).as_ptr()), name.as_ptr()).expect("export") as usize;
@@ -328,6 +432,27 @@ mod tests {
             assert_eq!(gai(b"example.com\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
             assert!(out.is_null());
             assert_ne!(gai(b"localhost\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
+
+            // ConnectEx is not an export: WSAIoctl hands the caller a function pointer.
+            // The system hook must replace that pointer, otherwise this path bypasses all
+            // network refusals (issue #444).
+            let mut wsa = [0u8; 512];
+            assert_eq!(WSAStartup(0x0202, wsa.as_mut_ptr()), 0);
+            let ioctl: unsafe extern "system" fn(usize, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32 =
+                std::mem::transmute(f("ws2_32.dll", b"WSAIoctl\0"));
+            let s = socket(2, 1, 6);
+            assert_ne!(s, usize::MAX);
+            let mut connect_ex = 0usize;
+            let mut returned = 0u32;
+            assert_eq!(ioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, WSAID_CONNECTEX.as_ptr() as *const c_void, WSAID_CONNECTEX.len() as u32, &mut connect_ex as *mut usize as *mut c_void, std::mem::size_of::<usize>() as u32, &mut returned, std::ptr::null_mut(), std::ptr::null()), 0);
+            assert_eq!(connect_ex, connect_ex_detour as usize);
+            let connect_ex: unsafe extern "system" fn(usize, *const u8, i32, *const c_void, u32, *mut u32, *mut c_void) -> i32 = std::mem::transmute(connect_ex);
+            let mut external = [0u8; 16];
+            external[0] = 2;
+            external[4..8].copy_from_slice(&[8, 8, 8, 8]);
+            assert_eq!(connect_ex(s, external.as_ptr(), 16, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), 0);
+            assert_eq!(WSAGetLastError(), WSAENETUNREACH);
+            closesocket(s);
         }
     }
 }
