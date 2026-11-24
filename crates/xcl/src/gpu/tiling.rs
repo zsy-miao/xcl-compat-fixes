@@ -131,7 +131,10 @@ impl Layout {
         };
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
         // the pattern masks are 16 bits: coordinates above them do not matter
-        let high = |l: u32, shift: u32| table(1 << (16 - l.min(16)), shift, l);
+        let high = |l: u32, shift: u32| {
+            let used = bits[..blk as usize].iter().fold(0u32, |m, &b| m | ((b >> shift) & 0xFFFF) as u32) >> l.min(16);
+            table(1 << (32 - used.leading_zeros()), shift, l)
+        };
         Layout {
             mode,
             elem_log2,
@@ -578,6 +581,45 @@ mod tests {
                             assert!(!std::mem::replace(&mut seen[o >> e], true), "mode {mode} e {e} {cfg:?}: ({x},{y}) collides");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn high_coordinate_tables_keep_their_offsets_at_one_period() {
+        let full = |bits: &[u64; 20], blk: u32, l: u32, shift: u32| -> Vec<u32> {
+            (0..1u32 << (16 - l.min(16)))
+                .map(|c| {
+                    let mut off = 0u32;
+                    for (i, &b) in bits[..blk as usize].iter().enumerate() {
+                        let mask = ((b >> shift) & 0xFFFF) as u32;
+                        off |= ((mask & (c << l)).count_ones() & 1) << i;
+                    }
+                    off
+                })
+                .collect()
+        };
+        let check = |l: &Layout, bits: &[u64; 20], what: &str| {
+            let blk = l.block_bytes.trailing_zeros();
+            for (t, b, shift) in [(&l.hx, l.block_w, 0), (&l.hy, l.block_h, 16), (&l.hz, l.block_d, 32)] {
+                let want = full(bits, blk, b.trailing_zeros(), shift);
+                assert!(t.len().is_power_of_two() && t.len() <= want.len(), "{what}: table of {} for {}", t.len(), want.len());
+                for c in (0..1usize << 18).step_by(3).chain([u32::MAX as usize, (1 << 40) + 5]) {
+                    assert_eq!(t[c % t.len()], want[c % want.len()], "{what}: shift {shift} coordinate block {c}");
+                }
+            }
+            assert!(l.hz.len() <= 64, "{what}: {} z entries", l.hz.len());
+        };
+        for cfg in configs() {
+            for e in 0..5 {
+                for mode in MODES {
+                    let l = Layout::new(mode, e, cfg).unwrap();
+                    check(&l, &pattern_bits(PATTERNS, mode, e, cfg).unwrap(), &format!("2D mode {mode} e {e} {cfg:?}"));
+                }
+                for mode in [5u32, 9, 17, 21, 25, 26] {
+                    let l = Layout::new_3d(mode, e, cfg).unwrap();
+                    check(&l, &pattern_bits(PATTERNS_3D, mode, e, cfg).unwrap(), &format!("3D mode {mode} e {e} {cfg:?}"));
                 }
             }
         }
