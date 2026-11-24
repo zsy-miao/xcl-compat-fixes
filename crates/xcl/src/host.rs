@@ -36,7 +36,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (p, e) = crate::hle::d3d12x::present::activity();
                 let (d, x) = crate::hle::d3d12x::bind::activity();
                 let f = crate::hle::d3d12x::frame::activity();
-                [p, e, d, x, f[0], f[1], f[2], f[3]]
+                let (r, b, fail) = crate::hle::dstorage::counters();
+                [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
             loop {
@@ -44,8 +45,33 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
-                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped)",
-                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
+                );
+                // where the memory is: the process's commit, video memory, and XCL's parts of it
+                let private = unsafe {
+                    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+                    let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+                    c.cb = std::mem::size_of_val(&c) as u32;
+                    K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
+                    c.PrivateUsage
+                };
+                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
+                let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
+                let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                let mb = |b: u64| b >> 20;
+                crate::xlog_info!(
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    mb(private as u64),
+                    mb(local),
+                    mb(non_local),
+                    mb(pages as u64),
+                    mb(page_pools as u64),
+                    mb(arenas as u64),
+                    mb(arenas_made as u64),
+                    mb(pools as u64),
+                    mb(pools_mapped as u64)
                 );
                 last = now;
             }
@@ -89,7 +115,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::resolver::set_search_dirs(dirs);
 
     let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
-    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts));
+    // (the shader cache is XCL's too: on a drive a console mount names it must stay where it is)
+    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir()));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {

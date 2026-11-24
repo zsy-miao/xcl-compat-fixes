@@ -87,7 +87,25 @@ pub unsafe fn from_cstr_ptr(p: *const u8) -> Option<String> {
 
 /// ANSI (current code page) → String. Falls back to lossy UTF-8.
 pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    from_code_page_ptr(p, windows_sys::Win32::Globalization::CP_ACP)
+}
+
+pub(crate) unsafe fn from_file_ansi_ptr(p: *const u8) -> Option<String> {
+    use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
+    use windows_sys::Win32::Storage::FileSystem::AreFileApisANSI;
+    if p.is_null() {
+        return None;
+    }
+    let code_page = if AreFileApisANSI() != 0 {
+        CP_ACP
+    } else {
+        CP_OEMCP
+    };
+    from_code_page_ptr(p, code_page)
+}
+
+unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
     if p.is_null() {
         return None;
     }
@@ -95,13 +113,23 @@ pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     if len == 0 {
         return Some(String::new());
     }
-    let n = MultiByteToWideChar(CP_ACP, 0, p, len as i32, std::ptr::null_mut(), 0);
+    let n = MultiByteToWideChar(code_page, 0, p, len as i32, std::ptr::null_mut(), 0);
     if n <= 0 {
         return from_cstr_ptr(p);
     }
     let mut buf = vec![0u16; n as usize];
-    MultiByteToWideChar(CP_ACP, 0, p, len as i32, buf.as_mut_ptr(), n);
+    MultiByteToWideChar(code_page, 0, p, len as i32, buf.as_mut_ptr(), n);
     Some(String::from_utf16_lossy(&buf))
+}
+
+/// The process runs under Wine (its ntdll exports `wine_get_version`).
+pub fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: ntdll is always loaded; both names are NUL-terminated.
+    *WINE.get_or_init(|| unsafe {
+        GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
+    })
 }
 
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.

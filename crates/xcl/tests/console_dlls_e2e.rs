@@ -1168,3 +1168,37 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         assert!(right > left, "the input's left-to-right gradient survives the upscale");
     }
 }
+
+/// No GPU: every compute shader inside XboxBvhBuilder.dll (found by its DXBC header) against
+/// what XCL does with its root arguments. The shader's stage descriptor says how many user
+/// SGPRs it has; its RTS0 part gives the argument layout. Arguments must not be put into
+/// registers the shader does not have – with the layout's rule alone that happens for the
+/// builder's shaders (four user SGPRs, s4 = the group id, every argument read from the table),
+/// and the builder then computes nothing.
+#[test]
+fn xbox_bvh_builder_shaders_get_no_argument_in_a_register_they_do_not_have() {
+    use xcl::hle::d3d12x::console_list::{inline_for, layout_from_blob};
+    let Some(dir) = setup() else { return };
+    let dll = std::fs::read(dir.join("XboxBvhBuilder.dll")).unwrap();
+    let word = |at: usize| u32::from_le_bytes(dll[at..at + 4].try_into().unwrap()) as usize;
+    let (mut shaders, mut by_rule_alone, mut wrong) = (0, 0, Vec::new());
+    let mut at = 0;
+    while let Some(i) = dll[at..].windows(4).position(|w| w == b"DXBC") {
+        let start = at + i;
+        at = start + 4;
+        if start + 32 > dll.len() || word(start + 20) != 1 {
+            continue;
+        }
+        let Some(blob) = dll.get(start..start + word(start + 24)) else { continue };
+        let (Some(user), Some(l)) = (xcl::gpu::recomp::pso::compute_user_sgprs(blob), layout_from_blob(blob)) else { continue };
+        shaders += 1;
+        let has = 4 * user.saturating_sub(4);
+        by_rule_alone += (l.inline > has) as u32;
+        if inline_for(&l, Some(user)) > has {
+            wrong.push(format!("+{start:#x}: {user} user SGPRs, {} bytes of arguments in registers", inline_for(&l, Some(user))));
+        }
+    }
+    println!("XboxBvhBuilder.dll: {shaders} compute shaders; by the layout's rule alone {by_rule_alone} would get arguments in registers they do not have");
+    assert!(shaders >= 40, "only {shaders} compute shaders found in the DLL");
+    assert!(wrong.is_empty(), "{} of {shaders} shaders: {:?}", wrong.len(), &wrong[..wrong.len().min(4)]);
+}

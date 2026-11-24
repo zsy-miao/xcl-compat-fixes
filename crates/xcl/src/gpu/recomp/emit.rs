@@ -197,6 +197,23 @@ fn dpp16_src(ctrl: u64) -> Option<String> {
 /// The lane `lane` of a 32-lane half reads with `ds_swizzle_b32` (the RDNA ISA's DS_SWIZZLE_B32):
 /// offset ≥ 0xE000 FFT, ≥ 0xC000 rotate, bit 15 quad permute, otherwise the and/or/xor bit
 /// mode (xor = offset[14:10], so 0x401F swaps the 16-lane halves).
+/// MIMG sample coordinates per DIM as HLSL takes them (array layer rounded); empty for cubes.
+fn sample_coord(dim: u64, c: &[String]) -> String {
+    match dim {
+        0 => c[0].clone(),
+        1 => format!("float2({}, {})", c[0], c[1]),
+        2 => format!("float3({}, {}, {})", c[0], c[1], c[2]),
+        4 => format!("float2({}, round({}))", c[0], c[1]),
+        5 => format!("float3({}, {}, round({}))", c[0], c[1], c[2]),
+        _ => String::new(),
+    }
+}
+
+/// The coordinates moved by the offset vector `o` (from `texel_offset`); array layers stay.
+fn moved_coords(dim: u64, c: &[String], o: &str) -> Vec<String> {
+    c.iter().enumerate().map(|(k, x)| if (dim == 4 && k == 1) || (dim == 5 && k == 2) { x.clone() } else { format!("({x} + {o}[{k}])") }).collect()
+}
+
 pub(crate) fn swizzle_lane(offset: u64, lane: u32) -> u32 {
     let i = lane & 0x1F;
     let mask = (offset & 0x1F) as u32;
@@ -426,13 +443,19 @@ fn is_f64_rounded_op(name: &str) -> bool {
 }
 
 /// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`).
-/// Uses `f32_to_f16_rm(..., xcl_fp16_rm)` only when the shader changes `MODE[3:2]`.
 fn to_f16_expr(dynamic_rm: bool, e: &str) -> String {
     if dynamic_rm {
-        format!("f32_to_f16_rm({e}, xcl_fp16_rm)")
+        to_f16_rounded_expr(true, e)
     } else {
         format!("(f32tof16({e}) & 0xFFFFu)")
     }
+}
+
+/// Round an exact binary32 input in the selected RDNA mode. Legacy `f32tof16`
+/// uses round-toward-zero. The default RDNA mode is round-to-nearest-even.
+fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
+    let rm = if dynamic_rm { "xcl_fp16_rm" } else { "0u" };
+    format!("f32_to_f16_rm({e}, {rm})")
 }
 
 impl Em {
@@ -594,6 +617,16 @@ impl Em {
         format!("v{n}")
     }
 
+    fn mask_zero(&mut self, lo: u64) -> String {
+        let l = self.sreg(lo);
+        if self.opt.wave64 {
+            let h = self.sreg(lo + 1);
+            format!("({l} | {h}) == 0u")
+        } else {
+            format!("{l} == 0u")
+        }
+    }
+
     /// 32-bit value of a scalar source code (0..255) or VALU source (256+ = VGPR).
     fn code32(&mut self, code: u64, lit: Option<u32>, f16: bool) -> Option<String> {
         Some(match code {
@@ -608,14 +641,8 @@ impl Em {
                     hex(f32_const(code)?.to_bits())
                 }
             }
-            251 => {
-                let (l, h) = (self.sreg(106), self.sreg(107));
-                format!("(uint)(({l} | {h}) == 0u)")
-            }
-            252 => {
-                let (l, h) = (self.sreg(126), self.sreg(127));
-                format!("(uint)(({l} | {h}) == 0u)")
-            }
+            251 => format!("(uint)({})", self.mask_zero(106)),
+            252 => format!("(uint)({})", self.mask_zero(126)),
             253 => "scc".into(),
             255 => hex(lit?),
             256..=511 => self.vreg(code - 256),
@@ -642,6 +669,8 @@ impl Em {
                 let b = (f32_const(code)? as f64).to_bits();
                 (hex(b as u32), hex((b >> 32) as u32))
             }
+            251 => (format!("(uint)({})", self.mask_zero(106)), "0u".into()),
+            252 => (format!("(uint)({})", self.mask_zero(126)), "0u".into()),
             253 => ("scc".into(), "0u".into()),
             255 => if f64 { ("0u".into(), hex(lit?)) } else { (hex(lit?), "0u".into()) },
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
@@ -845,22 +874,6 @@ impl Em {
     }
 
     fn sopp(&mut self, d: &Decoded, name: &str, _next: u64) -> Flow {
-        let vccz = |s: &mut Self| {
-            let (l, h) = (s.sreg(106), s.sreg(107));
-            if s.opt.wave64 {
-                format!("({l} | {h}) == 0u")
-            } else {
-                format!("{l} == 0u")
-            }
-        };
-        let execz = |s: &mut Self| {
-            let (l, h) = (s.sreg(126), s.sreg(127));
-            if s.opt.wave64 {
-                format!("({l} | {h}) == 0u")
-            } else {
-                format!("{l} == 0u")
-            }
-        };
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
@@ -931,10 +944,10 @@ impl Em {
                     "s_branch" => Flow::Jump(t),
                     "s_cbranch_scc0" => Flow::Cond("scc == 0u".into(), t),
                     "s_cbranch_scc1" => Flow::Cond("scc != 0u".into(), t),
-                    "s_cbranch_vccz" => Flow::Cond(vccz(self), t),
-                    "s_cbranch_vccnz" => Flow::Cond(format!("!({})", vccz(self)), t),
-                    "s_cbranch_execz" => Flow::Cond(execz(self), t),
-                    "s_cbranch_execnz" => Flow::Cond(format!("!({})", execz(self)), t),
+                    "s_cbranch_vccz" => Flow::Cond(self.mask_zero(106), t),
+                    "s_cbranch_vccnz" => Flow::Cond(format!("!({})", self.mask_zero(106)), t),
+                    "s_cbranch_execz" => Flow::Cond(self.mask_zero(126), t),
+                    "s_cbranch_execnz" => Flow::Cond(format!("!({})", self.mask_zero(126)), t),
                     _ => {
                         self.unsupported(d, "conditional branch");
                         Flow::Next
@@ -1083,8 +1096,6 @@ impl Em {
         // SOP1 / SOP2
         let saveexec = name.contains("saveexec") || name.contains("wrexec");
         if saveexec {
-            let s0 = self.read64(d, ins[0], false).ok_or("op")?;
-            let (el, eh) = (self.sreg(126), self.sreg(127));
             let op = |a: &str, e: &str| -> Option<String> {
                 Some(match base.split('_').nth(1)? {
                     "and" => format!("{a} & {e}"),
@@ -1100,16 +1111,24 @@ impl Em {
                     _ => return None,
                 })
             };
-            let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
-            let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
-            self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
-            self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
             if !self.opt.wave64 || name.ends_with("_b32") {
+                let s0 = self.read(d, ins[0], false).ok_or("op")?;
+                let el = self.sreg(126);
+                let nl = op(&s0, &el).ok_or("saveexec")?;
+                let (t0, o0) = (self.t(), self.t());
+                self.line(&format!("uint {o0} = {el};"));
+                self.line(&format!("uint {t0} = {nl};"));
                 self.line(&format!("{el} = {t0};"));
                 self.line(&format!("scc = (uint)({t0} != 0u);"));
-                let v = if name.contains("wrexec") { t0.clone() } else { o0.clone() };
+                let v = if name.contains("wrexec") { t0 } else { o0 };
                 self.write32(&dst, &v);
             } else {
+                let s0 = self.read64(d, ins[0], false).ok_or("op")?;
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
+                let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
+                self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
+                self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
                 self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
                 let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
@@ -1904,6 +1923,23 @@ impl Em {
     /// Sampler descriptors (S#, 4 dwords) hold the sampler heap index in BORDER_COLOR_PTR
     /// (word 3 [11:0]). Address layout with A16 (16-bit bias/coordinates/lod, 32-bit offset,
     /// compare and gradients) as in AnyPS5's `componentShape` (GPL-2.0, ported 2026-11-20).
+    /// `float3 {t}_o{sfx}`: an MIMG texel offset (`o`, three 6-bit signed fields) in the texture
+    /// coordinates of mip `level` – offset / that level's size (array layers do not move).
+    fn texel_offset(&mut self, t: &str, dim: u64, o: &str, level: &str, sfx: &str) {
+        let (w, h, z, n) = (format!("{t}_w{sfx}"), format!("{t}_h{sfx}"), format!("{t}_d{sfx}"), format!("{t}_n{sfx}"));
+        let dims = match dim {
+            0 => format!("{t}_T.GetDimensions({level}, {w}, {n});"),
+            1 => format!("{t}_T.GetDimensions({level}, {w}, {h}, {n});"),
+            2 => format!("{t}_T.GetDimensions({level}, {w}, {h}, {z}, {n});"),
+            4 => format!("{t}_T.GetDimensions({level}, {w}, {z}, {n}); {z} = 1u;"),
+            _ => format!("{t}_T.GetDimensions({level}, {w}, {h}, {z}, {n}); {z} = 1u;"),
+        };
+        self.line(&format!("uint {w} = 1u, {h} = 1u, {z} = 1u, {n}; {dims}"));
+        self.line(&format!(
+            "float3 {t}_o{sfx} = float3((float)(((int)({o} << 26)) >> 26) / (float){w}, (float)(((int)({o} << 18)) >> 26) / (float){h}, (float)(((int)({o} << 10)) >> 26) / (float){z});"
+        ));
+    }
+
     fn mimg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("TFE") != 0 || f("LWE") != 0 {
@@ -2107,8 +2143,8 @@ impl Em {
             };
             let s3 = self.sreg(ssamp + 3);
             // texel offsets come from a VGPR (6-bit fields); SM 6.6 takes only immediate offsets, so
-            // the coordinates move by offset / size of the sampled mip (exact for lz / l / gather,
-            // the rounded implicit LOD otherwise)
+            // the coordinates move by offset / size of the sampled mip (exact for lz / integer l /
+            // gather; an implicit LOD with a linear mip filter is sampled per mip further down)
             let offset = if has_o {
                 if dim == 3 {
                     return Err("MIMG offset cube");
@@ -2118,19 +2154,9 @@ impl Em {
             } else {
                 None
             };
-            let coord0 = match dim {
-                0 => coords[0].clone(),
-                1 => format!("float2({}, {})", coords[0], coords[1]),
-                2 => format!("float3({}, {}, {})", coords[0], coords[1], coords[2]),
-                4 => format!("float2({}, round({}))", coords[0], coords[1]),
-                5 => format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2]),
-                _ => String::new(),
-            };
-            let coords: Vec<String> = if offset.is_some() {
-                coords.iter().enumerate().map(|(k, c)| if (dim == 4 && k == 1) || (dim == 5 && k == 2) { c.clone() } else { format!("({c} + {t}_o[{k}])") }).collect()
-            } else {
-                coords
-            };
+            let coord0 = sample_coord(dim, &coords);
+            let coords_unmoved = coords.clone();
+            let coords: Vec<String> = if offset.is_some() { moved_coords(dim, &coords, &format!("{t}_o")) } else { coords };
             let (ty, coord) = match dim {
                 0 => ("Texture1D<float4>", coords[0].clone()),
                 1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
@@ -2155,17 +2181,7 @@ impl Em {
                     (None, _, true) => format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)"),
                     _ => "0u".to_string(),
                 };
-                let dims = match dim {
-                    0 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_n);"),
-                    1 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_n);"),
-                    2 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n);"),
-                    4 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_d, {t}_n); {t}_d = 1u;"),
-                    _ => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d = 1u;"),
-                };
-                self.line(&format!("uint {t}_w = 1u, {t}_h = 1u, {t}_d = 1u, {t}_n; {dims}"));
-                self.line(&format!(
-                    "float3 {t}_o = float3((float)(((int)({o} << 26)) >> 26) / (float){t}_w, (float)(((int)({o} << 18)) >> 26) / (float){t}_h, (float)(((int)({o} << 10)) >> 26) / (float){t}_d);"
-                ));
+                self.texel_offset(&t, dim, o, &level, "");
             }
             let gather = base.starts_with("gather4");
             let call = if gather {
@@ -2203,6 +2219,35 @@ impl Em {
                     (None, None, None, Some(b)) if ps => format!("{t}_T.SampleBias({t}_S, {})", tail(format!("{coord}, {b}"))),
                     (None, None, None, Some(b)) => format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(b.clone())),
                     _ if has_lz || !ps => format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor("0.0f".into())),
+                    // implicit LOD with an offset and a linear mip filter: the console moves each of
+                    // the two blended mips by the offset in its own texels – sampled per mip and
+                    // blended here. Anisotropic or point-mip samplers keep the one-mip form above.
+                    _ if offset.is_some() => {
+                        let o = offset.clone().unwrap_or_default();
+                        let (w0, w2) = match self.static_ss.get(&d.pc) {
+                            Some(w) => (format!("{}u", w[0]), format!("{}u", w[2])),
+                            None => (self.sreg(ssamp), self.sreg(ssamp + 2)),
+                        };
+                        // the level a clamp past the last mip asks for is the last mip ({t}_n: the view's levels)
+                        let lod = floor(format!("{t}_T.CalculateLevelOfDetail({t}_S, {coord0})"));
+                        self.line(&format!("float {t}_L = min({lod}, (float)(max({t}_n, 1u) - 1u)); float {t}_l0 = floor({t}_L);"));
+                        let l1 = format!("min((uint){t}_l0 + 1u, max({t}_n, 1u) - 1u)");
+                        self.texel_offset(&t, dim, &o, &format!("(uint){t}_l0"), "a");
+                        self.texel_offset(&t, dim, &o, &l1, "b");
+                        let c0 = sample_coord(dim, &moved_coords(dim, &coords_unmoved, &format!("{t}_oa")));
+                        let c1 = sample_coord(dim, &moved_coords(dim, &coords_unmoved, &format!("{t}_ob")));
+                        self.line(&format!("float4 {t}_m0 = {t}_T.SampleLevel({t}_S, {c0}, {t}_l0);"));
+                        self.line(&format!("float4 {t}_m1 = {t}_T.SampleLevel({t}_S, {c1}, (float)({l1}));"));
+                        self.line(&format!("float4 {t}_s1 = {t}_T.Sample({t}_S, {});", tail(coord.clone())));
+                        // S# word 2: XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26];
+                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso min / mag
+                        // filter, as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
+                        // the mag filter, so mip 0 of a minified sample needs min = mag.
+                        self.line(&format!(
+                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag >= 2u || {t}_min >= 2u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || (({t}_mag | ({t}_mag >> 1)) & 1u) == (({t}_min | ({t}_min >> 1)) & 1u));"
+                        ));
+                        format!("({t}_pm ? lerp({t}_m0, {t}_m1, {t}_L - {t}_l0) : {t}_s1)")
+                    }
                     _ => format!("{t}_T.Sample({t}_S, {})", tail(coord.clone())),
                 }
             };
@@ -2433,7 +2478,7 @@ impl Em {
     fn sources(&mut self, d: &Decoded, ins: &[&Operand], src_f16: bool) -> Result<Vec<String>, &'static str> {
         let mut u = Vec::new();
         for o in ins {
-            if d.variant != Variant::Plain && o.field == Some("SRC0") {
+            if (d.variant != Variant::Plain && o.field == Some("SRC0")) || (d.variant == Variant::Sdwa && o.field == Some("VSRC1")) {
                 u.push("0u".into()); // replaced below
                 continue;
             }
@@ -2451,13 +2496,13 @@ impl Em {
             Variant::Sdwa => {
                 let e = ext_encoding(d).ok_or("SDWA")?;
                 let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
-                let s0 = if fv("S0") == 1 { self.code32(fv("VSRC0"), None, false).ok_or("op")? } else { self.vreg(fv("VSRC0")) };
+                let s0 = if fv("S0") == 1 { self.code32(fv("VSRC0"), None, src_f16).ok_or("op")? } else { self.vreg(fv("VSRC0")) };
                 if !u.is_empty() {
                     u[0] = format!("sdwa_sel({s0}, {}u, {})", fv("SRC0_SEL"), fv("SRC0_SEXT") == 1);
                 }
                 if d.enc.field("VSRC1").is_some() && u.len() > 1 {
                     let v1 = fv("VSRC1");
-                    let s1 = if fv("S1") == 1 { self.code32(v1, None, false).ok_or("op")? } else { self.vreg(v1) };
+                    let s1 = if fv("S1") == 1 { self.code32(v1, None, src_f16).ok_or("op")? } else { self.vreg(v1) };
                     u[1] = format!("sdwa_sel({s1}, {}u, {})", fv("SRC1_SEL"), fv("SRC1_SEXT") == 1);
                 }
             }
@@ -2566,7 +2611,12 @@ impl Em {
         let dyn_rm = self.dynamic_f16_rm;
         let fr = |e: String| {
             let s = if clamp { format!("saturate({e})") } else { e };
-            to_f16_expr(dyn_rm, &s)
+            // The product of two binary16 operands fits exactly in binary32.
+            if name == "v_pk_mul_f16" {
+                to_f16_rounded_expr(dyn_rm, &s)
+            } else {
+                to_f16_expr(dyn_rm, &s)
+            }
         };
         let t = self.t();
         // dot products: one 32-bit result
@@ -2754,7 +2804,8 @@ impl Em {
     fn valu16(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);
-        let u = self.sources(d, &ins, name.contains("f16"))?;
+        let src_f16 = name.contains("f16") && !matches!(name, "v_cvt_f16_u16" | "v_cvt_f16_i16");
+        let u = self.sources(d, &ins, src_f16)?;
         let plain = d.variant == Variant::Plain;
         let half = |i: usize| -> String {
             let s = u.get(i).map(String::as_str).unwrap_or("0u");
@@ -2796,7 +2847,11 @@ impl Em {
             if m.clamp {
                 s = format!("saturate({s})");
             }
-            to_f16_expr(dyn_rm, &s)
+            if name == "v_mul_f16" {
+                to_f16_rounded_expr(dyn_rm, &s)
+            } else {
+                to_f16_expr(dyn_rm, &s)
+            }
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
@@ -3117,7 +3172,7 @@ impl Em {
             "v_cvt_f16_f32" => {
                 // the modifiers in f32 before the rounding: the same f16 (scaling by a power of
                 // two is exact, and 0 and 1 are f16 values), except where the f16 is denormal
-                let h = to_f16_expr(self.dynamic_f16_rm, &Self::out_mods(&m, &fs(0)));
+                let h = to_f16_rounded_expr(self.dynamic_f16_rm, &Self::out_mods(&m, &fs(0)));
                 if m.opsel >> 3 & 1 == 1 {
                     format!("({cur} & 0xFFFFu) | ({h} << 16)")
                 } else if d.variant == Variant::Sdwa {
@@ -4214,7 +4269,8 @@ impl Em {
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    let _ = writeln!(h, "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);", sname(next).unwrap(), x * y * z);
+                    // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
+                    let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {
@@ -4492,6 +4548,63 @@ fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
     }
     h.push_str("};\n");
+}
+
+/// Geometry shader for the console's rect lists (IASetPrimitiveTopology 17, AMD's
+/// DI_PT_RECTLIST; PSO topology type 19) behind a translated VS with these outputs: the PC has
+/// no such topology, the draw arrives as a triangle list and each rect's three vertices come
+/// here. They are three corners of a screen-aligned rectangle (AMD PAL, `palCmdBuffer.h`:
+/// "Each rect is three 2D axis-aligned rectangle vertices"), and the corner between the other
+/// two is not always the same vertex: Mesa's radeonsi blits send (x1,y1), (x1,y2), (x2,y1) – v0
+/// – and xf86-video-ati's r600 EXA (x1,y1), (x1,y2), (x2,y2) – v1. The corner is the vertex
+/// sharing x with one of the others and y with the other; the fourth vertex is the opposite
+/// corner, a + b - corner, with every float output taken the same way (both drivers' texture
+/// coordinates rely on the implied corner continuing them linearly). Only for three vertices
+/// with one positive w – then a + b - corner is the same in clip and screen space and every
+/// interpolation mode agrees; three that are not such corners, or differ in w, stay the one
+/// triangle they make.
+///
+/// Flat values are the rect's first vertex's: both triangles start with v[0], which is where
+/// the PC takes a flat input from (an integer input, or what the translation declares
+/// `nointerpolation` for `v_interp_mov_f32`), and the fourth vertex's integer outputs are
+/// v[0]'s. On the console the first vertex is the provoking one of every primitive under
+/// D3D's setting – AMD's register references (R6xx, SI, CIK), PA_SU_SC_MODE_CNTL
+/// .PROVOKING_VTX_LAST: "Defines which vertex of a primitive is used for attribute components
+/// when flat shading is enabled", "0 = First Vtx (D3D)"; the Evergreen / Cayman programming
+/// guide, 5.2: a flat attribute is the provoking vertex's value with gradients of 0. Neither
+/// says so of a rect in particular, and it is not measured on one.
+pub fn rect_list_gs(outputs: &[SigElement]) -> String {
+    let mut h = String::new();
+    h.push_str("// generated by XCL: a console rect list's rectangles (three corners, the fourth implied)\n");
+    out_struct(&mut h, "XclOut", outputs);
+    h.push_str("[maxvertexcount(6)]\nvoid main(triangle XclOut v[3], inout TriangleStream<XclOut> s)\n{\n");
+    // the corner c: x shared with a and y with b, or the other way round (a = c + 1, b = c + 2);
+    // one w: clip-space x and y compare as the screen's do
+    h.push_str("    uint c = 3u;\n");
+    h.push_str("    if (v[0].pos.w > 0.0 && v[1].pos.w == v[0].pos.w && v[2].pos.w == v[0].pos.w) {\n");
+    h.push_str("        float2 q[3] = { v[0].pos.xy, v[1].pos.xy, v[2].pos.xy };\n");
+    h.push_str("        [unroll] for (uint i = 0u; i < 3u; i++) {\n");
+    h.push_str("            float2 p = q[i], a = q[(i + 1u) % 3u], b = q[(i + 2u) % 3u];\n");
+    h.push_str("            bool corner = (p.x == a.x && p.y == b.y) || (p.x == b.x && p.y == a.y);\n");
+    h.push_str("            bool degenerate = all(p == a) || all(p == b) || all(a == b);\n");
+    h.push_str("            if (c == 3u && corner && !degenerate)\n                c = i;\n        }\n    }\n");
+    h.push_str("    if (c == 3u) {\n        s.Append(v[0]);\n        s.Append(v[1]);\n        s.Append(v[2]);\n        return;\n    }\n");
+    h.push_str("    XclOut k = v[c], a = v[(c + 1u) % 3u], b = v[(c + 2u) % 3u];\n    XclOut d = v[0];\n");
+    h.push_str("    d.pos = a.pos + b.pos - k.pos;\n");
+    for (k, e) in ranked(outputs, true).iter().enumerate() {
+        if hlsl_type(e) == "float" {
+            let _ = writeln!(h, "    d.p{k} = a.p{k} + b.p{k} - k.p{k};");
+        }
+    }
+    // (corner, a, b) is v0 v1 v2 in its order or rotated; (corner, a, d), (corner, d, b) and
+    // (a, d, b) wind as it does. Of those, the two halves that both hold v0, v0 first:
+    // v0 v1 d, v0 d v2 (corner v0) – v0 v1 v2, v0 v2 d (v1) – v0 v1 v2, v0 d v1 (v2)
+    h.push_str("    s.Append(v[0]);\n    s.Append(v[1]);\n");
+    h.push_str("    if (c == 0u)\n        s.Append(d);\n    else\n        s.Append(v[2]);\n");
+    h.push_str("    s.RestartStrip();\n    s.Append(v[0]);\n");
+    h.push_str("    if (c == 1u) {\n        s.Append(v[2]);\n        s.Append(d);\n    } else {\n        s.Append(d);\n");
+    h.push_str("        if (c == 0u)\n            s.Append(v[2]);\n        else\n            s.Append(v[1]);\n    }\n}\n");
+    h
 }
 
 /// Second pass of the mesh mode: a mesh shader that turns the records written by the

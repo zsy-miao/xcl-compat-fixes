@@ -70,6 +70,9 @@ fn committed_texture_address_survives_the_retail_clear_and_is_freed() {
         assert_eq!(resource.GetGPUVirtualAddress(), 0, "the fallback must not change PC/runtime calls");
         assert_eq!(title_address(key), Some(address));
         assert_eq!(TEXTURE_MEMORY.lock().unwrap().as_ref().unwrap().get(&key), Some(&address));
+        // The current backend reserves lazily. Host tests do not install the title's
+        // access-violation handler, so use its normal pre-touch path before writing.
+        crate::hle::kernelx::lazy::ensure(address, 0x4_0000);
         // Exact operation that crashed the retail executable: memset(address, 0, 256*256*4).
         std::ptr::write_bytes(address as *mut u8, 0xA5, 0x4_0000);
         std::ptr::write_bytes(address as *mut u8, 0, 0x4_0000);

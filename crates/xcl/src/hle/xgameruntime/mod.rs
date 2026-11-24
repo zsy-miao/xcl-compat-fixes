@@ -405,7 +405,7 @@ pub struct XPersistentLocalStorageSpaceInfo {
 /// (`DirEntry::file_type` on Windows reports every name-surrogate reparse point —
 /// symlinks, junctions and mount points — as `is_symlink`, without an extra syscall
 /// and without dereferencing it.)
-fn pls_used_bytes(root: &Path) -> u64 {
+pub(crate) fn pls_used_bytes(root: &Path) -> u64 {
     let mut used = 0u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -446,11 +446,7 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPe
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = GetDiskFreeSpaceExW(crate::util::wide(&pls).as_ptr(), &mut avail, &mut total, &mut free);
     // the title's quota (MicrosoftGame.Config <PersistentLocalStorage><SizeMB>, else 4 GiB)
-    let quota = match crate::state::config().pls_mb {
-        0 => 4096,
-        mb => mb,
-    }
-    .saturating_mul(1024 * 1024);
+    let quota = crate::state::config().pls_quota_bytes();
     let used = pls_used_bytes(Path::new(&pls));
     if ok == 0 {
         // host figures unavailable – let the remaining quota bound free space alone

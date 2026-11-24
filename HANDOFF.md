@@ -336,7 +336,12 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. The g
 - `OutputDebugStringA/W` (kernelx HLE) → XCL log `[debug] …` (console DLLs and games write a lot there; that is how the XDXR error surfaced).
 - **The XboxBvhBuilder constructor goes through completely on the XCL device** (probe `XCL_PROBE_BVH_DEVICE=1`):
   - `XCL_D3D12_TRACE=1` (NEW, `guard::make_tracer`): every public vtable method called from console code → log
-    `D3D12 trace: Iface::Method (#slot) ← module+offset`. That is how the sequence CreateRootSignature → SetName → slot 62 came out.
+    `D3D12 trace: Iface::Method (#slot) ← module+offset: (args…)`. That is how the sequence CreateRootSignature → SetName → slot 62 came out.
+    (The tail-jump form: the slot splits classify by the caller's return address, so the result is not logged.)
+  - `XCL_TRACE_IMPORTS=1` (`guard::make_call_tracer`, `resolver::trace_filter`): every import resolved to an HLE
+    function is wrapped in a call-through thunk → `trace: dll!Function ← module+offset: (args…) → result` (pointer
+    arguments show the string or the words they point at). `all` wraps system imports too (short runs: a data export
+    would be wrapped as well); `kernelx!Create,-kernelx!GetTickCount` include / exclude prefixes of `dll!Function`.
   - **The console device vtable differs from the PC one:** slot 62 on the console = `CreateComputePipelineState(desc, NULL, NULL,
     riid, ppv)` (two extra arguments), on PC = CreateStateObject. `guard::make_split` (NEW): a call from the game image →
     console version, from the runtime → PC; table `real::console_slots` (for now only device #62).
@@ -1774,6 +1779,62 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   41.6 s with 4 windows, 22.5 s with 1); heap-indexed windows would remove it but a raw buffer view cannot cover a
   4 GiB window – a redesign of how shaders reach title memory.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
+- **Then: its first menu is visible (2026-11-23)** – the account prompt ("account choice (Y) / PLAYER1 (A)") at 30 fps
+  (632 frames in 30 s, 720 draws per 2 s), no crash; the process commits ~18–19 GB (the system's limit here is
+  ~36 GB with a 32 GB machine). What it took:
+  - **Memory.** Every allocation of video memory is charged to the process's commit by WDDM, so video memory counts
+    against RAM + page file. (1) GPU-owned textures (RT / DS / UAV) placed at title addresses are now **reserved
+    (tiled) resources on 64 KiB pages of video memory** (`vram.rs`, `Pages`): one page per 64 KiB page of the
+    title's address that a target covers, shared by every target there (aliasing as on the console), tiles past the
+    console's size the target's own; pages no target uses go back to the pools after 2 s; title queues wait on the
+    mapping fence (`vram::before_execute`). The arenas (default heaps per address range) remain only for what the
+    driver will not make reserved (D32S8 / R32G8X24 and MSAA) or `XCL_VRAM_ARENAS=1`: the title packs its streaming
+    targets back to back over 3.5 GB of addresses, and straddling placements made union arenas while the old ones
+    lived on – **15 GB of arenas in 2 s**, 18 GB of local video memory on a 16 GB card, then the device was removed;
+    now 3.2 GB of pages. (2) Physical pages mapped into plain reservations whose home was never used are only
+    reserved (`kernelx/lazy.rs`): a vectored handler commits a page on the CPU's first access; ReadFile (hooked),
+    DirectStorage destinations and CPU-side bottom-of-pipe writes commit first (`lazy::ensure` – kernel calls do
+    not fault into the handler). (3) Title GPU heaps go to the coherent window when it fits (size from the last run,
+    `cache/uma_coherent.txt`); sparse pool heaps whose tiles are all free are released.
+  - **The device removal (0x887A0001) at ~14 s** was a UAV in B5G5R5A1 of a target the PC makes R8G8B8A8 (found with
+    `XCL_D3D12_DEBUG=1`, which works with this title now; the debug layer logs 8 messages per id). Views now get
+    the PC's format for the resource (`device_x::pc_shader_view_format`): depth buffers are made typeless and their
+    shader views use R24_UNORM_X8 / R32_FLOAT(_X8X24) (stencil: plane 1) – a D24S8 format in an SRV, or R16_UNORM of
+    the D16S8 buffer, is also an invalid call; the console's 116 / 117 (R10G10B10 7e3 / 6e4 floats) are R16G16B16A16F;
+    B5G5R5A1 / B4G4R4A4 targets are R8G8B8A8 (RTV, UAV, pipeline formats, clear values follow).
+  - From PR #195 (taken in parts): index / vertex buffers outside unified memory are mirrored into it and each draw
+    copies what it reads (`list_x::gpu_va`); rect lists are drawn as two triangles a rectangle (fourth corner on the
+    CPU, `bind::draw_rects`); a committed texture asked for its GPU address gets lazily committed memory at one
+    (`real::texture_memory`); stand-in streams carry null pointers for missing shaders.
+  - Pipelines whose console MS container sits in the AS slot (no MS subobject; its minimap) are **refused**:
+    translated as the mesh shader they are, the title rendered nothing from then on (black every run). Open: what
+    it expects of them.
+  - `XCL_ACTIVITY` logs the process's commit, local / non-local video memory, target pages, arenas and sparse pools.
+  - Open: arenas for D32S8 targets still take 2.8 GB (one per 256 MB of addresses; a D32S8 → R32 + separate stencil
+    split, or exact-size heaps, would cut it); the debug layer's resource-state errors (538) and sparse
+    simultaneous-access errors (1047); buffer views outside unified memory still get an empty V#.
+
+## Console CPU instructions the PC lacks (2026-11-23)
+A retail game on an Intel CPU before Ice Lake / Alder Lake dies with 0xC000001D (illegal instruction) in its own code
+right after its first `CreateShaderResourceView` (the first descriptor written into title memory). `insn.rs` decodes
+the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`, `rdpru`, `monitorx` / `mwaitx`
+(AMD only), `rdpid` – and the vectored handler (`eh::emulate_console_only`) emulates them and steps over
+(`clwb` / `monitorx` / `mwaitx`: nothing, the PC's memory is coherent; `clzero`: 64 zero bytes at rAX; `rdpru`:
+QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruction. Any other illegal instruction
+(and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
+SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
+
+- **Then: past the first menu to its settings (2026-11-23)** – pressing A on the account prompt crashed the title
+  a few seconds later (0xC0000005 with no XCL crash line: its own crash filter ends the process). `XCL_TRACE_FAULTS=1`
+  (access violations logged as they are raised, before the title's handlers) showed the title reading slot 25 of a
+  device "vtable" 0x1000. GetResourceAllocationInfo and the other struct-returning device methods take either
+  argument order (return buffer, device / device, return buffer), told apart by which argument looks adopted; the
+  title's stack return buffer held a stale copy of the device's vtable pointer, so the result went over the device
+  object. `real::this_first`: when both look adopted, the one on the thread's stack (or not the device) is the
+  buffer. Menus now ~15 GB committed (#225: exact-size arenas for D32S8 / MSAA).
+- Open (from a user report): a write-watch scan of textures in the 4 GiB coherent window costs in proportion to their
+  size at every submit; a page guard (read-only until the first CPU write, `kernelx::lazy`) was tried and reverted
+  pending measurement past the menus.
 
 ## Console CPU instructions the PC lacks (2026-11-23)
 A retail game on an Intel CPU before Ice Lake / Alder Lake dies with 0xC000001D (illegal instruction) in its own code

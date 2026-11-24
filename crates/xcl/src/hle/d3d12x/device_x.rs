@@ -650,77 +650,111 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
-    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let mut flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    // the console's D16_UNORM_S8_UINT family (118 – 120): the PC's D24S8 one, typeless so its
+    // depth and stencil views both fit
+    if matches!(format, 118..=120) {
+        d[0x20..0x24].copy_from_slice(&44u32.to_le_bytes());
+    }
+    // a depth buffer in a typed depth format: typeless, as the console's shaders read it too
+    // (R32_FLOAT of a D32_FLOAT buffer – on the PC only a typeless resource has both views)
+    if flags & 2 != 0 {
+        if let Some(t) = depth_typeless(format) {
+            d[0x20..0x24].copy_from_slice(&t.to_le_bytes());
+        }
+    }
+    // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: the PC has none – half floats hold them
+    if matches!(format, 116 | 117) {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
+    // B5G5R5A1 / B4G4R4A4 targets: not ones a PC driver takes for rendering together with
+    // unordered access (a retail game's 2560x1440 one, flags 0x5: E_INVALIDARG) – R8G8B8A8, the
+    // same values with more bits; the GPU's own (nothing of the CPU's is laid out for them)
+    if matches!(format, 86 | 115) && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    }
+    // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
+    // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
+    if flags & 2 != 0 {
+        flags &= !4;
+    }
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    // a depth buffer the console also writes as a UAV (GTA VI's 2560x1440 D16S8): the PC refuses
-    // depth + unordered access together, and the resource got no size
-    let pc_flags = if flags & 0x2 != 0 { flags & 0xFF & !0x4 } else { flags & 0xFF };
-    d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
-    // A depth resource is read through shader views as well as a DSV. Its PC resource must
-    // therefore be typeless; only its views, pipeline and optimized clear use typed formats.
-    let pc = match format {
-        118..=120 => 44, // R24G8_TYPELESS, with D24S8 / depth / stencil views
-        20 if flags & 2 != 0 => 19,
-        40 if flags & 2 != 0 => 39,
-        45 if flags & 2 != 0 => 44,
-        55 if flags & 2 != 0 => 53,
-        86 | 115 if flags & 5 != 0 => 28,
-        f => pc_view_format(f),
-    };
-    d[0x20..0x24].copy_from_slice(&pc.to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
     d
 }
 
-/// A DXGI format of the console only as the PC's nearest: the 16-bit depth + 8-bit stencil
-/// family (118 D16_UNORM_S8_UINT, 119 R16_UNORM_X8_TYPELESS, 120 X16_TYPELESS_G8_UINT) as the
-/// 24-bit one (45, 46, 47). The PC driver refuses them: GTA VI's depth buffer got no size
-/// (GetResourceAllocationInfo) and the title stopped on its assertion.
-///
-/// 86 (B5G5R5A1_UNORM) is a PC format, but not one a PC driver takes for a render target that
-/// is also a UAV (a retail title's 2560x1440 target, flags 0x5: CreatePlacedResource refused it,
-/// E_INVALIDARG, and the title stopped). It becomes R8G8B8A8_UNORM (28): what shaders write to
-/// it and read from it is the same, with more bits; its memory is twice the console's.
-pub fn pc_format(f: u32) -> u32 {
-    match f {
-        // B5G5R5A1 (86) and B4G4R4A4 (115) render targets (the same title's 2560x1440 ones)
-        86 | 115 => 28,
-        // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: half floats hold them
-        116 | 117 => 10,
-        118 => 45,
-        119 => 46,
-        120 => 47,
-        f => f,
-    }
-}
-
-/// Typed format for shader views; unlike render targets, ordinary packed-colour textures
-/// keep their PC-supported 16-bit format and layout.
+/// The PC format of a view, pipeline or clear value in the console's D16_UNORM_S8_UINT family:
+/// D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT (`pc_resource_desc` makes such
+/// resources R24G8_TYPELESS).
 pub fn pc_view_format(f: u32) -> u32 {
     match f {
-        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,
+        116 | 117 => 10,
         f => f,
     }
 }
 
-/// The typed shader-readable member of a depth resource's PC format family.
+/// The typeless format of a depth format's family (None: not a depth format).
+fn depth_typeless(f: u32) -> Option<u32> {
+    match f {
+        20 => Some(19), // D32_FLOAT_S8X24_UINT
+        40 => Some(39), // D32_FLOAT
+        45 => Some(44), // D24_UNORM_S8_UINT
+        55 => Some(53), // D16_UNORM
+        _ => None,
+    }
+}
+
+/// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`).
+pub fn pc_target_format(f: u32) -> u32 {
+    match f {
+        86 | 115 => 28,
+        f => pc_view_format(f),
+    }
+}
+
+/// The format a shader's view of a resource whose PC format is `resource` has on the PC (`view`
+/// 0: the resource's own). The console names depth buffers' views plainly (R16_UNORM of a D16S8
+/// buffer, R32_FLOAT of a D32 one, even the depth format itself); the PC wants its family's
+/// readable formats and removes the device for anything else (0x887A0001).
 pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
     let view = pc_view_format(view);
     match (resource, view) {
+        // R32G8X24_TYPELESS: depth 21, stencil 22
         (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
         (19..=22, 22 | 61 | 62) => 22,
+        // R24G8_TYPELESS: depth 46, stencil 47
         (44..=47, 0 | 41 | 44 | 45 | 46 | 53 | 54 | 55 | 56) => 46,
         (44..=47, 47 | 61 | 62) => 47,
+        // R32_TYPELESS, R16_TYPELESS
         (39 | 40, 0 | 39 | 40) => 41,
         (53 | 55, 0 | 53 | 55) => 56,
+        // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
         (_, v) => v,
     }
+}
+
+/// Whether a shader view in `pc_shader_view_format`'s format reads the stencil (plane 1 on the PC).
+pub fn stencil_view(resource: u32, view: u32) -> bool {
+    matches!((resource, view), (19..=22, 22) | (44..=47, 47))
+}
+
+/// A clear value (D3D12_CLEAR_VALUE: format first) with `pc_view_format`, copied into `buf`.
+pub(super) unsafe fn pc_clear(clear: *const c_void, buf: &mut [u8; 24]) -> *const c_void {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 24) {
+        return clear;
+    }
+    std::ptr::copy_nonoverlapping(clear as *const u8, buf.as_mut_ptr(), 24);
+    let f = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    buf[0..4].copy_from_slice(&pc_target_format(f).to_le_bytes());
+    buf.as_ptr() as *const c_void
 }
 
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
@@ -745,10 +779,6 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
             }
         };
         if s == u64::MAX || a == 0 {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                crate::xlog_warn!("D3D12.X: GetResourceAllocationInfo: no size for {:x?} (as the PC's: {:x?})", &x[..0x34], &pc_resource_desc(&x)[..0x34]);
-            }
             size = u64::MAX;
             break;
         }
@@ -821,22 +851,6 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
     }
 }
 
-/// A D3D12_CLEAR_VALUE (format, then 16 bytes of colour or depth + stencil) with a console-only
-/// format as the PC's (`pc_format`); None: nothing to change (or no clear value).
-pub(super) unsafe fn pc_clear_value(clear: *const c_void) -> Option<[u8; 20]> {
-    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
-        return None;
-    }
-    let mut c = (clear as *const [u8; 20]).read_unaligned();
-    let f = u32::from_le_bytes(c[0..4].try_into().unwrap());
-    let pc = pc_format(f);
-    if pc == f {
-        return None;
-    }
-    c[0..4].copy_from_slice(&pc.to_le_bytes());
-    Some(c)
-}
-
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -849,38 +863,49 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
-    // the clear value names the console's format too (a 1024x1024 D16S8 depth buffer: 118 with
-    // the desc already 45 – the PC refused the pair, E_INVALIDARG, and the title stopped)
-    let pc_clear = pc_clear_value(clear);
-    let clear = pc_clear.as_ref().map_or(clear, |c| c.as_ptr() as *const c_void);
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
-    // a depth buffer is no UAV on the PC (`pc_resource_desc`): its unordered-access initial state
-    // (GTA VI's 768x768x6 shadow maps: 0x8) is refused – it starts as a depth target
-    if u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) & 0x2 != 0 && state & 0x8 != 0 {
+    // (a depth buffer placed for unordered access – no longer one on the PC: written as depth)
+    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 && state & 0x8 != 0 {
         state = (state & !0x8) | 0x10;
     }
+    let mut clear_buf = [0u8; 24];
+    let clear = pc_clear(clear, &mut clear_buf);
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
         }
     }
-    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`)
+    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`);
+    // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
-    if !buffer && super::vram::gpu_owned(flags) {
+    let mut placed_hr = None;
+    if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
-        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
-            if hr >= 0 && !(*ppv).is_null() {
-                real::note_title_address(*ppv as usize, va as usize);
+        if super::vram::gpu_owned(flags) {
+            if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
+                if hr >= 0 && !(*ppv).is_null() {
+                    if let Some(bytes) = console_bytes {
+                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                    }
+                    real::note_title_address(*ppv as usize, va as usize);
+                }
+                return hr;
             }
-            return hr;
+        } else {
+            placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+    let hr = match placed_hr {
+        Some(hr) => hr,
+        None => {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
+        }
+    };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
@@ -912,10 +937,6 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             w(0x20),
             w(0x30)
         );
-        if hr < 0 {
-            let cf = if clear.is_null() { -1 } else { *(clear as *const i32) };
-            crate::xlog_info!("D3D12.X: … its state {state:#x}, clear value format {cf}, as the PC's {:x?}", &d[..0x34]);
-        }
     }
     hr
 }
@@ -1021,27 +1042,38 @@ mod tests {
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
     }
 
+    /// Console depth buffers become PC ones a shader can view: typeless, the D16S8 family as
+    /// D24S8, no UAV flag; views get the family's readable formats (stencil from plane 1).
     #[test]
-    fn console_depth_buffers_become_pc_ones() {
+    fn console_depth_buffers_and_their_views_are_the_pcs() {
         let mut x = [0u8; 0x38];
         x[0] = 3; // texture 2D
-        x[0x20] = 118; // D16_UNORM_S8_UINT
-        x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes()); // depth + UAV + console bits
-        let d = pc_resource_desc(&x);
-        let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
-        assert_eq!((u(0x20), u(0x30)), (44, 0x2));
-        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes()); // a UAV texture keeps it
-        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x30..0x34].try_into().unwrap()), 0x4);
-        assert_eq!((pc_format(119), pc_format(120), pc_format(28)), (46, 47, 28));
-        for (typed, typeless) in [(20u32, 19u32), (40, 39), (45, 44), (55, 53)] {
-            x[0x20..0x24].copy_from_slice(&typed.to_le_bytes());
-            x[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
-            let d = pc_resource_desc(&x);
-            assert_eq!(u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), typeless);
-        }
-        x[0x20..0x24].copy_from_slice(&86u32.to_le_bytes());
-        x[0x30..0x34].fill(0);
-        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 86, "ordinary packed-colour textures retain their layout");
+        let desc = |x: &[u8; 0x38]| {
+            let d = pc_resource_desc(x);
+            (u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()))
+        };
+        x[0x20] = 118; // D16_UNORM_S8_UINT, depth + UAV + console bits
+        x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes());
+        assert_eq!(desc(&x), (44, 0x2));
+        x[0x20] = 40; // D32_FLOAT depth buffer: typeless
+        x[0x30..0x34].copy_from_slice(&0x2u32.to_le_bytes());
+        assert_eq!(desc(&x), (39, 0x2));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // not a depth buffer: as it is
+        assert_eq!(desc(&x), (40, 0));
+        x[0x20] = 86; // B5G5R5A1 target that is also a UAV
+        x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
+        assert_eq!(desc(&x), (28, 0x5));
+        // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
+        assert_eq!(pc_shader_view_format(44, 45), 46);
+        assert_eq!(pc_shader_view_format(44, 56), 46);
+        assert_eq!(pc_shader_view_format(44, 118), 46);
+        assert_eq!(pc_shader_view_format(44, 120), 47);
+        assert!(stencil_view(44, 47) && !stencil_view(44, 46));
+        assert_eq!(pc_shader_view_format(39, 0), 41);
+        assert_eq!(pc_shader_view_format(19, 62), 22);
+        assert_eq!(pc_shader_view_format(28, 86), 28);
+        assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
+        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
     }
 
     #[test]

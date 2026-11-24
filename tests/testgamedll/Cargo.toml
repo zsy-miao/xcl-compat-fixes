@@ -10,3 +10,6 @@ publish = false
 name = "testgame_mw"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
+# no unit tests: the GNU linker keeps the kernelx.dll import in the test harness's exe,
+# which then does not start (kernelx.dll exists only inside XCL)
+test = false

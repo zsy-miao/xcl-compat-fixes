@@ -162,7 +162,12 @@ impl Uma {
     /// large title reservations and overflow), and window 3 as a smaller committed coherent
     /// window (`OpenExistingHeapFromAddress`) for per-draw arguments and CPU readback buffers.
     pub fn for_runtime(size: usize) -> Option<Uma> {
-        let committed = ((size.min(RUNTIME_COMMITTED_CAP) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
+        Self::for_runtime_with(size, RUNTIME_COMMITTED_CAP)
+    }
+
+    /// `for_runtime` with a coherent window of up to `coherent` bytes (`coherent_hint`).
+    pub fn for_runtime_with(size: usize, coherent: usize) -> Option<Uma> {
+        let committed = ((size.min(coherent.max(RUNTIME_COMMITTED_CAP)) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
         let sparse_len = (MAX_WINDOWS - 1) * WINDOW;
         for slot in (4usize..512).step_by(MAX_WINDOWS) {
             let base = slot << 32;
@@ -263,6 +268,13 @@ impl Uma {
     /// Whether `p` is in a committed window.
     pub fn is_committed(&self, p: usize) -> bool {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
+    }
+
+    /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
+    /// read-write as a whole, so it needs no `VirtualQuery` (which walks a region to its end to
+    /// size it: on a 4 GiB window ~40 ms a call, a retail game's DirectStorage requests crawled).
+    pub fn in_committed_window(&self, p: usize, len: usize) -> bool {
+        len > 0 && self.is_committed(p) && p.checked_add(len - 1).is_some_and(|e| self.window_of(e) == self.window_of(p))
     }
 
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
@@ -654,12 +666,77 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
+/// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
+/// known only once it asks for it, and the window is committed when it is made: its size is
+/// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
+/// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
+fn coherent_file() -> std::path::PathBuf {
+    crate::state::data_dir().join("cache").join("uma_coherent.txt")
+}
+
+/// Bytes the coherent window is made with.
+pub fn coherent_hint() -> usize {
+    if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return (mb << 20).clamp(GRAIN, MAX_SIZE);
+    }
+    let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
+    // and textures (WDDM charges commit for each video-memory allocation too) and the window
+    // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
+    // unified memory: no image) rather than taking the system's commit
+    if title > 0 && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
+        crate::xlog_warn!(
+            "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
+            free_commit() >> 20,
+            NEEDS_FOR_COHERENT_HEAPS >> 20
+        );
+        return RUNTIME_COMMITTED_CAP;
+    }
+    (title + RUNTIME_COMMITTED_CAP).min(MAX_SIZE)
+}
+
+/// Commit free before the title starts for its GPU heaps to go to the coherent window.
+const NEEDS_FOR_COHERENT_HEAPS: usize = 17 << 30;
+
+fn free_commit() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return usize::MAX;
+    }
+    m.ullAvailPageFile as usize
+}
+
+/// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
+/// next run makes the window that large (this one has the size it was made with).
+pub fn note_coherent_need(bytes: usize) {
+    static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let before = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    if bytes > before && NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes {
+        let f = coherent_file();
+        if let Some(d) = f.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(&f, bytes.to_string());
+        crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (a window of up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(MAX_SIZE) >> 20);
+    }
+}
+
+impl Uma {
+    /// The committed coherent window (None: none).
+    pub fn committed_window(&self) -> Option<usize> {
+        (0..MAX_WINDOWS).find(|&k| self.is_committed_window(k))
+    }
+}
+
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048).
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
         .get_or_init(|| {
             let mb = std::env::var("XCL_UMA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
-            let u = Uma::for_runtime(mb << 20);
+            let coherent = coherent_hint();
+            let u = Uma::for_runtime_with((mb << 20).max(coherent), coherent);
             match &u {
                 Some(u) => {
                     let sparse_n = (0..MAX_WINDOWS).filter(|&k| u.is_sparse_window(k)).count();

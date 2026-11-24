@@ -835,6 +835,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
     recomp::dxc::set_memory_reserve(2);
+    // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
+    // `--split` sets both
+    let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
@@ -898,6 +901,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         let code = &f.data[p.offset..p.offset + p.len];
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
+                        let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {

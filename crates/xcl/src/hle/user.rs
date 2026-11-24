@@ -71,6 +71,10 @@ pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 
     if c.is_null() {
         return 0;
     }
+    if (*c).cb_size != std::mem::size_of::<WndClassEx<u8>>() as u32 {
+        windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let c = &*c;
     let mut keep = Vec::new();
     let w = WndClassEx::<u16> {
@@ -180,5 +184,112 @@ unsafe extern "system" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize
             CallWindowProcW(orig, hwnd, msg, wp, lp)
         }
         _ => CallWindowProcW(orig, hwnd, msg, wp, lp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+    #[link(name = "user32")]
+    extern "system" {
+        #[link_name = "RegisterClassExA"]
+        fn native_register_class(c: *const WndClassEx<u8>) -> u16;
+        fn UnregisterClassW(class: *const u16, instance: usize) -> i32;
+        fn GetClassInfoExW(instance: usize, class: *const u16, out: *mut WndClassEx<u16>) -> i32;
+        fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
+    }
+
+    #[test]
+    fn register_class_rejects_invalid_sizes_like_windows() {
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name = c"XclInvalidClassSizeTest";
+            let wide_name = wide(class_name.to_str().unwrap());
+            let mut c = WndClassEx {
+                cb_size: 0, style: 0, wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0, wnd_extra: 0, instance, icon: 0, cursor: 0,
+                background: 0, menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr() as *const u8, icon_small: 0,
+            };
+            let size = std::mem::size_of_val(&c) as u32;
+            let mut results = Vec::new();
+            for bad_size in [0, 1, size - 1, size + 1, u32::MAX] {
+                c.cb_size = bad_size;
+                SetLastError(0x1234_5678);
+                let native_atom = native_register_class(&c);
+                let native_error = GetLastError();
+                if native_atom != 0 {
+                    assert_ne!(UnregisterClassW(wide_name.as_ptr(), instance), 0);
+                }
+                SetLastError(0x1234_5678);
+                let atom = RegisterClassExA(&c);
+                let error = GetLastError();
+                if atom != 0 {
+                    assert_ne!(UnregisterClassW(wide_name.as_ptr(), instance), 0);
+                }
+                eprintln!("cbSize={bad_size}: Windows atom={native_atom:#x}, error={native_error}; XCL atom={atom:#x}, error={error}");
+                results.push((bad_size, native_atom, native_error, atom, error));
+            }
+            for (bad_size, native_atom, native_error, atom, error) in results {
+                assert_eq!(native_atom, 0, "Windows must reject cbSize={bad_size}");
+                assert_eq!(atom, 0, "XCL must reject cbSize={bad_size}");
+                assert_eq!(error, native_error, "cbSize={bad_size}");
+            }
+        }
+    }
+
+    #[test]
+    fn register_class_accepts_valid_size_and_preserves_attributes() {
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name = c"XclValidClassSizeTest";
+            let wide_name = wide(class_name.to_str().unwrap());
+            let c = WndClassEx {
+                cb_size: std::mem::size_of::<WndClassEx<u8>>() as u32,
+                style: 0x3, wnd_proc: DefWindowProcW as usize,
+                cls_extra: 8, wnd_extra: 16, instance, icon: 0, cursor: 0,
+                background: 0, menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr() as *const u8, icon_small: 0,
+            };
+            let atom = RegisterClassExA(&c);
+            assert_ne!(atom, 0, "valid class: error {}", GetLastError());
+            let mut info: WndClassEx<u16> = std::mem::zeroed();
+            info.cb_size = std::mem::size_of_val(&info) as u32;
+            let found = GetClassInfoExW(instance, wide_name.as_ptr(), &mut info);
+            assert_ne!(UnregisterClassW(wide_name.as_ptr(), instance), 0);
+            assert_ne!(found, 0);
+            assert_eq!(info.style, c.style);
+            assert_eq!(info.wnd_proc, c.wnd_proc);
+            assert_eq!(info.cls_extra, c.cls_extra);
+            assert_eq!(info.wnd_extra, c.wnd_extra);
+            assert_eq!(info.instance, instance);
+        }
+    }
+
+    #[test]
+    fn register_class_checks_size_before_reading_remaining_fields() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            // Only the first eight bytes are readable; the remaining fields lie in
+            // the uncommitted second page. Reject cbSize without touching them.
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let committed = VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+            if committed.is_null() {
+                VirtualFree(base, 0, MEM_RELEASE);
+                panic!("commit test page failed");
+            }
+            let c = (base as *mut u8).add(0x1000 - 8).cast::<WndClassEx<u8>>();
+            c.cast::<u32>().write(8);
+            SetLastError(0x1234_5678);
+            let atom = RegisterClassExA(c);
+            let error = GetLastError();
+            VirtualFree(base, 0, MEM_RELEASE);
+            assert_eq!(atom, 0);
+            assert_eq!(error, windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
     }
 }

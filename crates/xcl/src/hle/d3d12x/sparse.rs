@@ -16,7 +16,7 @@
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -211,8 +211,12 @@ struct State {
     rb_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
-    pools: Vec<ID3D12Heap>,
+    /// video-memory pool heaps (None: given back, its index free for the next one)
+    pools: Vec<Option<ID3D12Heap>>,
     free: Vec<(u32, u32)>,
+    /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
+    /// went by (titles' queues may still read what was mapped there)
+    retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
     /// tile address → pool tile + uncommitted page hole mask + per-page sent chunk hashes
     mapped: FxHashMap<usize, TileEntry>,
     /// pool tiles also used by placed buffers (not freed while they are)
@@ -389,8 +393,68 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
-/// commits before the device existed
-static EARLY: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
+pub fn pool_bytes() -> (usize, usize) {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return (0, 0) };
+    let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
+    (pools, pools.saturating_sub(s.free.len() * TILE))
+}
+/// commits before the device existed: the pages committed, as disjoint page ranges (start →
+/// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
+/// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
+/// every page it touches; `init` commits them once the windows exist.
+static EARLY: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The pages `[a, a + n)` touches, as `[start, end)`.
+fn page_span(a: usize, n: usize) -> (usize, usize) {
+    (a & !(PAGE - 1), a.saturating_add(n).saturating_add(PAGE - 1) & !(PAGE - 1))
+}
+
+/// Add the pages `[a, b)` to `early`, merged with the ranges they overlap or touch.
+fn early_add(early: &mut BTreeMap<usize, usize>, mut a: usize, mut b: usize) {
+    if a >= b {
+        return;
+    }
+    if let Some((&s, &e)) = early.range(..=a).next_back() {
+        if e >= a {
+            a = s;
+            b = b.max(e);
+            early.remove(&s);
+        }
+    }
+    loop {
+        let Some((s, e)) = early.range(a..=b).next().map(|(&s, &e)| (s, e)) else { break };
+        b = b.max(e);
+        early.remove(&s);
+    }
+    early.insert(a, b);
+}
+
+/// Take the pages `[a, b)` out of `early`; a range that overlaps it keeps the rest.
+fn early_remove(early: &mut BTreeMap<usize, usize>, a: usize, b: usize) {
+    if a >= b {
+        return;
+    }
+    if let Some((&s, &e)) = early.range(..a).next_back() {
+        if e > a {
+            early.insert(s, a);
+            if e > b {
+                early.insert(b, e);
+                return;
+            }
+        }
+    }
+    loop {
+        let Some((s, e)) = early.range(a..b).next().map(|(&s, &e)| (s, e)) else { break };
+        early.remove(&s);
+        if e > b {
+            early.insert(b, e);
+            break;
+        }
+    }
+}
 /// generation counter incremented whenever the set of mapped tiles changes (for watch_ranges cache)
 static MAPPED_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -462,6 +526,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             windows,
             pools: Vec::new(),
             free: Vec::new(),
+            retired: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             buffers: FxHashMap::default(),
@@ -487,8 +552,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             *STATE.lock().unwrap() = Some(s);
-            for (a, n) in std::mem::take(&mut *EARLY.lock().unwrap()) {
-                committed(a, n);
+            for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
+                committed(a, b - a);
             }
             out
         }
@@ -520,10 +585,45 @@ impl State {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }
-        let h = self.pools.len() as u32;
-        self.pools.push(heap?);
+        let heap = heap?;
+        let h = match self.pools.iter().position(|p| p.is_none()) {
+            Some(i) => {
+                self.pools[i] = Some(heap);
+                i as u32
+            }
+            None => {
+                self.pools.push(Some(heap));
+                self.pools.len() as u32 - 1
+            }
+        };
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
         Some(((h, 0), false))
+    }
+
+    /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
+    /// system's commit: a retail game's homes of physical pages left 0.75 GB of pools for
+    /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
+    fn retire_free_pools(&mut self) {
+        let now = std::time::Instant::now();
+        let done = unsafe { self.fence.GetCompletedValue() };
+        self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+        if self.free.len() < POOL_TILES as usize {
+            return;
+        }
+        let mut count = vec![0u32; self.pools.len()];
+        for &(h, _) in &self.free {
+            count[h as usize] += 1;
+        }
+        let gone: Vec<usize> = (0..count.len()).filter(|&h| count[h] == POOL_TILES && self.pools[h].is_some()).collect();
+        if gone.is_empty() {
+            return;
+        }
+        self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
+        for h in gone {
+            if let Some(heap) = self.pools[h].take() {
+                self.retired.push((heap, self.value, now));
+            }
+        }
     }
 
     /// Map `tiles` (tile addresses) of `res` (starting at `res_base`) onto pool tiles,
@@ -567,7 +667,7 @@ impl State {
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                &self.pools[h as usize],
+                self.pools[h as usize].as_ref().expect("a pool tile of a live pool"),
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -1151,7 +1251,8 @@ pub unsafe fn committed(a: usize, n: usize) {
     }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
-        EARLY.lock().unwrap().push((a, n));
+        let (start, end) = page_span(a, n);
+        early_add(&mut EARLY.lock().unwrap(), start, end);
         return;
     };
     s.ensure_mapped(a, n, |_| 0xFFFF);
@@ -1183,7 +1284,8 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
-        EARLY.lock().unwrap().retain(|&(x, m)| x + m <= a || x >= a + n);
+        let (start, end) = page_span(a, n);
+        early_remove(&mut EARLY.lock().unwrap(), start, end);
         return;
     };
     let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
@@ -1203,6 +1305,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     }
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     s.signal();
+    s.retire_free_pools();
 }
 
 impl State {
@@ -1559,6 +1662,7 @@ mod tests {
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
+                retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
@@ -1674,5 +1778,121 @@ mod tests {
         assert_eq!(u, vec![t3]);
         assert_eq!(free, vec![(0, 13)]);
         assert_eq!(to_zero, vec![(t4, PAGE)], "unrelated mapped tile's to_zero must remain");
+    }
+
+    /// The pages in `early`, checking that its ranges are page-aligned, not empty, disjoint and
+    /// merged (no two touch).
+    fn early_pages(early: &BTreeMap<usize, usize>) -> std::collections::BTreeSet<usize> {
+        let mut last_end = None;
+        let mut pages = std::collections::BTreeSet::new();
+        for (&a, &b) in early {
+            assert!(a % PAGE == 0 && b % PAGE == 0 && a < b, "range {a:#x}..{b:#x}");
+            assert!(last_end.is_none_or(|e| e < a), "range {a:#x}..{b:#x} touches the one before");
+            last_end = Some(b);
+            pages.extend((a..b).step_by(PAGE));
+        }
+        pages
+    }
+
+    /// xorshift64*: the same sequence on every run
+    fn next(x: &mut u64) -> u64 {
+        *x ^= *x >> 12;
+        *x ^= *x << 25;
+        *x ^= *x >> 27;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Before the device exists, commits and decommits leave the pages a plain page set would
+    /// hold, with the live path's rule (a range counts every page it touches): random ranges,
+    /// unaligned too, over 300 pages.
+    #[test]
+    fn early_commits_are_the_pages_a_page_set_holds() {
+        let base = 0x4_2000_0000usize;
+        for seed in 1..=8u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let (mut early, mut model) = (BTreeMap::new(), std::collections::BTreeSet::new());
+            for _ in 0..4000 {
+                let a = base + (next(&mut x) % (300 * PAGE as u64)) as usize;
+                let n = match next(&mut x) % 4 {
+                    0 => PAGE,
+                    1 => 1 + (next(&mut x) % 64) as usize,
+                    _ => 1 + (next(&mut x) % (24 * PAGE as u64)) as usize,
+                };
+                let (start, end) = page_span(a, n);
+                let pages = (start..end).step_by(PAGE);
+                if next(&mut x) % 3 == 0 {
+                    early_remove(&mut early, start, end);
+                    pages.for_each(|p| {
+                        model.remove(&p);
+                    });
+                } else {
+                    early_add(&mut early, start, end);
+                    model.extend(pages);
+                }
+                assert_eq!(early_pages(&early), model, "seed {seed}");
+            }
+        }
+    }
+
+    /// The same pages as the list this replaced, for what that list handled exactly: one
+    /// entry per committed page (`XMemMapPhysicalPagesScatter`, `home_again`) and page-aligned
+    /// decommits of any length.
+    #[test]
+    fn early_commits_match_the_old_list_for_page_entries() {
+        let base = 0x4_2000_0000usize;
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let (mut early, mut old): (BTreeMap<usize, usize>, Vec<(usize, usize)>) = (BTreeMap::new(), Vec::new());
+        for _ in 0..20000 {
+            let a = base + (next(&mut x) % 512) as usize * PAGE;
+            if next(&mut x) % 2 == 0 {
+                old.push((a, PAGE));
+                early_add(&mut early, a, a + PAGE);
+            } else {
+                let n = (1 + next(&mut x) % 8) as usize * PAGE;
+                old.retain(|&(y, m)| y + m <= a || y >= a + n);
+                early_remove(&mut early, a, a + n);
+            }
+        }
+        let old_pages: std::collections::BTreeSet<usize> = old.iter().map(|&(y, _)| y).collect();
+        assert_eq!(early_pages(&early), old_pages);
+    }
+
+    /// A range committed in one call keeps its other pages when one page of it is decommitted
+    /// (`commit_homes` commits several pages, `move_home_away` gives one back). The list this
+    /// replaced dropped the whole entry, so `init` left those still-committed pages as holes.
+    #[test]
+    fn early_decommit_of_one_page_keeps_the_rest() {
+        let a = 0x4_2000_0000usize;
+        let mut early = BTreeMap::new();
+        early_add(&mut early, a, a + 4 * TILE);
+        early_remove(&mut early, a + TILE, a + 2 * TILE);
+        assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
+    /// reverse, before the device exists (`cargo test --release -p xcl --lib --
+    /// --ignored --exact hle::d3d12x::sparse::tests::early_commit_timing --nocapture`,
+    /// `XCL_EARLY_PAGES=16384,32768`). Run it alone: a test that made the device keeps a state.
+    #[test]
+    #[ignore]
+    fn early_commit_timing() {
+        if STATE.lock().unwrap().is_some() {
+            return eprintln!("early_commit_timing: a sparse state exists – run it alone");
+        }
+        let sizes: Vec<usize> = std::env::var("XCL_EARLY_PAGES").ok().map_or(vec![4096, 8192, 16384, 32768], |v| v.split(',').map(|s| s.trim().parse().unwrap()).collect());
+        let base = 0x4_2000_0000usize;
+        for n in sizes {
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                unsafe { committed(base + i * TILE, TILE) };
+            }
+            let commit = t.elapsed();
+            let t = std::time::Instant::now();
+            for i in (0..n).rev() {
+                unsafe { decommitted(base + i * TILE, TILE) };
+            }
+            let decommit = t.elapsed();
+            println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
     }
 }

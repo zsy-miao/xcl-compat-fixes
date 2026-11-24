@@ -616,11 +616,11 @@ unsafe extern "system" fn Heap_GetDesc16(this: *mut NullObj, ret: *mut u8) -> *m
     }
     ret
 }
-unsafe extern "system" fn Heap_GetHandleStart(this: *mut NullObj, ret: *mut u64) -> *mut u64 {
-    if !ret.is_null() {
-        *ret = (*this).value.load(Ordering::Relaxed);
-    }
-    ret
+/// #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code takes the handle in rax
+/// and passes only `this` (as `real::heap_cpu_start_x`); rdx holds whatever the caller left
+/// there, so it must not be written through as the PC's hidden return pointer.
+unsafe extern "system" fn Heap_GetHandleStart(this: *mut NullObj) -> u64 {
+    (*this).value.load(Ordering::Relaxed)
 }
 unsafe extern "system" fn Resource_Map(this: *mut NullObj, _sub: u32, _range: *const c_void, data: *mut *mut c_void) -> HRESULT {
     let mut g = (*this).mem.lock().unwrap();
@@ -791,5 +791,57 @@ mod tests {
             assert_eq!(unknown(dev), 0);
             assert!(crate::stubs::all_stubs().iter().any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
         }
+    }
+
+    /// Console code calls descriptor heap #9 / #10 with only `this` and takes the start in rax;
+    /// rdx is left over from the caller and must not be written (the test title's rdx pointed
+    /// into its read-only .rdata: an access violation under Wine on the null device).
+    #[test]
+    fn heap_start_handles_come_back_in_rax() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let desc = [0u32, 16, 1, 0]; // CBV_SRV_UAV, 16 slots, shader visible
+            let create_heap: Fn4 = std::mem::transmute(slot(dev, 14));
+            let mut heaps = [std::ptr::null_mut(); 2];
+            for h in &mut heaps {
+                assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), h), S_OK);
+            }
+            // the start is the heap's own handle range (CreateDescriptorHeap): not 0, one per heap
+            let base = heaps.map(|h| (*(h as *mut NullObj)).value.load(Ordering::Relaxed));
+            assert_ne!(base[0], 0);
+            assert_ne!(base[0], base[1]);
+            for (h, base) in heaps.into_iter().zip(base) {
+                for i in [9, 10] {
+                    #[cfg(all(target_arch = "x86_64", windows))]
+                    {
+                        let mut sentinel = 0x5A5A_5A5A_5A5A_5A5Au64;
+                        let p = call_with_rdx(slot(h, i), h, &mut sentinel);
+                        assert_eq!(sentinel, 0x5A5A_5A5A_5A5A_5A5A, "slot {i} wrote through rdx");
+                        assert_eq!(p, base, "slot {i} with rdx set");
+                    }
+                    let start: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(slot(h, i));
+                    assert_eq!(start(h), base, "slot {i}");
+                }
+            }
+        }
+    }
+
+    /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.
+    #[cfg(all(target_arch = "x86_64", windows))]
+    unsafe fn call_with_rdx(f: usize, this: *mut c_void, rdx: *mut u64) -> u64 {
+        let ret: u64;
+        // rsp is 16-aligned on entry to the asm block: 32 B of shadow space keep it so at the call
+        core::arch::asm!(
+            "sub rsp, 32",
+            "call {f}",
+            "add rsp, 32",
+            f = in(reg) f,
+            in("rcx") this,
+            in("rdx") rdx,
+            lateout("rax") ret,
+            clobber_abi("system"),
+        );
+        ret
     }
 }

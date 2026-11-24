@@ -1,1 +1,45 @@
 /target
+
+# Game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance"): game
+# packages and archives, console executables and libraries, video, audio banks, textures, dumps.
+# XCL's own synthetic test data lives in tests/data/ and is listed explicitly below.
+*.rpf
+*.xvd
+*.xvc
+*.msixvc
+*.appx
+*.msix
+*.appxbundle
+*.xex
+*.xbe
+*.pak
+*.bk2
+*.bik
+*.ttpf
+*.dds
+*.ktx
+*.ktx2
+*.wem
+*.bnk
+*.exe
+*.dll
+*.pdb
+*.sys
+*.dmp
+*.mdmp
+*.iso
+*.pkg
+*.xsp
+*.cab
+MicrosoftGame.config
+appxmanifest.xml
+resources.pri
+!tests/data/testgame/MicrosoftGame.config
+
+# XCL's run output (logs, reports, frame dumps, shader dumps)
+*.log
+report.json
+frame_*.bmp
+
+# Python bytecode of the scripts
+__pycache__/

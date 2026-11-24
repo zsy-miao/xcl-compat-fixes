@@ -171,6 +171,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 // ---------------------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioStats {
     pub engines: u64,
     pub engine_errors: u64,
@@ -197,6 +198,12 @@ pub struct AudioStats {
     pub source_voice_errors: u64,
     /// console-only flags we dropped, e.g. "XAudio2Create:0x1"
     pub dropped_flags: Vec<String>,
+    /// the console's decoder (xapu, `hle::acphal`): Opus packets decoded, packets that failed (silence
+    /// went out), frames produced, samples that are not 0
+    pub xapu_packets_decoded: u64,
+    pub xapu_decode_errors: u64,
+    pub xapu_frames: u64,
+    pub xapu_nonzero_samples: u64,
 }
 
 static ENGINES: AtomicU64 = AtomicU64::new(0);
@@ -236,6 +243,10 @@ pub fn stats() -> AudioStats {
         buffers_silenced: SILENCED.load(Ordering::Relaxed),
         source_voice_errors: SOURCE_ERRORS.load(Ordering::Relaxed),
         dropped_flags: DROPPED.lock().map(|d| d.clone()).unwrap_or_default(),
+        xapu_packets_decoded: PCM_PACKETS.load(Ordering::Relaxed),
+        xapu_decode_errors: PCM_PACKET_ERRORS.load(Ordering::Relaxed),
+        xapu_frames: PCM_DECODED_FRAMES.load(Ordering::Relaxed),
+        xapu_nonzero_samples: PCM_NONZERO.load(Ordering::Relaxed),
     }
 }
 
@@ -1166,6 +1177,24 @@ unsafe extern "system" fn destroy_voice(this: *mut c_void) {
         h.state.live_buffers.lock().unwrap().clear();
         drop(Box::from_raw(h.cb_ptr as *mut DecodedCallback));
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// the console audio processor's decoder (hle::acphal): what it did, for report.json
+// ---------------------------------------------------------------------------------------
+
+static PCM_DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static PCM_NONZERO: AtomicU64 = AtomicU64::new(0);
+static PCM_PACKETS: AtomicU64 = AtomicU64::new(0);
+static PCM_PACKET_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// What the console decoder (xapu) did: `packets` Opus packets decoded to `frames` frames of which
+/// `nonzero` samples are not 0, `errors` packets that did not decode (silence went out).
+pub fn note_console_decode(packets: u64, errors: u64, frames: u64, nonzero: u64) {
+    PCM_PACKETS.fetch_add(packets, Ordering::Relaxed);
+    PCM_PACKET_ERRORS.fetch_add(errors, Ordering::Relaxed);
+    PCM_DECODED_FRAMES.fetch_add(frames, Ordering::Relaxed);
+    PCM_NONZERO.fetch_add(nonzero, Ordering::Relaxed);
 }
 
 #[cfg(test)]

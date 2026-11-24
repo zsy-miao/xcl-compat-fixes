@@ -1,0 +1,40 @@
+# What a pull request needs before it can be merged (CONTRIBUTING.md, "What a PR needs to be
+# merged"), checked by scripts/pr_check.py from the PR's description and files: the Tested / Not
+# tested / AI use sections, no small / open-weight model named in AI use, no game data or
+# binaries, and – when it changes the runtime – `xcl-smoke` runs on main and on the PR's head.
+#
+# pull_request_target: the workflow and the checker are main's (a PR cannot change what checks
+# it). Nothing of the PR is checked out or run – only its description and file list are read
+# through the API – so its code never runs with this token.
+name: PR checks
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  description:
+    name: PR description
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: scripts/pr_check.py
+          sparse-checkout-cone-mode: false
+      - name: Check the description and files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY: ${{ github.event.pull_request.body }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          printf '%s' "$BODY" > body.md
+          gh api "repos/$REPO/pulls/$NUMBER/files" --paginate \
+            --jq '.[] | [.filename, .status, ((.patch == null) and (.changes == 0)), .sha] | @tsv' > files.tsv
+          python3 scripts/pr_check.py --body body.md --head "$HEAD" --files files.tsv --repo "$REPO"

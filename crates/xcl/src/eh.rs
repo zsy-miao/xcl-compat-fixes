@@ -94,7 +94,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 let d = modules::describe_address(vt);
                 if d.contains('+') { format!(" (vtable {d})") } else { String::new() }
             };
-            let regs = [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp)];
+            let regs = [
+                ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx),
+                ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8),
+                ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12),
+                ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
+            ];
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
@@ -246,6 +251,17 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn is_writable(va: usize, bytes: usize) -> bool {
+    if bytes == 0 || va.checked_add(bytes).is_none() { return false; }
+    crate::hle::kernelx::lazy::ensure(va, bytes);
+    // Preserve the official coherent-window fast path; elsewhere keep the local
+    // current-protection check across every native region in the write span.
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
+    crate::gpu::shader::writable(va, bytes)
+}
+
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
@@ -331,25 +347,65 @@ unsafe fn emulate_sse4a(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug
     true
 }
 
+/// Update the x86-64 arithmetic flags (CF, PF, AF, ZF, SF, OF) for `cmp lhs, rhs`, keeping all
+/// other EFLAGS bits intact.
+fn cmp_eflags(eflags: u32, lhs: u64, rhs: u64) -> u32 {
+    const ARITH: u32 = 0x001 | 0x004 | 0x010 | 0x040 | 0x080 | 0x800;
+    let (res, cf) = lhs.overflowing_sub(rhs);
+    let (_, of) = (lhs as i64).overflowing_sub(rhs as i64);
+    let mut f = eflags & !ARITH;
+    if cf {
+        f |= 0x001;
+    }
+    if (res as u8).count_ones() % 2 == 0 {
+        f |= 0x004;
+    }
+    if (lhs & 0xF) < (rhs & 0xF) {
+        f |= 0x010;
+    }
+    if res == 0 {
+        f |= 0x040;
+    }
+    if (res as i64) < 0 {
+        f |= 0x080;
+    }
+    if of {
+        f |= 0x800;
+    }
+    f
+}
+
+/// How many of the `most` code bytes at `rip`, where an instruction just raised an exception,
+/// are there to read. The page `rip` is on is – the instruction was fetched from it – so only
+/// bytes on the next page are asked about. `readable` asks `VirtualQuery`, which walks a region
+/// to its end to size it: for a title's code section at every emulated instruction, twice.
+unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
+    let in_page = 0x1000 - (rip & 0xFFF);
+    if in_page >= most {
+        return most;
+    }
+    (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
 unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> i32 {
     use crate::insn::ConsoleOnly;
     let rip = ctx.Rip as usize;
-    if modules::image_base_for_addr(rip).is_none() || !crate::gpu::shader::readable(rip, 1) {
+    if modules::image_base_for_addr(rip).is_none() {
         return 0;
     }
-    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
-    static SEEN: std::sync::Mutex<Vec<ConsoleOnly>> = std::sync::Mutex::new(Vec::new());
+    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock() {
-        if !seen.contains(&what) {
-            seen.push(what);
+        if !seen.contains(&std::mem::discriminant(&what)) {
+            seen.push(std::mem::discriminant(&what));
             if what == ConsoleOnly::Ud2 {
                 crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
             } else {
@@ -357,22 +413,65 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             }
         }
     }
+    let mut step = len;
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
             if emulate_clwb_loop(ctx, code) { return -1; }
-        }
-        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
-        ConsoleOnly::Clzero => {
-            if emulate_clzero_loop(ctx, code) {
-                return -1;
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            let mut old = 0u32;
+            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
+                let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
+                code.fill(0x90);
+                unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
-            let line = (ctx.Rax as usize) & !63;
-            crate::hle::kernelx::lazy::ensure(line, 64);
-            if crate::gpu::shader::writable(line, 64) {
+        }
+        ConsoleOnly::Monitorx => {}
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+        }
+        ConsoleOnly::Clzero => {
+            // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
+            // is at EAX, zero-extended – as a Zen 5 runs it
+            let a32 = code[..len - 3].contains(&0x67);
+            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
+            if is_writable(line, 64) {
                 std::ptr::write_bytes(line as *mut u8, 0, 64);
             } else {
                 return 0; // the real instruction faults there too
+            }
+        }
+        ConsoleOnly::ClzeroLoop { end_reg } => {
+            if emulate_clzero_loop(ctx, code) { return -1; }
+            let regs: [&u64; 16] = [
+                &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
+                &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,
+            ];
+            let end = *regs[end_reg as usize & 15];
+            let start = ctx.Rax;
+            let line = (start as usize) & !63;
+            let fast = (end > start && ctx.EFlags & 0x100 == 0)
+                .then(|| (end - start).div_ceil(64).checked_mul(64))
+                .flatten()
+                .filter(|&b| b < 2 * 1024 * 1024 * 1024)
+                .and_then(|b| {
+                    let bytes = usize::try_from(b).ok()?;
+                    line.checked_add(bytes)?;
+                    Some((bytes, start.checked_add(b)?))
+                });
+            match fast {
+                Some((bytes, final_rax)) if is_writable(line, bytes) => {
+                    std::ptr::write_bytes(line as *mut u8, 0, bytes);
+                    ctx.Rax = final_rax;
+                    ctx.EFlags = cmp_eflags(ctx.EFlags, final_rax, end);
+                }
+                _ if is_writable(line, 64) => {
+                    // Fall back to stepping the single `clzero` (len - 9) so the title's own
+                    // `add / cmp / jb` runs natively for end <= start, huge/wrapping, or partial ranges.
+                    std::ptr::write_bytes(line as *mut u8, 0, 64);
+                    step = len - 9;
+                }
+                _ => return 0,
             }
         }
         ConsoleOnly::Rdpru => {
@@ -394,7 +493,7 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             if !emulate_sse4a(ctx, what) { return 0; }
         }
     }
-    ctx.Rip += len as u64;
+    ctx.Rip += step as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -419,6 +518,31 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
     }
     if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
         return emulate_console_only(&mut *(*info).ContextRecord);
+    }
+    // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
+    // title's handlers – a title whose own crash filter ends the process leaves no other trace
+    if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FAULTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 32 {
+            let c = &*(*info).ContextRecord;
+            let op = match rec.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "?",
+            };
+            crate::xlog_warn!(
+                "access violation ({op} at {:#x}) in {}; rax={:#x} rcx={:#x} rdx={:#x} r8={:#x}; on the stack: {}",
+                rec.ExceptionInformation[1],
+                modules::describe_address(rec.ExceptionAddress as usize),
+                c.Rax,
+                c.Rcx,
+                c.Rdx,
+                c.R8,
+                stack_callers(c.Rsp as usize)
+            );
+        }
     }
     if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
         return 0;
@@ -1159,5 +1283,156 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
+    /// the 32-bit address: only the 32-bit one's line is zeroed.
+    #[test]
+    fn clzero_with_an_address_size_prefix_zeroes_at_eax() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let alloc = |at: usize| unsafe { VirtualAlloc(at as *const _, 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        let low = (1..64).map(|n| alloc(n << 26)).find(|&p| p != 0).expect("a buffer below 4 GiB");
+        let high = (1..256).map(|n| alloc(low + (n << 32))).find(|&p| p != 0).expect("a buffer at low + n << 32");
+        let code = alloc(0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_a32.exe".into(), path: "clzero_a32.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // alone, and as the first of a loop to rdx (add rax, 0x40; cmp rax, rdx; jb back to the 0F)
+        for bytes in [&[0x67u8, 0x0F, 0x01, 0xFC][..], &[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+                std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
+                std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx) = (code as u64, (high + 0x47) as u64, (high + 0x100) as u64);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 4);
+                let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
+                assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
+                assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+            }
+        }
+        modules::unregister_mapped(code);
+    }
+
+    #[test]
+    fn cmp_eflags_matches_x86_64_sub_flags() {
+        // equal: ZF=1, PF=1 (0 has even parity), CF=AF=SF=OF=0; IF (0x200) preserved
+        assert_eq!(cmp_eflags(0x202 | 0x891, 0x100, 0x100), 0x202 | 0x040 | 0x004);
+        // 0xD0 - 0xC0 = 0x10 (1 one-bit -> PF=0): all arithmetic flags 0
+        assert_eq!(cmp_eflags(0x202 | 0x8D5, 0xD0, 0xC0), 0x202);
+        // unsigned borrow + AF + SF: 0x00 - 0x01 = -1 (0xFF has 8 one-bits -> PF=1)
+        assert_eq!(cmp_eflags(0x202, 0, 1), 0x202 | 0x001 | 0x004 | 0x010 | 0x080);
+        // signed overflow: i64::MIN - 1 = i64::MAX (0xFF -> PF=1, AF=1, OF=1, CF=0, SF=0)
+        assert_eq!(cmp_eflags(0x202, 0x8000_0000_0000_0000, 1), 0x202 | 0x004 | 0x010 | 0x800);
+    }
+
+    #[test]
+    fn clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        let alloc = || unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        let (buf, code) = (alloc(), alloc());
+        assert_ne!(buf, 0);
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_loop_test.exe".into(), path: "clzero_loop_test.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // clzero; add rax, 0x40; cmp rax, rdx; jb -12
+        let loop_bytes: [u8; 12] = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), code as *mut u8, loop_bytes.len());
+
+            // 1) Aligned exact multiple: [0x40..0x100), Rax -> 0x100, ZF=1, CF=0
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x40) as u64, (buf + 0x100) as u64, 0x202 | 0x001);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.Rax, (buf + 0x100) as u64);
+            assert_eq!(ctx.EFlags, 0x202 | 0x040 | 0x004);
+            let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+            assert!(s[..0x40].iter().all(|&b| b == 0xA5));
+            assert!(s[0x40..0x100].iter().all(|&b| b == 0));
+            assert!(s[0x100..0x140].iter().all(|&b| b == 0xA5));
+
+            // 2) Unaligned start + non-64B-multiple length: start = +0x50, end = +0xC0 -> 2 cache lines [0x40..0xC0), Rax -> +0xD0, ZF=0, CF=0
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            ctx = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x50) as u64, (buf + 0xC0) as u64, 0x202 | 0x041);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.Rax, (buf + 0xD0) as u64);
+            assert_eq!(ctx.EFlags, 0x202);
+            let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+            assert!(s[..0x40].iter().all(|&b| b == 0xA5));
+            assert!(s[0x40..0xC0].iter().all(|&b| b == 0));
+            assert!(s[0xC0..0x140].iter().all(|&b| b == 0xA5));
+
+            // 3) end <= start: executes the single first clzero line [0x40..0x80) and steps only 3 bytes so add/cmp/jb runs natively
+            for end in [buf + 0x40, buf] {
+                std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+                ctx = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x53) as u64, end as u64, 0x202);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 3);
+                assert_eq!(ctx.Rax, (buf + 0x53) as u64);
+                let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+                assert!(s[..0x40].iter().all(|&b| b == 0xA5));
+                assert!(s[0x40..0x80].iter().all(|&b| b == 0));
+                assert!(s[0x80..0x140].iter().all(|&b| b == 0xA5));
+            }
+        }
+        modules::unregister_mapped(code);
+        unsafe {
+            VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The code bytes of an instruction that raised an exception: its own page without asking,
+    /// the next page only as far as it is there – and an instruction that ends its page, with
+    /// nothing mapped after it, is still emulated.
+    #[test]
+    fn code_bytes_on_the_instructions_page_are_not_asked_about() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let buf = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(code != 0 && buf != 0);
+            // 16 bytes or more left on the page; fewer, with the next page there
+            assert_eq!(code_bytes_at(code + 0x100, 16), 16);
+            assert_eq!(code_bytes_at(code + 0xFF0, 16), 16);
+            assert_eq!(code_bytes_at(code + 0xFFD, 16), 16);
+            // … and with the next page not there: what is left of this one
+            assert_ne!(VirtualFree((code + 0x1000) as *mut _, 0x1000, MEM_DECOMMIT), 0);
+            assert_eq!(code_bytes_at(code + 0xFFD, 16), 3);
+            assert_eq!(code_bytes_at(code + 0xFFF, 16), 1);
+            assert_eq!(code_bytes_at(code + 0x800, 16), 16);
+
+            // clzero in the last three bytes of the page
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "page_end.exe".into(), path: "page_end.exe".into(), base: code, size: 0x2000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            std::ptr::copy_nonoverlapping([0x0Fu8, 0x01, 0xFC].as_ptr(), (code + 0xFFD) as *mut u8, 3);
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x100);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax) = ((code + 0xFFD) as u64, (buf + 0x47) as u64);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip as usize, code + 0x1000);
+            let b = std::slice::from_raw_parts(buf as *const u8, 0x100);
+            assert!(b[0x40..0x80].iter().all(|&x| x == 0) && b[..0x40].iter().chain(&b[0x80..]).all(|&x| x == 0xA5));
+            modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+            VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
     }
 }

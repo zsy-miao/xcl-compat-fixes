@@ -360,10 +360,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         if std::env::var_os("XCL_SKIP_CPU_CHECK").is_some() {
             println!("  WARNING: this CPU lacks {} (XCL_SKIP_CPU_CHECK set, continuing)", missing.join(", "));
         } else {
-            eprintln!(
-                "xcl: this CPU lacks {}: Xbox Series X|S games are compiled for the console's Zen 2 CPU\n     and need them (they would stop with an illegal instruction). XCL_SKIP_CPU_CHECK=1 runs anyway.",
-                missing.join(", ")
-            );
+            eprintln!("xcl: {}", format_missing_cpu_message(&missing));
             return 2;
         }
     }
@@ -384,28 +381,53 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     code as i32
 }
 
+/// Formats a friendly error message listing the missing console Zen 2 CPU features.
+pub fn format_missing_cpu_message(missing: &[&str]) -> String {
+    format!(
+        "this CPU lacks {}: Xbox Series X|S games are compiled for the console's Zen 2 CPU\n     and need them (they would stop with an illegal instruction). XCL_SKIP_CPU_CHECK=1 runs anyway.",
+        missing.join(", ")
+    )
+}
+
+/// Helper to evaluate CPU features using a query closure, returning missing feature names.
+pub fn check_cpu_features<F: Fn(&str) -> bool>(has: F) -> Vec<&'static str> {
+    const REQUIRED: &[(&str, &str)] = &[
+        ("sse4.2", "SSE4.2"),
+        ("popcnt", "POPCNT"),
+        ("avx", "AVX"),
+        ("avx2", "AVX2"),
+        ("fma", "FMA"),
+        ("f16c", "F16C"),
+        ("bmi1", "BMI1"),
+        ("bmi2", "BMI2"),
+        ("lzcnt", "LZCNT"),
+        ("movbe", "MOVBE"),
+    ];
+    let mut missing = Vec::new();
+    for &(feature, name) in REQUIRED {
+        if !has(feature) {
+            missing.push(name);
+        }
+    }
+    missing
+}
+
 /// Instruction set extensions of the console's Zen 2 that this CPU does not have (titles are
 /// compiled for them: AVX2, FMA, F16C, BMI1 / BMI2, LZCNT, POPCNT, MOVBE, SSE4.2).
 pub fn missing_console_cpu_features() -> Vec<&'static str> {
-    let mut missing = Vec::new();
-    macro_rules! need {
-        ($($feature:tt => $name:literal),* $(,)?) => {
-            $(if !std::arch::is_x86_feature_detected!($feature) { missing.push($name); })*
-        };
-    }
-    need!(
-        "sse4.2" => "SSE4.2",
-        "popcnt" => "POPCNT",
-        "avx" => "AVX",
-        "avx2" => "AVX2",
-        "fma" => "FMA",
-        "f16c" => "F16C",
-        "bmi1" => "BMI1",
-        "bmi2" => "BMI2",
-        "lzcnt" => "LZCNT",
-        "movbe" => "MOVBE",
-    );
-    missing
+    check_cpu_features(|f| match f {
+        "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
+        "popcnt" => std::arch::is_x86_feature_detected!("popcnt"),
+        "avx" => std::arch::is_x86_feature_detected!("avx"),
+        "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+        "fma" => std::arch::is_x86_feature_detected!("fma"),
+        "f16c" => std::arch::is_x86_feature_detected!("f16c"),
+        "bmi1" => std::arch::is_x86_feature_detected!("bmi1"),
+        "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
+        "lzcnt" => std::arch::is_x86_feature_detected!("lzcnt"),
+        "movbe" => std::arch::is_x86_feature_detected!("movbe"),
+        _ => false,
+    })
 }
 
 fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
@@ -453,6 +475,10 @@ fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
     if let Some(r) = report.as_mut() {
         r.exit_code = Some(code as i64);
         r.environment = environment.to_vec();
+        if r.dxc.dir.is_empty() {
+            // the game compiled nothing: the DXC the checks above found for it
+            r.dxc = crate::gpu::recomp::dxc::toolchain();
+        }
         let _ = std::fs::write(&path, serde_json::to_string_pretty(r).unwrap_or_default());
     }
     println!();
@@ -644,5 +670,42 @@ mod tests {
         assert_eq!(quote("C:\\Games\\My Game\\a.exe"), "\"C:\\Games\\My Game\\a.exe\"");
         assert_eq!(quote("say \"hi\""), "\"say \\\"hi\\\"\"");
         assert_eq!(quote(""), "\"\"");
+    }
+
+    #[test]
+    fn cpu_feature_detection_identifies_missing_features() {
+        let all_present = check_cpu_features(|_| true);
+        assert!(all_present.is_empty());
+
+        let none_present = check_cpu_features(|_| false);
+        assert_eq!(
+            none_present,
+            vec!["SSE4.2", "POPCNT", "AVX", "AVX2", "FMA", "F16C", "BMI1", "BMI2", "LZCNT", "MOVBE"]
+        );
+
+        let missing_avx2 = check_cpu_features(|f| f != "avx2");
+        assert_eq!(missing_avx2, vec!["AVX2"]);
+
+        let missing_fma = check_cpu_features(|f| f != "fma");
+        assert_eq!(missing_fma, vec!["FMA"]);
+
+        let missing_bmi = check_cpu_features(|f| f != "bmi1" && f != "bmi2");
+        assert_eq!(missing_bmi, vec!["BMI1", "BMI2"]);
+
+        let missing_zen2_subset = check_cpu_features(|f| {
+            !["avx2", "fma", "bmi1", "bmi2", "popcnt", "sse4.2", "lzcnt"].contains(&f)
+        });
+        assert_eq!(
+            missing_zen2_subset,
+            vec!["SSE4.2", "POPCNT", "AVX2", "FMA", "BMI1", "BMI2", "LZCNT"]
+        );
+    }
+
+    #[test]
+    fn missing_cpu_message_format() {
+        let msg = format_missing_cpu_message(&["AVX2", "FMA", "BMI1", "BMI2", "POPCNT", "SSE4.2", "LZCNT"]);
+        assert!(msg.contains("this CPU lacks AVX2, FMA, BMI1, BMI2, POPCNT, SSE4.2, LZCNT"));
+        assert!(msg.contains("Zen 2 CPU"));
+        assert!(msg.contains("XCL_SKIP_CPU_CHECK=1"));
     }
 }

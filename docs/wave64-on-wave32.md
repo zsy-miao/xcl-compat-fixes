@@ -236,8 +236,17 @@ primitive's edge) a lane that was not launched loses what `v_writelane` put ther
 shaders of the pack (3 540 reads) spill to lanes < 32.
 
 The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`), so a driver that
-picks 64 lanes runs the program as before. Without `split_wave64` (a GPU with 64-lane waves)
-nothing changes: the HLSL of every program of the pack is identical to the one before
+picks 64 lanes runs the program as before.
+
+Which GPUs get the form: every GPU whose wave range includes 32 (`pso::graphics_wave32`), not
+only those without 64-lane waves. D3D12 has no `WaveSize` for graphics shaders, so the driver
+picks, and an RDNA2 driver (RX 6600 XT, issue #42) runs a wave64 PS in waves of 32 although it
+reports 32–64: without the form, `v_readlane` 32 wrapped to lane 0 there
+(`gpu_wave64_ps_whole_wave_reductions` summed twice). Compute, mesh and geometry programs set
+`[WaveSize(64)]` and still get the split form only on GPUs without 64-lane waves.
+
+On a GPU with 64-lane waves only, nothing changes: the HLSL of every program of the pack is
+identical to the one before
 (`retail_wave64_graphics_lane_forms` prints digests of the native form, and of the other modes'
 32-lane form, to compare builds).
 

@@ -11,9 +11,10 @@
 //! dropped), the XGameUi dialogs that do not take a user –, refuses XStore, app broadcast and
 //! app capture (the thunk then returns its "API not available" error), and passes everything
 //! else to the PC's own XGameRuntime (`System32\xgameruntime.dll`: the same classes under the
-//! same GUIDs) – XTaskQueue / XAsync, XThread, XNetworking, XGameInvite… Once the PC runtime is
-//! in use, the queues and async blocks are its own, so XCL's async APIs run on its XAsync
-//! (`xasync::use_pc`). Nothing that takes an XCL user handle goes to the PC runtime: it does not
+//! same GUIDs) – XTaskQueue / XAsync, XThread, XGameInvite… (XNetworking is always XCL's). Once
+//! the PC runtime is in use, the queues and async blocks are its own, so XCL's async APIs run on
+//! its XAsync (`xasync::use_pc`); without `System32\xgameruntime.dll`, XAsync / XTaskQueue /
+//! XThread fall back to XCL's own. Nothing that takes an XCL user handle goes to the PC runtime: it does not
 //! validate foreign handles.
 //!
 //! Layout: `gdk_table` (extracted from the public PC GDK's thunk library) gives every
@@ -138,7 +139,7 @@ fn pc() -> Option<&'static Pc> {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
         let h = LoadLibraryExW(crate::util::wide("xgameruntime.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if h.is_null() {
-            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XTaskQueue/XAsync and the other APIs XCL does not implement are unavailable");
+            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XCL's own XTaskQueue/XAsync are used; dialogs, text entry, game invites, game streaming and the other APIs XCL does not implement are unavailable");
             return None;
         }
         let f = |n: &str| GetProcAddress(h, format!("{n}\0").as_ptr()).map(|p| p as usize);
@@ -372,6 +373,8 @@ unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, ou
         return S_OK;
     }
     *out = std::ptr::null_mut();
+    // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
+    crate::xlog_warn!("XGameRuntime: {} QueryInterface({}) refused (E_NOINTERFACE) – an interface version XCL's GDK table does not know?", f.name, *iid);
     E_NOINTERFACE
 }
 
@@ -1665,28 +1668,49 @@ mod tests {
         let max_slot = table().map(|r| r.3).max().unwrap_or(0);
         assert!(max_slot < SLOTS, "SLOTS={SLOTS} truncates slot {max_slot}");
 
+        // A slot is compared with the function the main vtable binds to the same name, not with
+        // `f as usize`: a function has no single address (`std::ptr::fn_addr_eq`), and the
+        // windows-gnu build has two copies of `register_token4`, one in each codegen unit.
+        let bound = |o: &Obj, slot: usize, name: &str| {
+            assert_eq!(o.iface.names[slot], Some(name), "{} slot {slot}", o.iface.name);
+            assert_ne!(o.targets[slot], 0, "{} slot {slot} ({name}) has no function", o.iface.name);
+            o.targets[slot]
+        };
+        let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
+        let main_fn = |name: &str| bound(pm, slot_in_table(name).2, name);
+
         // XPackage v1 (be3f3e9f): XPackageEnumeratePackages is at slot 28.
         let p1 = own(&XPACKAGE, &XPACKAGE_V1_IID).expect("XPackage v1");
         assert!(!p1.iface.main);
-        assert_eq!(p1.targets[28], enumerate_packages as usize);
+        assert_eq!(bound(p1, 28, "XPackageEnumeratePackages"), main_fn("XPackageEnumeratePackages"));
 
         // XPackage v2 (f92d8712): EnumeratePackages @ 35, RegisterPackageInstalled @ 36.
         let p2 = own(&XPACKAGE, &XPACKAGE_V2_IID).expect("XPackage v2");
         assert!(!p2.iface.main);
-        assert_eq!(p2.targets[35], enumerate_packages as usize);
-        assert_eq!(p2.targets[36], register_token4 as usize);
+        assert_eq!(bound(p2, 35, "XPackageEnumeratePackages"), main_fn("XPackageEnumeratePackages"));
+        assert_eq!(bound(p2, 36, "XPackageRegisterPackageInstalled"), main_fn("XPackageRegisterPackageInstalled"));
+
+        // ... and through the vtable, as a title calls it: v2's slot 36 hands out a new token
+        // each time (register_token4); v1 has nothing at slot 36.
+        let register = |o: &Obj, token: *mut u64| unsafe {
+            slot::<Fwd>(o as *const Obj as *mut c_void, 36)(o, 0, 0, 0, token as usize, 0, 0, 0, 0, 0) as u32 as HRESULT
+        };
+        let (mut t1, mut t2) = (0u64, 0u64);
+        assert_eq!(register(p2, &mut t1), S_OK);
+        assert_eq!(register(p2, &mut t2), S_OK);
+        assert!(t1 != 0 && t2 > t1, "tokens {t1}, {t2}");
+        assert_eq!(register(p2, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(register(p1, &mut t1), E_NOTIMPL);
 
         // XPackage main: XPackageGetIdentifier at slot 27.
-        let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
-        assert_eq!(pm.targets[27], XPackageGetIdentifier as usize);
+        bound(pm, 27, "XPackageGetIdentifier");
 
         // XSystem v3 (6fd71f09): XSystemGetAppSpecificDeviceId is at slot 4 (not SandboxId).
         let s3 = own(&XSYSTEM, &XSYSTEM_V3_IID).expect("XSystem v3");
         assert!(!s3.iface.main);
-        assert_eq!(s3.targets[4], XSystemGetAppSpecificDeviceId as usize);
         let sm = own(&XSYSTEM, &XSYSTEM).expect("XSystem main");
-        assert_eq!(sm.targets[4], XSystemGetXboxLiveSandboxId as usize);
-        assert_eq!(sm.targets[5], XSystemGetAppSpecificDeviceId as usize);
+        bound(sm, 4, "XSystemGetXboxLiveSandboxId");
+        assert_eq!(bound(s3, 4, "XSystemGetAppSpecificDeviceId"), bound(sm, 5, "XSystemGetAppSpecificDeviceId"));
 
         // Compatible alias IIDs resolve cleanly to their main vtables.
         assert!(own(&XUSER, &XUSER_V2_IID).unwrap().iface.iids.contains(&XUSER_V2_IID));

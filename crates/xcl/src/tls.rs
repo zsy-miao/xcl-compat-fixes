@@ -335,7 +335,9 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
     for (arr, block) in carriers {
         *arr = block;
     }
-    *title_index = 0;
+    if !title_index.is_null() {
+        *title_index = 0;
+    }
     if let Ok(images) = IMAGES.read() {
         for img in images.iter().filter(|i| i.name == img_name) {
             img.index.store(0, Ordering::Release);
@@ -488,7 +490,9 @@ pub unsafe fn install(
     if index == NO_INDEX {
         return Err("Windows did not allocate a TLS slot for the carrier (TLS directory ignored)".into());
     }
-    *index_ptr = index;
+    if !index_ptr.is_null() {
+        *index_ptr = index;
+    }
     img.index.store(index, Ordering::Release);
     let n = fill_existing_threads(&img, index);
     crate::xlog_info!(
@@ -591,5 +595,20 @@ mod tests {
         .join()
         .unwrap();
         assert!(ok);
+    }
+
+    #[test]
+    fn install_without_an_index_variable() {
+        let dir = std::env::temp_dir().join(format!("xcl_tls_test_noidx_{}", std::process::id()));
+        let template: &'static [u8; 16] = Box::leak(Box::new([0xA5u8; 16]));
+        let idx = unsafe {
+            install("unit-noidx", template.as_ptr() as usize, 16, 0x1000, std::ptr::null_mut(), &dir).unwrap()
+        };
+        assert_ne!(idx, NO_INDEX);
+        unsafe {
+            let b = tls_block_of(current_teb(), idx);
+            assert!(!b.is_null());
+            assert_eq!(std::slice::from_raw_parts(b, 16), &template[..]);
+        }
     }
 }

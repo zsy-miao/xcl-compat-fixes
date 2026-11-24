@@ -59,6 +59,10 @@ pub struct Config {
     pub raytracing: String,
     pub window_width: u32,
     pub window_height: u32,
+    /// The XCL window's position: "auto" (CW_USEDEFAULT – Windows may place it on any monitor),
+    /// "center" (the primary monitor's work area), or "x,y" (top-left of the window, screen
+    /// coordinates; clamped into the nearest monitor's work area). `XCL_WINDOW_POS` overrides.
+    pub window_pos: String,
     /// Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token (for a backend of
     /// your own that accepts it). Off: the request fails as on a console that cannot reach Xbox
     /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
@@ -79,6 +83,8 @@ impl Config {
     pub fn resolve(&mut self, manifest: Option<&crate::manifest::Manifest>) -> Vec<String> {
         let mut from = Vec::new();
         let series_s = self.is_series_s();
+        // "Auto" / "Advanced" in xcl.toml: read in any case, as device_type and the manifest (#106)
+        self.title_memory = self.title_memory.trim().to_ascii_lowercase();
         if self.title_memory == "auto" {
             let m = manifest.and_then(|m| if series_s { m.lockhart_memory.clone() } else { m.anaconda_memory.clone() });
             if let Some(m) = &m {
@@ -124,6 +130,14 @@ impl Config {
 pub const PLS_MOUNT_TARGET: &str = "{data}\\pls";
 
 impl Config {
+    pub(crate) fn pls_quota_bytes(&self) -> u64 {
+        match self.pls_mb {
+            0 => 4096,
+            mb => mb,
+        }
+        .saturating_mul(1024 * 1024)
+    }
+
     /// The console drive the title is given as its persistent local storage root ("S:\"):
     /// the drive-letter mount onto `{data}\pls`. None when the mounts have no such drive.
     pub fn pls_drive(&self) -> Option<String> {
@@ -173,6 +187,7 @@ impl Default for Config {
             raytracing: "auto".into(),
             window_width: 1280,
             window_height: 720,
+            window_pos: "auto".into(),
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
@@ -351,6 +366,16 @@ mod tests {
         let mut c = Config::default();
         c.resolve(Some(&manifest));
         assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("standard", 13_824));
+    }
+
+    #[test]
+    fn title_memory_is_read_in_any_case() {
+        let manifest = crate::manifest::Manifest { anaconda_memory: Some("Advanced".into()), ..Default::default() };
+        for (setting, m) in [("Auto", Some(&manifest)), ("ADVANCED", None)] {
+            let mut c = Config { title_memory: setting.into(), ..Config::default() };
+            c.resolve(m);
+            assert_eq!((c.title_memory.as_str(), c.uma_mb), ("advanced", 4095), "{setting}");
+        }
     }
 
     #[test]

@@ -446,19 +446,27 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
+/// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
+/// registers. None: not a console compute shader.
+pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    if let Some(f) = fspx(blob) {
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(cs.user_sgprs),
+        _ => None,
+    }
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
-        let r = f.rsrc2;
-        let cs = super::CsInterface {
-            threads: f.threads,
-            user_sgprs: (r >> 1) & 31,
-            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
-            tg_size: (r >> 10) & 1 == 1,
-            tid_components: ((r >> 11) & 3) + 1,
-        };
+        let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
         let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
@@ -548,23 +556,36 @@ pub fn split_wave64_forced() -> bool {
     std::env::var("XCL_SPLIT_WAVE64").is_ok_and(|v| v == "1")
 }
 
-pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
-    if split_wave64_forced() {
-        return true;
-    }
+/// Whether a wave64 VS / PS can run in 32-lane waves on the adapter: D3D12 has no `WaveSize`
+/// for graphics shaders, so the driver picks, and one whose range includes 32 may pick 32 –
+/// an RDNA2 driver (RX 6600 XT, issue #42) runs pixel shaders in waves of 32 although it
+/// reports 32–64. Such a VS / PS needs the `upper_lanes` form (`Options::split_wave64`), which
+/// checks the wave size at run time, so a driver that picks 64 lanes runs it as before.
+pub fn graphics_wave32(wave_min: u32, wave_max: u32) -> bool {
+    wave32_only(wave_min, wave_max) || wave_min <= 32
+}
+
+/// The device's wave lane range; `None` when it cannot be asked.
+fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    if unsafe {
+    unsafe {
         device.CheckFeatureSupport(
             D3D12_FEATURE_D3D12_OPTIONS1,
             &mut options as *mut _ as _,
             std::mem::size_of_val(&options) as u32,
         )
     }
-    .is_err()
-    {
-        return true;
-    }
-    wave32_only(options.WaveLaneCountMin, options.WaveLaneCountMax)
+    .ok()
+    .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
+    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| wave32_only(min, max))
+}
+
+/// `graphics_wave32` for the device: the split flag for a wave64 VS / PS. Unknown: assume so.
+pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
+    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
@@ -573,6 +594,17 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
     let record = g.record();
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
     finish_two_pass(translation, record, ps)
+}
+
+/// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
+/// console VS `vs` (its container): `emit::rect_list_gs` for the VS's output signature, which
+/// is what the translated VS's output struct is declared from.
+pub fn rect_list_gs(vs: &[u8]) -> Result<Vec<u8>, String> {
+    let outputs = crate::gpu::dxbc::signatures(vs).1;
+    if outputs.is_empty() {
+        return Err("the VS has no output signature".into());
+    }
+    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs), "main", "gs_6_6")?.0)
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.

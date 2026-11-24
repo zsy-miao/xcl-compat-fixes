@@ -32,6 +32,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::util::HRESULT;
 
+#[cfg(test)]
+#[path = "vram_gpu_tests.rs"]
+mod gpu_regression_tests;
+
 /// A heap of video memory for placements at title addresses `[base, base + size)`.
 struct Arena<H> {
     base: usize,
@@ -178,7 +182,16 @@ struct Page {
     idle_since: Option<std::time::Instant>,
 }
 
-/// The title's pages of video memory for GPU-owned textures (see the module's comment).
+struct Target {
+    va: usize,
+    console_bytes: Option<u64>,
+    total: u32,
+    mapped: bool,
+    used: Vec<usize>,
+    used_extra: Vec<(usize, usize)>,
+}
+
+/// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
     /// signalled after each mapping; title queues wait for it before their next work
@@ -190,8 +203,11 @@ struct Pages {
     cooling: std::collections::VecDeque<(Tile, std::time::Instant)>,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
-    /// target → (the title pages it uses, tiles of its own past the title's memory)
-    targets: std::collections::HashMap<usize, (Vec<usize>, Vec<Tile>)>,
+    /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
+    /// address share them without aliasing unrelated addresses
+    extra_pages: std::collections::HashMap<(usize, usize), Page>,
+    /// resource → its mapping metadata and currently held pages / extra keys
+    targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
 }
@@ -199,8 +215,8 @@ struct Pages {
 // D3D12 objects are free-threaded
 unsafe impl Send for Pages {}
 
-/// None inside: no pages on this device (not tried yet: the outer None)
-static PAGES: Mutex<Option<Option<Pages>>> = Mutex::new(None);
+/// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
+static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
@@ -213,7 +229,7 @@ impl Pages {
         }
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-        crate::xlog_info!("D3D12.X: GPU-owned textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
+        crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
             fence,
@@ -222,19 +238,25 @@ impl Pages {
             free: Vec::new(),
             cooling: std::collections::VecDeque::new(),
             pages: std::collections::HashMap::new(),
+            extra_pages: std::collections::HashMap::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
         })
     }
 
-    /// Pages no target used for `IDLE` go back to the pools.
-    fn sweep(&mut self, now: std::time::Instant) {
-        let old: Vec<usize> = self.pages.iter().filter(|(_, p)| p.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)).map(|(&a, _)| a).collect();
-        for a in old {
-            if let Some(p) = self.pages.remove(&a) {
-                self.cooling.push_back((p.tile, now));
+    fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
+        let old: Vec<K> = map.iter().filter(|(_, p)| p.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)).map(|(&k, _)| k).collect();
+        for k in old {
+            if let Some(p) = map.remove(&k) {
+                cooling.push_back((p.tile, now));
             }
         }
+    }
+
+    /// Pages no resource used for `IDLE` go back to the pools.
+    fn sweep(&mut self, now: std::time::Instant) {
+        Self::sweep_map(&mut self.pages, &mut self.cooling, now);
+        Self::sweep_map(&mut self.extra_pages, &mut self.cooling, now);
     }
 
     unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
@@ -252,8 +274,8 @@ impl Pages {
             Flags: D3D12_HEAP_FLAG_NONE,
         };
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
-            crate::xlog_warn!("D3D12.X: no video memory for more pages of GPU-owned textures ({e})");
+        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+            crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
             return None;
         }
         self.pools.push(heap?);
@@ -290,6 +312,112 @@ impl Pages {
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
     }
+
+    /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
+    /// to the pool even while the title keeps the COM object alive.
+    unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+        let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        self.queue.UpdateTileMappings(
+            res,
+            1,
+            Some(&coord),
+            Some(&region),
+            None,
+            1,
+            Some(&flag),
+            None,
+            Some(&total),
+            D3D12_TILE_MAPPING_FLAG_NONE,
+        );
+        self.value += 1;
+        let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
+        for a in used {
+            if let Some(p) = self.pages.get_mut(&a) {
+                p.users = p.users.saturating_sub(1);
+                if p.users == 0 {
+                    if immediate_cool {
+                        if let Some(p) = self.pages.remove(&a) {
+                            self.cooling.push_back((p.tile, now));
+                        }
+                    } else {
+                        p.idle_since = Some(now);
+                    }
+                }
+            }
+        }
+        for k in used_extra {
+            if let Some(p) = self.extra_pages.get_mut(&k) {
+                p.users = p.users.saturating_sub(1);
+                if p.users == 0 {
+                    if immediate_cool {
+                        if let Some(p) = self.extra_pages.remove(&k) {
+                            self.cooling.push_back((p.tile, now));
+                        }
+                    } else {
+                        p.idle_since = Some(now);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
+        let now = std::time::Instant::now();
+        self.sweep(now);
+        let mut tiles = Vec::with_capacity(total as usize);
+        let mut used = Vec::with_capacity(own);
+        let mut used_extra = Vec::new();
+        for i in 0..total as usize {
+            let tile = if i < own {
+                let a = first + i * PAGE;
+                let tile = match self.pages.get_mut(&a) {
+                    Some(p) => {
+                        p.users += 1;
+                        p.idle_since = None;
+                        Some(p.tile)
+                    }
+                    None => self.take_tile(dev).inspect(|&t| {
+                        self.pages.insert(a, Page { tile: t, users: 1, idle_since: None });
+                    }),
+                };
+                if tile.is_some() {
+                    used.push(a);
+                }
+                tile
+            } else {
+                let k = (va, i);
+                let tile = match self.extra_pages.get_mut(&k) {
+                    Some(p) => {
+                        p.users += 1;
+                        p.idle_since = None;
+                        Some(p.tile)
+                    }
+                    None => self.take_tile(dev).inspect(|&t| {
+                        self.extra_pages.insert(k, Page { tile: t, users: 1, idle_since: None });
+                    }),
+                };
+                if tile.is_some() {
+                    used_extra.push(k);
+                }
+                tile
+            };
+            let Some(t) = tile else { break };
+            tiles.push(t);
+        }
+        if tiles.len() < total as usize {
+            self.release_tiles(used, used_extra, now, true);
+            return None;
+        }
+        self.map(res, &tiles);
+        Some((used, used_extra))
+    }
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
@@ -308,22 +436,55 @@ fn heap_ranges(heap: u32, tiles: &[Tile]) -> Vec<(bool, u32, u32)> {
     out
 }
 
-/// A GPU-owned texture at `va` as a reserved resource on the title's pages there
-/// (`console_bytes`: its size on the console – the pages it covers; tiles past them are its
-/// own). None: it cannot be (the caller tries an arena).
-unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    if va % PAGE != 0 || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN {
+/// 64 KiB page boundaries `P` with `va <= P < va + bytes`, capped at `total` tiles:
+/// `(first_page, count)`. Because every `P` lies strictly inside `[va, va + bytes)`, two
+/// non-overlapping ranges never share a page here even when `va` is only 4 KiB aligned.
+fn owned_pages(va: usize, console_bytes: Option<u64>, total: usize) -> Option<(usize, usize)> {
+    match console_bytes {
+        Some(b) => {
+            let bytes = usize::try_from(b).ok()?;
+            let first = va.checked_next_multiple_of(PAGE)?;
+            let end = va.saturating_add(bytes);
+            let n = if first < end { (end - first).div_ceil(PAGE) } else { 0 };
+            Some((first, n.min(total)))
+        }
+        None => (va % PAGE == 0).then_some((va, total)),
+    }
+}
+
+/// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
+/// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
+/// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
+#[allow(clippy::too_many_arguments)]
+unsafe fn place_on_pages(
+    dev: &ID3D12Device,
+    this: *mut c_void,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    console_bytes: Option<u64>,
+    require_aligned: bool,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+        return None;
+    }
+    if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
     let mut g = PAGES.lock().unwrap();
-    let pages = g.get_or_insert_with(|| Pages::new(dev)).as_mut()?;
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({hr:#x}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
+        if require_aligned {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({hr:#x}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
+            }
         }
         return None;
     }
@@ -331,70 +492,88 @@ unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, va: usize, desc:
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
-    let own = console_bytes.map_or(total as usize, |b| (b as usize).div_ceil(PAGE)).min(total as usize);
-    let now = std::time::Instant::now();
-    pages.sweep(now);
-    let mut tiles = Vec::with_capacity(total as usize);
-    let mut used = Vec::with_capacity(own);
-    let mut extra = Vec::new();
-    for i in 0..total as usize {
-        let tile = if i < own {
-            let a = va + i * PAGE;
-            let tile = match pages.pages.get_mut(&a) {
-                Some(p) => {
-                    p.users += 1;
-                    p.idle_since = None;
-                    Some(p.tile)
-                }
-                None => pages.take_tile(dev).inspect(|&t| {
-                    pages.pages.insert(a, Page { tile: t, users: 1, idle_since: None });
-                }),
-            };
-            if tile.is_some() {
-                used.push(a);
-            }
-            tile
-        } else {
-            pages.take_tile(dev).inspect(|&t| extra.push(t))
-        };
-        let Some(t) = tile else { break };
-        tiles.push(t);
-    }
-    pages.targets.insert(raw as usize, (used, extra));
-    if tiles.len() < total as usize {
-        // no video memory for all of it: the target goes (its pages with it)
+    let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) else {
         drop(g);
-        forget_pages(raw as usize);
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
-    }
-    pages.map(res, &tiles);
+    };
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
+    drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
 }
 
-/// A target released: its pages are no longer its.
-fn forget_pages(resource: usize) {
+/// Unmap a placed texture superseded by a placement with a different address range, returning its
+/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
+pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
+    let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.as_mut() else { return };
-    let Some((used, extra)) = pages.targets.remove(&resource) else { return };
     let now = std::time::Instant::now();
-    for a in used {
-        if let Some(p) = pages.pages.get_mut(&a) {
-            p.users = p.users.saturating_sub(1);
-            if p.users == 0 {
-                p.idle_since = Some(now);
-            }
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.get_mut(&key) else { continue };
+        if !t.mapped {
+            return;
         }
+        let total = t.total;
+        let used = std::mem::take(&mut t.used);
+        let used_extra = std::mem::take(&mut t.used_extra);
+        t.mapped = false;
+        pages.unmap(res, total);
+        pages.release_tiles(used, used_extra, now, true);
+        return;
     }
-    pages.cooling.extend(extra.into_iter().map(|t| (t, now)));
 }
 
-/// Before a title queue's work: it waits for the pages mapped since its last work.
-pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+/// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
+pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
+        return false;
+    }
+    let Some(dev) = dev else { return false };
+    let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.as_mut() else { return };
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
+    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+        return false;
+    };
+    if mapped {
+        return true;
+    }
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+        return false;
+    };
+    if let Some(t) = pages.targets.get_mut(&key) {
+        t.used = used;
+        t.used_extra = used_extra;
+        t.mapped = true;
+    }
+    true
+}
+
+/// A resource released: its pages are no longer its.
+fn forget_pages(resource: usize) {
+    let mut g = PAGES.lock().unwrap();
+    let now = std::time::Instant::now();
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.remove(&resource) else { continue };
+        if t.mapped {
+            pages.release_tiles(t.used, t.used_extra, now, false);
+        }
+        return;
+    }
+}
+
+/// Before GPU work on `queue`: it waits for the pages mapped since its last work on that device.
+pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
@@ -402,17 +581,49 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     }
 }
 
-/// (bytes of pages in use by targets, bytes of pool heaps) – `XCL_ACTIVITY`
+#[cfg(test)]
+pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
+    let g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get(&device) else { return (0, 0) };
+    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+}
+
+/// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.as_ref() else { return (0, 0) };
-    (p.pages.len() * PAGE + p.targets.values().map(|t| t.1.len()).sum::<usize>() * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    g.values().flatten().fold((0, 0), |(used, pools), p| {
+        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+    })
 }
 
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
 fn tier2(dev: &ID3D12Device) -> bool {
     let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
+}
+
+/// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
+/// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
+/// available (the caller falls back to a committed resource).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn place_pages(
+    this: *mut c_void,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    console_bytes: Option<u64>,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
+        return None;
+    }
+    place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
 }
 
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
@@ -425,7 +636,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
         return None;
     }
     if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
-        if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
+        if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, riid, ppv) {
             return Some(hr);
         }
     }
@@ -461,6 +672,36 @@ mod tests {
         assert_eq!(heap_ranges(1, &tiles), [(false, 0, 2), (true, 0, 2), (false, 0, 3)]);
         // shared pages out of order: runs break where the tiles do
         assert_eq!(heap_ranges(0, &[(0, 3), (0, 1), (0, 2)]), [(true, 3, 1), (true, 1, 2)]);
+    }
+
+    /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so
+    /// non-overlapping ranges never share an owned page even when only 4 KiB aligned.
+    #[test]
+    fn owned_pages_never_alias_disjoint_ranges() {
+        assert_eq!(owned_pages(0x1_0000, Some(0x1_0000), 4), Some((0x1_0000, 1)));
+        assert_eq!(owned_pages(0x1_0000, Some(0x1_4000), 4), Some((0x1_0000, 2)));
+        assert_eq!(owned_pages(0x1_4000, Some(0x4000), 4), Some((0x2_0000, 0)));
+        assert_eq!(owned_pages(0x1_4000, Some(0x1_0000), 4), Some((0x2_0000, 1)));
+        assert_eq!(owned_pages(0x1_4000, Some(0x4_0000), 4), Some((0x2_0000, 4)));
+        assert_eq!(owned_pages(0x1_4000, None, 4), None);
+        // Exhaustively check 4 KiB-aligned disjoint pairs over 256 KiB.
+        const K4: usize = 0x1000;
+        for a in (0..16).map(|i| 0x10_0000 + i * K4) {
+            for sa in [K4, 4 * K4, 16 * K4, 20 * K4] {
+                let (fa, na) = owned_pages(a, Some(sa as u64), 8).unwrap();
+                let pa: Vec<usize> = (0..na).map(|i| fa + i * PAGE).collect();
+                for b in (0..16).map(|i| 0x10_0000 + i * K4) {
+                    for sb in [K4, 4 * K4, 16 * K4, 20 * K4] {
+                        if a + sa <= b || b + sb <= a {
+                            let (fb, nb) = owned_pages(b, Some(sb as u64), 8).unwrap();
+                            for j in 0..nb {
+                                assert!(!pa.contains(&(fb + j * PAGE)), "disjoint [{a:#x}..{:#x}) and [{b:#x}..{:#x}) shared page", a + sa, b + sb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A placement's arena id, with heaps numbered as they are made.
@@ -538,6 +779,7 @@ mod tests {
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;
@@ -638,7 +880,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "vram_gpu_tests.rs"]
-mod gpu_regression_tests;

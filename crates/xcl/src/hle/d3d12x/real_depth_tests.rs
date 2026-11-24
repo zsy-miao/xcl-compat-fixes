@@ -33,7 +33,7 @@ fn console_depth_views_become_pc_ones() {
         (53, 0, 56),
         (28, 28, 28),
     ] {
-        assert_eq!(pc_depth_view_format(resource, view), expected);
+        assert_eq!(super::super::device_x::pc_shader_view_format(resource as u32, view as u32), expected as u32);
     }
 
     with_resource_desc(19, |resource| unsafe {
@@ -73,8 +73,8 @@ fn console_depth_stencil_array_keeps_plane_after_format_conversion() {
         desc.Anonymous.Texture2DArray.FirstArraySlice = 4;
         desc.Anonymous.Texture2DArray.ArraySize = 5;
         desc.Anonymous.Texture2DArray.ResourceMinLODClamp = 0.75;
-        // Match dev_create_srv_x: console format mapping precedes depth-plane selection.
-        let mapped = pc_view_format(&desc).expect("console stencil format is mapped");
+        // The current view helper performs format mapping and plane selection together.
+        let mapped = pc_depth_srv(resource, &desc).expect("console stencil format is mapped");
         assert_eq!(mapped.Format.0, 47);
         let converted = pc_depth_srv(resource, &mapped).expect("mapped stencil still selects plane 1");
         let array = converted.Anonymous.Texture2DArray;
@@ -112,6 +112,9 @@ fn typeless_depth_defaults_have_typed_views_and_keep_explicit_fields() {
     unsafe { assert_eq!(mapped.Anonymous.Texture2DArray.MipSlice, 1); }
     resource.SampleDesc.Count = 4;
     assert_eq!(pc_depth_dsv(&resource, None).unwrap().ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY);
+    let srv = pc_srv(&resource, None).unwrap();
+    assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY);
+    unsafe { assert_eq!(srv.Anonymous.Texture2DMSArray.ArraySize, 3); }
     for (resource, depth) in [(19, 21), (39, 41), (44, 46), (53, 56)] {
         with_resource_desc(resource, |raw| unsafe {
             let srv = pc_depth_srv(raw, std::ptr::null()).expect("typeless resource needs a typed default SRV");
@@ -141,7 +144,7 @@ fn console_depth_view_format_preserves_descriptor_fields_and_plain_views() {
         desc.Anonymous.Texture2DArray.MipSlice = 2;
         desc.Anonymous.Texture2DArray.FirstArraySlice = 3;
         desc.Anonymous.Texture2DArray.ArraySize = 4;
-        let converted = pc_view_format(&desc).expect("console DSV format is mapped");
+        let converted = pc_depth_dsv(&D3D12_RESOURCE_DESC::default(), Some(&desc)).expect("console DSV format is mapped");
         assert_eq!(converted.Format.0, 45);
         assert_eq!(converted.ViewDimension, desc.ViewDimension);
         assert_eq!(converted.Flags, desc.Flags);
@@ -150,8 +153,8 @@ fn console_depth_view_format_preserves_descriptor_fields_and_plain_views() {
         assert_eq!(converted.Anonymous.Texture2DArray.ArraySize, 4);
         assert_eq!(desc.Format.0, 118);
         desc.Format = DXGI_FORMAT(45);
-        assert!(pc_view_format(&desc).is_none());
-        assert!(pc_view_format::<D3D12_DEPTH_STENCIL_VIEW_DESC>(std::ptr::null()).is_none());
+        assert!(pc_depth_dsv(&D3D12_RESOURCE_DESC::default(), Some(&desc)).is_none());
+        assert!(pc_depth_dsv(&D3D12_RESOURCE_DESC::default(), None).is_none());
     }
     with_resource_desc(28, |resource| unsafe {
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT(28), ..Default::default() };

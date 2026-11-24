@@ -516,7 +516,7 @@ fn render_target_and_depth_layouts_match() {
     let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
     let mut bad = std::collections::BTreeMap::<String, (usize, String)>::new();
     let (mut cases, mut same) = (0, 0);
-    for f in [28u32, 71, 40, 55, 45, 20, 41, 39, 44] {
+    for f in [28u32, 71, 40, 55, 45, 20, 41, 39, 44, 118, 119, 120] {
         for (w, h) in [(1u64, 1u32), (100, 60), (256, 256), (1920, 1080)] {
             for mips in [1u16, 3] {
                 for array in [1u16, 6] {
@@ -717,6 +717,54 @@ fn line_layouts_match_the_console_library() {
     }
     println!("{} differ", bad.len());
     for b in bad.iter().take(20) {
+        println!("  {b}");
+    }
+    assert!(bad.is_empty());
+}
+
+/// Computer method #10 (GetResourceTiling): tile counts, the packed mip info, the tile shape and
+/// the subresource tilings of 2D textures as the console's library answers.
+#[test]
+fn resource_tiling_matches_the_console_library() {
+    let Some(m) = console() else { return };
+    let theirs = proc(m, "XGCreateTextureComputer");
+    let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
+    type T = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32, *mut [u32; 3], *mut [u32; 3], *mut u32, u32, *mut [u32; 3]) -> i32;
+    let run = |create: usize, x: &[u8; 0x38], first: u32, asked: u32| unsafe {
+        let mut c = std::ptr::null_mut();
+        if std::mem::transmute::<usize, CreateFn>(create)(x.as_ptr(), &mut c) < 0 {
+            return None;
+        }
+        let vt = *(c as *const *const usize);
+        let f: T = std::mem::transmute(*vt.add(10));
+        let (mut tiles, mut packed, mut shape, mut n, mut subs) = (0xAAAAu32, [0xAAAA_AAAAu32; 3], [0xAAAA_AAAAu32; 3], asked, [[0xAAAA_AAAAu32; 3]; 32]);
+        let hr = f(c, &mut tiles, &mut packed, &mut shape, &mut n, first, subs.as_mut_ptr());
+        let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        release(c);
+        // (packed: NumStandardMips and NumPackedMips are bytes – the rest of the word is padding)
+        Some(if hr < 0 { (hr, 0, [0; 3], [0; 3], 0, Vec::new()) } else { (hr, tiles, [packed[0] & 0xFFFF, packed[1], packed[2]], shape, n, subs.to_vec()) })
+    };
+    let (mut cases, mut bad) = (0, Vec::new());
+    for f in [28u32, 61, 10, 2, 71, 77, 98, 49] {
+        for (w, h) in [(256u64, 256u32), (300, 200), (4096, 4096), (2048, 512), (64, 64), (1, 1), (1000, 37)] {
+            for (a, mips) in [(1u16, 0u16), (1, 1), (2, 3), (6, 0), (3, 2)] {
+                for lay in [0x109u32, 0x10A, 0x119, 0x11A, 0x11B, 0x105, 0x101, 0] {
+                    let x = desc(3, w, h, a, mips, f, lay, 0);
+                    for (first, asked) in [(0u32, 32u32), (0, 2), (1, 32), (3, 7)] {
+                        let (Some(c), Some(o)) = (run(theirs, &x, first, asked), run(ours, &x, first, asked)) else { continue };
+                        cases += 1;
+                        if c != o {
+                            bad.push(format!("fmt {f} {w}x{h} a{a} mips {mips} layout {lay:#x} first {first} asked {asked}:
+   console {c:x?}
+   ours    {o:x?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{cases} cases, {} differ", bad.len());
+    for b in bad.iter().take(6) {
         println!("  {b}");
     }
     assert!(bad.is_empty());

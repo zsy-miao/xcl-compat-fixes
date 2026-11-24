@@ -13,11 +13,11 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{SetLastError, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{WIN32_FIND_DATAA, WIN32_FIND_DATAW};
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_NOT_SAME_DEVICE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, WIN32_FIND_DATAA, WIN32_FIND_DATAW};
 
 use crate::hooks::hook;
-use crate::util::{from_ansi_ptr, from_wide_ptr, wide};
+use crate::util::{from_ansi_ptr, from_file_ansi_ptr, from_wide_ptr, wide};
 use crate::vfs::{self, Decision, Target};
 
 thread_local! {
@@ -82,20 +82,42 @@ fn log_open(api: &str, path: &str, flags: u32) {
     }
 }
 
+fn apply_open_decision(
+    decision: Decision,
+    disposition: u32,
+    passthrough: impl FnOnce() -> HANDLE,
+    redirected: impl FnOnce(*const u16, u32) -> HANDLE,
+) -> HANDLE {
+    match decision {
+        Decision::Pass => passthrough(),
+        Decision::Use(path) => redirected(wide(&path).as_ptr(), disposition),
+        Decision::UseWithDisposition(path, disposition) => redirected(wide(&path).as_ptr(), disposition),
+        Decision::CreateOverOriginal(path) => {
+            let handle = redirected(wide(&path).as_ptr(), disposition);
+            // Report that the virtual file existed before the open.
+            if handle != INVALID_HANDLE_VALUE {
+                unsafe { SetLastError(vfs::ERROR_ALREADY_EXISTS) };
+            }
+            handle
+        }
+        Decision::Fail(error) => {
+            unsafe { SetLastError(error) };
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
 unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileW", &path, fl);
-    match v.open_decision(&path, acc, disp, fl) {
-        Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
-        Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
-        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    apply_open_decision(
+        v.open_decision(&path, acc, disp, fl),
+        disp,
+        || orig(n, acc, sh, sa, disp, fl, t),
+        |p, d| orig(p, acc, sh, sa, d, fl, t),
+    )
 }
 
 unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
@@ -103,15 +125,12 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileA", &path, fl);
-    match v.open_decision(&path, acc, disp, fl) {
-        Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
-        Decision::Use(p) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
-        Decision::UseWithDisposition(p, d) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    apply_open_decision(
+        v.open_decision(&path, acc, disp, fl),
+        disp,
+        || orig(n, acc, sh, sa, disp, fl, t),
+        |p, d| orig!(O_CREATE_FILE_W as FnCreateFileW)(p, acc, sh, sa, d, fl, t),
+    )
 }
 
 unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, disp: u32, params: *const c_void) -> HANDLE {
@@ -121,15 +140,12 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
     log_open("CreateFile2", &path, flags);
-    match v.open_decision(&path, acc, disp, flags) {
-        Decision::Pass => orig(n, acc, sh, disp, params),
-        Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, disp, params),
-        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, d, params),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    apply_open_decision(
+        v.open_decision(&path, acc, disp, flags),
+        disp,
+        || orig(n, acc, sh, disp, params),
+        |p, d| orig(p, acc, sh, d, params),
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -238,6 +254,7 @@ unsafe extern "system" fn hk_set_attr_w(n: *const u16, attrs: u32) -> i32 {
 
 // ---------------------------------------------------------------------------------------
 // Free space: a console drive (T:\, G:\, …) reports the host volume its mount lives on.
+// The Ex APIs additionally cap the persistent local storage mount to the title's quota.
 // Untranslated, a console drive letter does not exist on the PC, the query fails and
 // titles read it as a full disk (Minecraft then refuses to create a world).
 // ---------------------------------------------------------------------------------------
@@ -289,36 +306,131 @@ unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64) -> Option<(u6
     (ok != 0).then(|| (avail.as_ref().copied().unwrap_or(0), total.as_ref().copied().unwrap_or(0)))
 }
 
-unsafe extern "system" fn hk_disk_free_ex_w(n: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
-    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
-    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
-    let Some(path) = from_wide_ptr(n) else { return orig(n, avail, total, free) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, avail, total, free), None),
-        Some(Ok(p)) => (orig(wide(&p).as_ptr(), avail, total, free), Some(p)),
+unsafe fn pls_disk_free_ex(
+    orig: FnDiskFreeExW,
+    path: *const u16,
+    root: &std::path::Path,
+    quota: u64,
+    [avail, total, free]: [*mut u64; 3],
+) -> i32 {
+    if avail.is_null() && total.is_null() && free.is_null() {
+        return orig(path, avail, total, free);
+    }
+    let (mut host_avail, mut host_total, mut host_free) = (0, 0, 0);
+    let ok = orig(path, &mut host_avail, &mut host_total, &mut host_free);
+    if ok == 0 {
+        return ok;
+    }
+    let err = windows_sys::Win32::Foundation::GetLastError();
+    let capacity = quota.min(host_total);
+    // Host free space already reflects host usage. Subtract PLS usage from its quota.
+    let remaining = if avail.is_null() && free.is_null() {
+        quota
+    } else {
+        quota.saturating_sub(crate::hle::xgameruntime::pls_used_bytes(root))
+    };
+    // These pointers are optional and may alias. Write in the native API's order.
+    if !avail.is_null() {
+        avail.write(host_avail.min(remaining));
+    }
+    if !total.is_null() {
+        total.write(capacity);
+    }
+    if !free.is_null() {
+        free.write(host_free.min(remaining));
+    }
+    SetLastError(err);
+    ok
+}
+
+unsafe fn disk_free_ex(
+    api: &str,
+    path: &str,
+    err: u32,
+    outputs: [*mut u64; 3],
+    pass: impl FnOnce() -> i32,
+) -> i32 {
+    let [avail, total, free] = outputs;
+    let (target, pls) = match vfs::get().map(|v| (v, v.classify(path))) {
+        Some((v, Target::Translated(p))) => {
+            let pls = v.pls_root_for(&p);
+            (Some(Ok(p)), pls)
+        }
+        Some((v, Target::Game { rel })) => (
+            Some(v.read_path_rel(&rel).ok_or(vfs::ERROR_FILE_NOT_FOUND)),
+            None,
+        ),
+        _ => (None, None),
+    };
+    let (r, real) = match target {
+        None => {
+            SetLastError(err);
+            (pass(), None)
+        }
+        Some(Ok(p)) => {
+            let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
+            let w = wide(&p);
+            let r = if let Some(root) = pls {
+                let quota = crate::state::config().pls_quota_bytes();
+                SetLastError(err);
+                pls_disk_free_ex(orig, w.as_ptr(), root, quota, outputs)
+            } else {
+                SetLastError(err);
+                orig(w.as_ptr(), avail, total, free)
+            };
+            (r, Some(p))
+        }
         Some(Err(e)) => {
             SetLastError(e);
             (0, None)
         }
     };
-    log_space("GetDiskFreeSpaceExW", &path, real.as_deref(), ex_answer(r, avail, total));
+    log_space(api, path, real.as_deref(), ex_answer(r, avail, total));
     r
 }
 
-unsafe extern "system" fn hk_disk_free_ex_a(n: *const u8, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
-    let orig = orig!(O_DISK_FREE_EX_A as FnDiskFreeExA);
-    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
-    let Some(path) = from_ansi_ptr(n) else { return orig(n, avail, total, free) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, avail, total, free), None),
-        Some(Ok(p)) => (orig!(O_DISK_FREE_EX_W as FnDiskFreeExW)(wide(&p).as_ptr(), avail, total, free), Some(p)),
-        Some(Err(e)) => {
-            SetLastError(e);
-            (0, None)
-        }
+unsafe extern "system" fn hk_disk_free_ex_w(
+    n: *const u16,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
+    let err = windows_sys::Win32::Foundation::GetLastError();
+    let Some(_g) = Guard::enter() else {
+        return orig(n, avail, total, free);
     };
-    log_space("GetDiskFreeSpaceExA", &path, real.as_deref(), ex_answer(r, avail, total));
-    r
+    let Some(path) = from_wide_ptr(n) else {
+        return orig(n, avail, total, free);
+    };
+    disk_free_ex(
+        "GetDiskFreeSpaceExW",
+        &path,
+        err,
+        [avail, total, free],
+        || orig(n, avail, total, free),
+    )
+}
+
+unsafe extern "system" fn hk_disk_free_ex_a(
+    n: *const u8,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_A as FnDiskFreeExA);
+    let err = windows_sys::Win32::Foundation::GetLastError();
+    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
+    let Some(path) = from_file_ansi_ptr(n) else {
+        return orig(n, avail, total, free);
+    };
+    disk_free_ex(
+        "GetDiskFreeSpaceExA",
+        &path,
+        err,
+        [avail, total, free],
+        || orig(n, avail, total, free),
+    )
 }
 
 unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
@@ -414,11 +526,14 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
     }
 }
 
-/// Kernel file reads cannot fault deferred destination pages into the title.
+/// ReadFile: a buffer in pages the title mapped but has not used yet (`kernelx::lazy`) is
+/// committed first – the kernel's write there would fail rather than fault in the title.
 unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
     let orig = orig!(O_READ_FILE as F);
-    if !buf.is_null() { crate::hle::kernelx::lazy::ensure(buf as usize, n as usize); }
+    if !buf.is_null() {
+        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    }
     orig(h, buf, n, read, ov)
 }
 
@@ -550,13 +665,14 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                 if src_meta.is_dir() {
                     return Err(vfs::ERROR_ACCESS_DENIED); // moving whole game dirs is not supported
                 }
+                let source_in_overlay = rs == v.overlay_path(sr);
                 // Case-only or exact self-rename inside the game folder: never delete/whiteout!
                 if let Some(dr) = &drel_opt {
                     if sr.to_lowercase() == dr.to_lowercase() {
                         if sr == dr {
                             return Ok(());
                         }
-                        if v.visible_in_overlay(sr) {
+                        if source_in_overlay {
                             let rd = v.overlay_path(dr);
                             if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags) == 0 {
                                 // SAFETY: GetLastError reads thread-local Win32 error state.
@@ -580,13 +696,39 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                     }
                 }
                 let (rd, drel) = dest_of(v, d)?;
-                if drel.is_none() {
+                if let Some(dr) = &drel {
+                    if source_in_overlay && flags & MOVEFILE_DELAY_UNTIL_REBOOT == 0 {
+                        // An in-place rename checks delete sharing before replacing the destination.
+                        let moved = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED);
+                        if moved != 0 {
+                            v.commit_write(dr);
+                            v.commit_overlay_removal(sr);
+                            return Ok(());
+                        }
+                        let error = GetLastError();
+                        if error != ERROR_NOT_SAME_DEVICE {
+                            return Err(error);
+                        }
+                    }
+                } else {
                     if let Ok(m) = std::fs::metadata(&rd) {
                         if m.is_dir() {
                             return Err(vfs::ERROR_ACCESS_DENIED);
                         }
                         if !replace_existing {
                             return Err(vfs::ERROR_ALREADY_EXISTS);
+                        }
+                    }
+                    // Move an overlay file directly when both paths are on one volume.
+                    // Windows checks delete sharing before replacing the destination.
+                    if source_in_overlay && flags & MOVEFILE_DELAY_UNTIL_REBOOT == 0 {
+                        if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED) != 0 {
+                            v.commit_overlay_removal(sr);
+                            return Ok(());
+                        }
+                        let error = GetLastError();
+                        if error != ERROR_NOT_SAME_DEVICE {
+                            return Err(error);
                         }
                     }
                 }
@@ -1096,8 +1238,11 @@ pub fn install() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::{CopyFile2, CopyFileExW, CopyFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+    };
 
     #[test]
     fn read_file_commits_a_lazy_destination_before_kernel_io() {
@@ -1169,6 +1314,101 @@ mod tests {
         }
     }
 
+    unsafe extern "system" fn quota_limited_host(
+        _: *const u16,
+        available: *mut u64,
+        total: *mut u64,
+        free: *mut u64,
+    ) -> i32 {
+        available.write(123);
+        total.write(1024);
+        free.write(2048); // Volume-wide free can exceed a caller's total.
+        SetLastError(9123);
+        1
+    }
+
+    #[test]
+    fn pls_disk_space_caps_auto_and_oversized_quotas_to_host_capacity() {
+        let fixture = HookFixture::new("pls_host_limits");
+        let root = fixture.temp();
+        std::fs::write(root.join("existing.bin"), [0; 256]).unwrap();
+        let path = wide(&root.to_string_lossy());
+        for (mb, expected_quota) in [(0, 4096 << 20), (u64::MAX, u64::MAX)] {
+            let config = crate::config::Config {
+                pls_mb: mb,
+                ..Default::default()
+            };
+            let quota = config.pls_quota_bytes();
+            assert_eq!(quota, expected_quota);
+            let (mut available, mut total, mut free) = (0, 0, 0);
+            let ok = unsafe {
+                pls_disk_free_ex(
+                    quota_limited_host,
+                    path.as_ptr(),
+                    &root,
+                    quota,
+                    [&mut available, &mut total, &mut free],
+                )
+            };
+            let err = unsafe { GetLastError() };
+            assert_eq!(ok, 1);
+            assert_eq!(err, 9123);
+            assert_eq!((available, total, free), (123, 1024, 2048));
+        }
+    }
+
+    #[test]
+    fn create_always_reports_existing_game_file() {
+        let f = HookFixture::new("create_always");
+        let overwrite = |path| {
+            let decision = f.vfs.open_decision(path, GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+            let handle = apply_open_decision(
+                decision,
+                CREATE_ALWAYS,
+                || panic!("game paths must go through the overlay"),
+                |p, disposition| unsafe {
+                    CreateFileW(
+                        p,
+                        GENERIC_WRITE,
+                        0,
+                        std::ptr::null(),
+                        disposition,
+                        FILE_ATTRIBUTE_NORMAL,
+                        std::ptr::null_mut(),
+                    )
+                },
+            );
+            let error = unsafe { GetLastError() };
+            assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW({path}) failed with {error}");
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
+            error
+        };
+
+        let existing = r"G:\data\hello.txt";
+        assert_eq!(overwrite(existing), vfs::ERROR_ALREADY_EXISTS, "first write to an existing game file");
+        assert_eq!(overwrite(existing), vfs::ERROR_ALREADY_EXISTS, "next write to its overlay file");
+        assert_eq!(f.read_vfs(existing).as_deref(), Some(&b""[..]));
+        assert_eq!(std::fs::read(f.game().join("data/hello.txt")).unwrap(), b"original");
+
+        assert_eq!(overwrite(r"G:\data\new.txt"), 0);
+        let decision = f.vfs.open_decision(r"G:\data\gone.txt", GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+        let handle = apply_open_decision(
+            decision,
+            CREATE_ALWAYS,
+            || panic!("expected overlay redirection"),
+            |_, _| {
+                unsafe { SetLastError(vfs::ERROR_ACCESS_DENIED) };
+                INVALID_HANDLE_VALUE
+            },
+        );
+        let error = unsafe { GetLastError() };
+        assert_eq!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(error, vfs::ERROR_ACCESS_DENIED);
+
+        f.vfs.delete_file(r"data\gone.txt").unwrap();
+        assert_eq!(overwrite(r"G:\data\gone.txt"), 0, "creating a whited-out file");
+    }
+
     fn real_move(s: *const u16, d: *const u16, f: u32) -> i32 {
         // SAFETY: callers pass valid NUL-terminated UTF-16 paths to Win32 MoveFileExW.
         unsafe { MoveFileExW(s, d, f) }
@@ -1214,7 +1454,13 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+        if crate::util::under_wine() {
+            // Wine's MoveFileExW succeeds on a case-only rename but keeps the old name
+            assert_eq!(ov_names.len(), 1);
+            assert!(ov_names[0].eq_ignore_ascii_case("Hello.txt"), "{ov_names:?}");
+        } else {
+            assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+        }
 
         // Exact self-rename is a safe no-op.
         let ok = unsafe { move_file_vfs(v, "G:\\data\\gone.txt", "G:\\data\\gone.txt", 0, real_move) };
@@ -1265,6 +1511,75 @@ mod tests {
         assert_eq!(ok, 1);
         assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"from-ext".to_vec()));
         assert!(!f.temp().join("ext.txt").exists());
+    }
+
+    #[test]
+    fn move_with_locked_overlay_source_preserves_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let f = HookFixture::new("locked_move");
+        let v = &f.vfs;
+        let source = r"G:\data\hello.txt";
+        let destination = r"G:\data\gone.txt";
+        let overlay_source = v.prepare_write(r"data\hello.txt", false).unwrap();
+        let overlay_destination = v.prepare_write(r"data\gone.txt", false).unwrap();
+        std::fs::write(&overlay_source, b"overlay source").unwrap();
+        std::fs::write(overlay_destination, b"old destination").unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(overlay_source)
+            .unwrap();
+        let result = unsafe { move_file_vfs(v, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) };
+        let error = unsafe { GetLastError() };
+        assert_eq!(result, 0, "the open source does not share delete access");
+        assert_eq!(f.read_vfs(destination).as_deref(), Some(&b"old destination"[..]));
+        assert_eq!(f.read_vfs(source).as_deref(), Some(&b"overlay source"[..]));
+        assert_eq!(error, ERROR_SHARING_VIOLATION);
+
+        drop(held);
+        let result = unsafe { move_file_vfs(v, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) };
+        assert_ne!(result, 0, "move should succeed after the source handle closes");
+        assert_eq!(f.read_vfs(destination).as_deref(), Some(&b"overlay source"[..]));
+        assert_eq!(f.read_vfs(source), None, "the original stays hidden after the move");
+        assert_eq!(std::fs::read(f.game().join("data/hello.txt")).unwrap(), b"original");
+        assert_eq!(std::fs::read(f.game().join("data/gone.txt")).unwrap(), b"bye");
+    }
+
+    #[test]
+    fn locked_overlay_move_to_temp_preserves_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let f = HookFixture::new("locked_move_temp");
+        let source = r"G:\data\hello.txt";
+        let destination = r"T:\destination.txt";
+        let overlay_source = f.vfs.prepare_write(r"data\hello.txt", false).unwrap();
+        std::fs::write(&overlay_source, b"overlay source").unwrap();
+        std::fs::write(f.temp().join("destination.txt"), b"old destination").unwrap();
+        let held = std::fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&overlay_source).unwrap();
+
+        let result = unsafe { move_file_vfs(&f.vfs, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) };
+        assert_eq!(result, 0);
+        assert_eq!(std::fs::read(f.temp().join("destination.txt")).unwrap(), b"old destination");
+        assert_eq!(f.read_vfs(source).as_deref(), Some(&b"overlay source"[..]));
+        drop(held);
+        assert_ne!(unsafe { move_file_vfs(&f.vfs, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) }, 0);
+        assert_eq!(std::fs::read(f.temp().join("destination.txt")).unwrap(), b"overlay source");
+        assert_eq!(f.read_vfs(source), None);
+        assert_eq!(std::fs::read(f.game().join("data/hello.txt")).unwrap(), b"original");
+
+        // A file that exists only in the overlay has no original to white out.
+        let new_source = r"G:\data\new.txt";
+        let new_overlay = f.vfs.prepare_write(r"data\new.txt", false).unwrap();
+        std::fs::write(new_overlay, b"new file").unwrap();
+        assert_ne!(unsafe { move_file_vfs(&f.vfs, new_source, r"T:\new.txt", 0, real_move) }, 0);
+        assert_eq!(std::fs::read(f.temp().join("new.txt")).unwrap(), b"new file");
+        assert_eq!(f.read_vfs(new_source), None);
     }
 
     #[test]

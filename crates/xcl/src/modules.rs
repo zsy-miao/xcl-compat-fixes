@@ -52,6 +52,17 @@ pub fn register_mapped(m: Arc<MappedModule>) {
     MAPPED.write().unwrap().push(m);
 }
 
+/// The image at `base` failed to load: it is no longer found (by name, base, address), so a
+/// later load maps it again – as Windows' loader unloads a DLL that failed.
+pub fn unregister_mapped(base: usize) {
+    MAPPED.write().unwrap().retain(|m| m.base != base);
+    for i in 0..RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES) {
+        if RANGE_BASE[i].load(Ordering::Acquire) == base {
+            RANGE_BASE[i].store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Lock-free: base of the mapped image containing `addr`.
 pub fn image_base_for_addr(addr: usize) -> Option<usize> {
     let n = RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES);
@@ -125,6 +136,18 @@ pub fn hle_name_by_handle(h: usize) -> Option<String> {
     g.as_ref()?.iter().find(|(_, &v)| v == h).map(|(k, _)| k.clone())
 }
 
+/// `name+offset` for an address inside its module, else the bare address.
+///
+/// The addresses `describe_address` gets include raw stack words, which can be anything. Wine
+/// may report a module for one with a handle above the address: the subtraction must not panic
+/// there, or a crash report turns into a panic in the crash handler.
+fn module_offset(name: &str, base: usize, addr: usize) -> String {
+    match addr.checked_sub(base) {
+        Some(offset) => format!("{name}+{offset:#x}"),
+        None => format!("{addr:#x}"),
+    }
+}
+
 /// "game.exe+0x1234", "KERNELBASE.dll+0x5678" or "0x...".
 pub fn describe_address(addr: usize) -> String {
     if let Some(b) = image_base_for_addr(addr) {
@@ -151,8 +174,32 @@ pub fn describe_address(addr: usize) -> String {
             let n = GetModuleFileNameW(h, buf.as_mut_ptr(), 260) as usize;
             let full = String::from_utf16_lossy(&buf[..n]);
             let name = full.rsplit('\\').next().unwrap_or(&full).to_string();
-            return format!("{name}+{:#x}", addr - h as usize);
+            return module_offset(&name, h as usize, addr);
         }
     }
     format!("{addr:#x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_offset_survives_a_base_above_the_address() {
+        // What Wine answered for a stack word while reporting a crash of the retail title:
+        // the handle lay above the address (the subtraction panicked and the report was lost).
+        assert_eq!(
+            module_offset("kernelbase.dll", 0x7fff_0000_0000, 0x6f93_bbb0_e7dc),
+            "0x6f93bbb0e7dc"
+        );
+        assert_eq!(module_offset("game.exe", 0x140000000, 0x140001234), "game.exe+0x1234");
+        assert_eq!(module_offset("game.exe", 0x140000000, 0x140000000), "game.exe+0x0");
+    }
+
+    #[test]
+    fn describe_address_takes_arbitrary_stack_words() {
+        for addr in [0usize, 1, 0x1000_0000_4, 0x7fff_ffff_ffff, usize::MAX] {
+            let _ = describe_address(addr);
+        }
+    }
 }

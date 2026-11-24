@@ -201,9 +201,10 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     r
 }
 
-/// Several uploads on one list, one wait: (resource, subresources, before, after) each. A
-/// failure of one is returned with its index; the others still run.
-pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)]) -> Result<Vec<(usize, String)>, String> {
+/// Several uploads on one list, one wait: (resource, subresources, states) each – the states
+/// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
+/// order). A failure of one is returned with its index; the others still run.
+pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -211,8 +212,8 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let mut staging = Vec::with_capacity(items.len());
     let mut failed = Vec::new();
-    for (k, (res, subs, before, after)) in items.iter().enumerate() {
-        match record_upload(dev, &list, res, subs, *before, *after) {
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match record_upload_states(dev, &list, res, subs, states, states) {
             Ok(s) => staging.push(s),
             Err(e) => failed.push((k, e)),
         }
@@ -227,10 +228,29 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
 /// the staging buffer returned must live until the list has run.
 pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> Result<ID3D12Resource, String> {
+    record_upload_states(dev, list, res, subs, &[before], &[after])
+}
+
+/// `record_upload` with the states per subresource: `before` / `after` hold one state for every
+/// subresource or one per subresource (D3D12 order; a title can leave its mips in different
+/// states).
+pub unsafe fn record_upload_states(
+    dev: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    res: &ID3D12Resource,
+    subs: &[Subresource],
+    before: &[D3D12_RESOURCE_STATES],
+    after: &[D3D12_RESOURCE_STATES],
+) -> Result<ID3D12Resource, String> {
     validate_subresources(subs)?;
     let rd = res.GetDesc();
     let n = subs.len();
     validate_subresource_count(&rd, n)?;
+    for s in [before, after] {
+        if s.len() != 1 && s.len() != n {
+            return Err(format!("{} subresource states for {n} subresources", s.len()));
+        }
+    }
     let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
     let mut rows = vec![0u32; n];
     let mut row_bytes = vec![0u64; n];
@@ -260,8 +280,9 @@ pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList
         }
     }
     up.Unmap(0, None);
-    if before != D3D12_RESOURCE_STATE_COPY_DEST {
-        list.ResourceBarrier(&[transition(res, before, D3D12_RESOURCE_STATE_COPY_DEST)]);
+    let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
+    if !to_copy.is_empty() {
+        list.ResourceBarrier(&to_copy);
     }
     for (k, fp) in fps.iter().enumerate() {
         let dst = D3D12_TEXTURE_COPY_LOCATION {
@@ -272,10 +293,22 @@ pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
     }
-    if after != D3D12_RESOURCE_STATE_COPY_DEST {
-        list.ResourceBarrier(&[transition(res, D3D12_RESOURCE_STATE_COPY_DEST, after)]);
+    let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
+    if !back.is_empty() {
+        list.ResourceBarrier(&back);
     }
     Ok(up)
+}
+
+/// The transitions of `r`'s `n` subresources from `from` to `to` (each one state for all, or one
+/// per subresource): one for all subresources when both are uniform, else one per subresource
+/// that changes.
+fn transitions(r: &ID3D12Resource, from: &[D3D12_RESOURCE_STATES], to: &[D3D12_RESOURCE_STATES], n: usize) -> Vec<D3D12_RESOURCE_BARRIER> {
+    if from.len() == 1 && to.len() == 1 {
+        return if from[0] == to[0] { Vec::new() } else { vec![transition(r, from[0], to[0])] };
+    }
+    let at = |s: &[D3D12_RESOURCE_STATES], k: usize| if s.len() == 1 { s[0] } else { s[k] };
+    (0..n).filter(|&k| at(from, k) != at(to, k)).map(|k| transition_sub(r, k as u32, at(from, k), at(to, k))).collect()
 }
 
 /// Wait until `queue` has run everything submitted so far.
@@ -305,13 +338,17 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+    transition_sub(r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after)
+}
+
+fn transition_sub(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: unsafe { std::mem::transmute_copy(r) },
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                Subresource: sub,
                 StateBefore: before,
                 StateAfter: after,
             }),

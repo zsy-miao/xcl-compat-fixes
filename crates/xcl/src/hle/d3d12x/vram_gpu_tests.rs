@@ -3,6 +3,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SA
 
 #[test]
 fn aliased_reserved_render_targets_share_title_pages_and_release_users() {
+    let _guard = VRAM_TEST_LOCK.lock().unwrap();
     assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12 backend required");
     unsafe {
         let raw_device = super::super::real::device_raw();
@@ -26,19 +27,19 @@ fn aliased_reserved_render_targets_share_title_pages_and_release_users() {
         assert!(hr.is_some_and(|hr| hr >= 0) && !first_raw.is_null(), "first reserved render target");
         let first = ID3D12Resource::from_raw(first_raw);
         assert_eq!(first.GetDesc().Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, "test must exercise tiled pages, not the arena fallback");
-        let first_bytes = page_bytes();
+        let first_bytes = page_bytes_for(raw_device as usize);
         let mut second_raw = std::ptr::null_mut();
         let hr = place(raw_device, title_va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(PAGE as u64), &iid as *const _ as *const windows_sys::core::GUID, &mut second_raw);
         assert!(hr.is_some_and(|hr| hr >= 0) && !second_raw.is_null(), "second aliased render target");
         let second = ID3D12Resource::from_raw(second_raw);
         assert_eq!(second.GetDesc().Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
         assert_ne!(first_raw, second_raw, "distinct resource objects must share their storage");
-        assert_eq!(page_bytes(), first_bytes, "the second alias must not allocate duplicate target pages or pools");
+        assert_eq!(page_bytes_for(raw_device as usize), first_bytes, "the second alias must not allocate duplicate target pages or pools");
         {
             let g = PAGES.lock().unwrap();
-            let pages = g.as_ref().unwrap().as_ref().unwrap();
-            assert_eq!(pages.targets[&(first_raw as usize)].0, [title_va]);
-            assert_eq!(pages.targets[&(second_raw as usize)].0, [title_va]);
+            let pages = g.get(&(raw_device as usize)).unwrap().as_ref().unwrap();
+            assert_eq!(pages.targets[&(first_raw as usize)].used, [title_va]);
+            assert_eq!(pages.targets[&(second_raw as usize)].used, [title_va]);
             assert_eq!(pages.pages[&title_va].users, 2);
         }
         // Exercise the synchronization path: work on a title queue cannot pass tile mapping.
@@ -50,14 +51,14 @@ fn aliased_reserved_render_targets_share_title_pages_and_release_users() {
         drop(first);
         {
             let g = PAGES.lock().unwrap();
-            let pages = g.as_ref().unwrap().as_ref().unwrap();
+            let pages = g.get(&(raw_device as usize)).unwrap().as_ref().unwrap();
             assert!(!pages.targets.contains_key(&(first_raw as usize)));
             assert_eq!(pages.pages[&title_va].users, 1);
         }
         drop(second);
         {
             let g = PAGES.lock().unwrap();
-            let pages = g.as_ref().unwrap().as_ref().unwrap();
+            let pages = g.get(&(raw_device as usize)).unwrap().as_ref().unwrap();
             assert!(!pages.targets.contains_key(&(second_raw as usize)));
             let page = &pages.pages[&title_va];
             assert_eq!(page.users, 0);

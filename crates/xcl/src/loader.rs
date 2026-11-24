@@ -157,10 +157,16 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         if delta != 0 { ", relocated" } else { "" }
     );
 
-    // 4. imports (normal + delay-load, resolved eagerly)
+    // 4. imports (normal + delay-load, resolved eagerly). A failure from here on takes the
+    // module out of the registry again: a later load must not find it (its memory freed, or
+    // never initialised) and take it for loaded
     let mut all = match pe.imports() {
         Ok(v) => v,
-        Err(e) => return fail(format!("{name}: import table: {e}")),
+        Err(e) => {
+            // nothing was resolved against it yet: its memory goes too
+            modules::unregister_mapped(base);
+            return fail(format!("{name}: import table: {e}"));
+        }
     };
     match pe.delay_imports() {
         Ok(v) => all.extend(v),
@@ -182,9 +188,10 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let adj = |va: u64| (va as i64 + delta) as usize;
         let template = adj(t.start_raw);
         let template_len = t.template_len() as usize;
-        let index_ptr = adj(t.address_of_index) as *mut u32;
+        let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
         unsafe {
-            tls_install(&module, template, template_len, t.total_len(), index_ptr)?;
+            // game DLLs loaded while its imports were resolved may point into it: its memory stays
+            tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
             if t.address_of_callbacks != 0 {
                 let mut cb = adj(t.address_of_callbacks) as *const u64;
                 let mut list = module.tls_callbacks.lock().unwrap();
@@ -291,7 +298,13 @@ pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
     if !m.is_dll {
         crate::xlog_warn!("{key} is not a DLL but is being loaded as a library");
     }
-    init_dll(&m)?;
+    if let Err(e) = init_dll(&m) {
+        // as Windows' loader: a DLL whose DllMain fails is not loaded, a later load maps it and
+        // runs DllMain again (here its memory stays: what DllMain ran may have left threads or
+        // callbacks in it)
+        modules::unregister_mapped(m.base);
+        return Err(e);
+    }
     Ok(m)
 }
 
@@ -328,9 +341,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     };
     unsafe {
         // PEB.ImageBaseAddress → GetModuleHandle(NULL), resources with NULL module, …
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        let wine = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some();
-        if wine {
+        if crate::util::under_wine() {
             crate::xlog_info!("Wine: PEB.ImageBaseAddress left alone (its loader needs the real main image there)");
         } else {
             *(peb().add(0x10) as *mut usize) = m.base;
@@ -405,5 +416,110 @@ pub fn on_tls_event(reason: u32) {
             crate::log::flush();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PE32+ DLL of one section (.text at RVA 0x1000) holding `code`, its entry point at the
+    /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);
+    /// `import_dir`: (RVA, size) of the import directory, if any.
+    fn tiny_dll(image_base: u64, code: &[u8], import_dir: Option<(u32, u32)>) -> Vec<u8> {
+        let mut f = vec![0u8; 0x400];
+        let put16 = |f: &mut Vec<u8>, at: usize, v: u16| f[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |f: &mut Vec<u8>, at: usize, v: u32| f[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        f[0..2].copy_from_slice(b"MZ");
+        put32(&mut f, 0x3C, 0x40);
+        f[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // COFF: x64, 1 section, optional header 0xF0, executable | large address aware | DLL
+        put16(&mut f, 0x44, 0x8664);
+        put16(&mut f, 0x46, 1);
+        put16(&mut f, 0x54, 0xF0);
+        put16(&mut f, 0x56, 0x2022);
+        let o = 0x58;
+        put16(&mut f, o, 0x20B);
+        put32(&mut f, o + 0x10, 0x1000); // entry point
+        put32(&mut f, o + 0x14, 0x1000); // base of code
+        f[o + 0x18..o + 0x20].copy_from_slice(&image_base.to_le_bytes());
+        put32(&mut f, o + 0x20, 0x1000); // section alignment
+        put32(&mut f, o + 0x24, 0x200); // file alignment
+        put16(&mut f, o + 0x28, 6);
+        put16(&mut f, o + 0x30, 6);
+        put32(&mut f, o + 0x38, 0x2000); // size of image
+        put32(&mut f, o + 0x3C, 0x200); // size of headers
+        put16(&mut f, o + 0x44, 3); // console subsystem
+        f[o + 0x48..o + 0x50].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        f[o + 0x50..o + 0x58].copy_from_slice(&0x1000u64.to_le_bytes());
+        f[o + 0x58..o + 0x60].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        f[o + 0x60..o + 0x68].copy_from_slice(&0x1000u64.to_le_bytes());
+        put32(&mut f, o + 0x6C, 16); // data directories
+        if let Some((rva, size)) = import_dir {
+            put32(&mut f, o + 0x70 + 8, rva);
+            put32(&mut f, o + 0x70 + 12, size);
+        }
+        // base relocations: one block (page 0x1000, 8 bytes: no entries) at RVA 0x1100
+        put32(&mut f, o + 0x70 + 5 * 8, 0x1100);
+        put32(&mut f, o + 0x70 + 5 * 8 + 4, 8);
+        put32(&mut f, 0x300, 0x1000);
+        put32(&mut f, 0x304, 8);
+        // section .text: RVA 0x1000, 0x200 bytes at file offset 0x200, code | execute | read
+        let s = o + 0xF0;
+        f[s..s + 5].copy_from_slice(b".text");
+        put32(&mut f, s + 8, 0x200);
+        put32(&mut f, s + 12, 0x1000);
+        put32(&mut f, s + 16, 0x200);
+        put32(&mut f, s + 20, 0x200);
+        put32(&mut f, s + 36, 0x6000_0020);
+        f[0x200..0x200 + code.len()].copy_from_slice(code);
+        f
+    }
+
+    fn write(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xcl-loader-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// DllMain returning FALSE: the load fails, the DLL is not left registered as loaded, and a
+    /// second load runs DllMain again (before: the second load returned the uninitialised module).
+    #[test]
+    fn a_dll_whose_dllmain_fails_is_not_loaded() {
+        // xor eax, eax; ret
+        let p = write("xcl_dllmain_false.dll", &tiny_dll(0x7E51_0000_0000, &[0x31, 0xC0, 0xC3], None));
+        let key = crate::util::dll_key("xcl_dllmain_false.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(r.as_ref().is_err_and(|e| e.contains("returned FALSE")), "attempt {attempt}: {:?}", r.map(|m| m.base));
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
+        // the same code returning TRUE loads, once
+        let p = write("xcl_dllmain_true.dll", &tiny_dll(0x7E52_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
+        let m = load_game_dll(&p).unwrap();
+        assert!(m.initialized.load(Ordering::Acquire));
+        assert_eq!(load_game_dll(&p).unwrap().base, m.base);
+    }
+
+    /// An import table that does not parse: the load fails and the module – whose memory is
+    /// freed – is not found afterwards (before: still registered over freed memory, and a second
+    /// load returned it).
+    #[test]
+    fn a_dll_with_a_broken_import_table_is_not_left_registered() {
+        // a descriptor at RVA 0x1010 whose name RVA lies outside the image
+        let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
+        code.resize(0x10, 0xCC);
+        for v in [0x1000u32, 0, 0, 0x7FFF_0000, 0x1000] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        let p = write("xcl_bad_imports.dll", &tiny_dll(0x7E53_0000_0000, &code, Some((0x1010, 40))));
+        let key = crate::util::dll_key("xcl_bad_imports.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
     }
 }

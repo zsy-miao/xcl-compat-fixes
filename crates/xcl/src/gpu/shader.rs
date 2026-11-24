@@ -212,6 +212,12 @@ pub fn readable(p: usize, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
+        return true;
+    }
+    if resident_and_readable(p, end) {
+        return true;
+    }
     let mut cur = p;
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -250,6 +256,38 @@ pub(crate) fn writable(p: usize, len: usize) -> bool {
         cur = next;
     }
     true
+}
+
+/// Whether each page of `[p, end)` (up to 16 pages) is in the working set with a readable
+/// protection, asked of the kernel for all the pages in one call that touches none of them.
+/// `readable` asks this first because `VirtualQuery` sizes the whole region around an address by
+/// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a retail game's
+/// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
+/// of the world load there. `false` for a page that is not resident (never touched, paged out,
+/// guard, reserved, no access): the `VirtualQuery` walk answers for those.
+fn resident_and_readable(p: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const MAX_PAGES: usize = 16;
+    let first = p >> 12;
+    let pages = ((end - 1) >> 12) - first + 1;
+    if pages > MAX_PAGES {
+        return false;
+    }
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
+    for (k, e) in ws[..pages].iter_mut().enumerate() {
+        e.VirtualAddress = ((first + k) << 12) as *mut std::ffi::c_void;
+    }
+    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+    if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
+        return false;
+    }
+    // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
+    ws[..pages].iter().all(|e| {
+        let flags = unsafe { e.VirtualAttributes.Flags };
+        let protect = ((flags >> 4) & 0x7FF) as u32;
+        flags & 1 != 0 && protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+    })
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
@@ -531,5 +569,46 @@ mod tests {
                 assert!(!writable(r, 64), "a new query observes release");
             }
         }
+    }
+
+    #[test]
+    fn readable_answers_from_the_working_set_without_touching_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            // 0, 1 written; 2 no access; 3 guard; 4 reserved; 5, 6 committed and never touched
+            let base = VirtualAlloc(std::ptr::null(), 7 << 12, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            let page = |k: usize| base + (k << 12);
+            for (k, protect) in [(0, PAGE_READWRITE), (1, PAGE_READWRITE), (2, PAGE_NOACCESS), (3, PAGE_READWRITE | PAGE_GUARD), (5, PAGE_READWRITE), (6, PAGE_READONLY)] {
+                assert!(!VirtualAlloc(page(k) as *const _, 1 << 12, MEM_COMMIT, protect).is_null());
+            }
+            std::ptr::write_volatile(page(0) as *mut u8, 1);
+            std::ptr::write_volatile(page(1) as *mut u8, 1);
+            // written pages: answered from the working set
+            assert!(resident_and_readable(page(0), page(2)));
+            assert!(readable(page(0), 2 << 12));
+            assert!(readable(page(0) + 100, 8));
+            // untouched pages: the region walk answers, and they stay untouched
+            assert!(!resident_and_readable(page(5), page(5) + 8));
+            assert!(readable(page(5), 8));
+            assert!(readable(page(6), 1 << 12));
+            assert!(!resident_and_readable(page(5), page(7)));
+            assert!(!readable(page(2), 8));
+            assert!(!readable(page(3), 8));
+            assert!(!readable(page(4), 8));
+            // asking about a guard page leaves it a guard page
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page(3) as *const _, &mut mbi, std::mem::size_of_val(&mbi)), 0);
+            assert_ne!(mbi.Protect & PAGE_GUARD, 0);
+            // a range is readable only when each of its pages is
+            assert!(!readable(page(1) + 0xFF0, 0x20));
+            assert!(!readable(page(4) + 0xFF0, 0x20));
+            assert!(!readable(page(0), 20 << 12));
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+        // more pages than one working-set query takes: the region walk
+        let v = vec![1u8; 32 << 12];
+        assert!(!resident_and_readable(v.as_ptr() as usize, v.as_ptr() as usize + v.len()));
+        assert!(readable(v.as_ptr() as usize, v.len()));
     }
 }

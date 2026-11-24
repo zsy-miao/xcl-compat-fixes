@@ -1,12 +1,48 @@
 //! The console's audio processor (`acphal.dll`, `xapu.dll`): memory the audio hardware
 //! addresses, the processor's command / message channel, SHAPE contexts and the decoder queue.
 //!
-//! Nothing is decoded or mixed here – the processor answers as hardware with no work to do:
-//! commands are acknowledged, audio frames tick (one every 128 samples at 48 kHz), SHAPE
-//! context arrays exist, and the decoder returns silence of the length asked for. A title's
-//! audio engine then starts and runs (XDefiant: `ApuCreateHeap` failing made it drop its whole
-//! audio setup), sounds decoded in software go wherever the engine sends them, and nothing
-//! waits forever on the processor. Audio through the console's mixer (SHAPE) stays silent.
+//! The processor answers as hardware with little to do: commands are acknowledged, audio frames
+//! tick (one every 128 samples at 48 kHz), SHAPE context arrays exist. A title's audio engine then
+//! starts and runs (XDefiant: `ApuCreateHeap` failing made it drop its whole audio setup), and
+//! nothing waits forever on the processor. The SHAPE mixer is not run.
+//!
+//! What runs is the decoder (xapu): Opus packets a title sends are decoded (`hle::opus`: Windows'
+//! Media Foundation decoder, or libopus where Windows has none – without either the decoder answers
+//! silence, logged once) and the PCM is written into the title's output buffer. Nothing is played
+//! from here: the title reads that output back itself, mixes it and plays its own mix through a
+//! system audio endpoint (Windows Spatial Audio), as a listening test showed – with the decoder's
+//! PCM played on a voice of XCL's own as well, the sound came out twice. So XCL only has to decode
+//! into the buffer. The SHAPE mixer is not run. `XCL_TRACE_APU=1` logs what a title sends (acphal
+//! commands, xapu commands with their structures and the start of the Opus input, the caller in the
+//! title, the rate per kind of command).
+//!
+//! # The decoder's commands as a retail game sends them (observed with `XCL_TRACE_APU=1`)
+//!
+//! Every command starts with the 24-byte `XApuCommand` (`kind`, `stream`, `sequence`, `options`,
+//! `context` u64); the title builds it on its stack and sets only the fields it uses (`kind` and
+//! `stream`, the others are left as they were – `sequence`, `options`, `context` mean nothing to it),
+//! then calls `XApuEnqueueCommand(handle, &command, &count)` and polls `XApuDequeueResult`.
+//! The game drives stream 0 only (so far) and is on one thread.
+//!
+//! * kind 1, Activate: `u32 channels` at +24 (1: mono, 2: stereo), the output rate 48000 at +56 (the
+//!   decoder is 48 kHz). Starts a stream.
+//! * kind 3, Process: one Opus packet (RFC 6716, no length prefix, no container: 80 / 160 B mono
+//!   CELT full band 20 ms, TOC 0xF8; 320 B stereo, TOC 0xFC) in `input` / `input_bytes`; `frames` = 960
+//!   (one packet), `first_frame` = 312 on the first command of a stream (the Opus pre-skip: decoded
+//!   frames to leave out), 0 after; the output is `frames × channels` float32 at `output`
+//!   (3 840 B mono). The input and output buffers are the same two for every command of the stream
+//!   (a ring the title refills); `ramp` is 0, the f32 "pitch" field holds 48000.0. A command every ~20 ms
+//!   once the title's own prefetch (a burst of ~20 commands, 4–6 ms apart) is done.
+//! * kind 2, Deactivate: nothing after the header (the 40 bytes behind are the title's stack); the
+//!   title sends it when it releases the stream (`kind`, `stream`, sequence 0), then frees the
+//!   stream's slot. Activate / Deactivate alternate with no Process in between for short sounds.
+//! * results: `state` bits 0 (output ready) and 1 (more input wanted), `frames` / `output_bytes`
+//!   the frames written (those after `first_frame`), `input` / `input_bytes` as sent.
+//! * acphal: one command (`type` 2, id 0xF0F0F0F0, no data) right after `Connect`, nothing after
+//!   it during menus / sound (the SHAPE contexts are written in APU memory, not through commands);
+//!   the DSP (chad) gets nothing.
+//! * APU memory: `ApuCreateHeap`, then `ApuAlloc` of 0x5780 (align 0x100), 0x222E00 (align 0x800,
+//!   flags 2) and 0x1913AFA0 (align 0x800, flags 1); `ApuMapVirtualAddress` is not called.
 //!
 //! Interfaces as titles call them (observed on retail titles; another project's notes on
 //! the same titles agree): `ApuAlloc(&va, &apu, size, alignment, flags)`,
@@ -27,6 +63,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::hle::{opus, xaudio2};
 use crate::util::{HRESULT, S_OK};
 
 const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
@@ -37,6 +74,109 @@ const XAPU_NO_RESULTS: HRESULT = 0x8AC8_1001_u32 as i32;
 
 /// one audio frame: 128 samples at 48 kHz
 const FRAME: Duration = Duration::from_micros(2667);
+
+// ---------------------------------------------------------------------------------------
+// XCL_TRACE_APU=1: what the title sends the audio processor and the decoder
+// ---------------------------------------------------------------------------------------
+
+/// `XCL_TRACE_APU` set (not "0"): log the commands, their structures and buffers
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TRACE_APU").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// Per kind of command: how many came, when the first and the last did (for the call frequency),
+/// and how many were logged in full.
+#[derive(Default)]
+struct TraceKind {
+    count: u64,
+    logged: u32,
+    first: Option<Instant>,
+    last_report: Option<Instant>,
+    since_report: u64,
+}
+
+/// the first commands of each kind are logged in full, then one line per second and kind
+struct Tracer {
+    kinds: Vec<(&'static str, u32, TraceKind)>,
+}
+
+static TRACER: Mutex<Tracer> = Mutex::new(Tracer { kinds: Vec::new() });
+/// commands of one kind logged in full
+const TRACE_FULL: u32 = 24;
+
+/// true: log this command in full; false: tracing is off, or the command is only counted (a rate line
+/// is logged here when due)
+fn trace_command(origin: &'static str, kind: u32) -> bool {
+    if !trace_on() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut t = TRACER.lock().unwrap();
+    let i = match t.kinds.iter().position(|k| k.0 == origin && k.1 == kind) {
+        Some(i) => i,
+        None => {
+            t.kinds.push((origin, kind, TraceKind::default()));
+            t.kinds.len() - 1
+        }
+    };
+    let k = &mut t.kinds[i].2;
+    k.count += 1;
+    k.since_report += 1;
+    k.first.get_or_insert(now);
+    if k.logged < TRACE_FULL {
+        k.logged += 1;
+        return true;
+    }
+    match k.last_report {
+        None => k.last_report = Some(now),
+        Some(r) if now.duration_since(r) >= Duration::from_secs(5) => {
+            let rate = k.since_report as f64 / now.duration_since(r).as_secs_f64();
+            crate::xlog_info!("apu-trace: {origin} command {kind:#x}: {} so far, {rate:.1}/s", k.count);
+            k.last_report = Some(now);
+            k.since_report = 0;
+        }
+        _ => {}
+    }
+    false
+}
+
+/// the return addresses of the call into the decoder's queue (`module+offset`), for the first
+/// commands of a kind: where in the title's code it comes from
+unsafe fn trace_callers(kind: u32) {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    static LOGGED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    {
+        let mut l = LOGGED.lock().unwrap();
+        if l.iter().filter(|&&k| k == kind).count() >= 2 {
+            return;
+        }
+        l.push(kind);
+    }
+    let mut frames = [std::ptr::null_mut::<c_void>(); 8];
+    let n = RtlCaptureStackBackTrace(1, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut());
+    let list: Vec<String> = frames[..n as usize].iter().map(|&f| crate::modules::describe_address(f as usize)).collect();
+    crate::xlog_info!("apu-trace:   command {kind:#x} called from {}", list.join(" < "));
+}
+
+/// the bytes of an xapu command as the title sends them: its own structure, not a fixed size (a
+/// command is 24 B for most kinds; reading more would run into whatever the title has behind it)
+fn command_len(kind: u32) -> usize {
+    match kind {
+        XAPU_ACTIVATE => std::mem::size_of::<XApuActivate>(),
+        XAPU_PROCESS => std::mem::size_of::<XApuProcess>(),
+        _ => std::mem::size_of::<XApuCommand>(),
+    }
+}
+
+/// up to `n` bytes at `p`, in hex (null: "null")
+unsafe fn hex(p: *const c_void, n: usize) -> String {
+    if p.is_null() {
+        return "null".into();
+    }
+    let b = std::slice::from_raw_parts(p as *const u8, n);
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+}
 
 // ---------------------------------------------------------------------------------------
 // memory the audio processor addresses (32-bit APU addresses)
@@ -175,6 +315,9 @@ pub unsafe extern "system" fn ApuAlloc(va: *mut *mut c_void, apu: *mut u32, size
     if !apu.is_null() {
         *apu = a;
     }
+    if trace_command("ApuAlloc", 0) {
+        crate::xlog_info!("apu-trace: ApuAlloc({size:#x}, align {alignment:#x}, flags {_flags:#x}) -> va {p:#x} apu {a:#x}");
+    }
     S_OK
 }
 
@@ -208,6 +351,9 @@ pub unsafe extern "system" fn ApuMapVirtualAddress(apu: *mut u32, va: *mut c_voi
         return E_OUTOFMEMORY;
     };
     *apu = a;
+    if trace_command("ApuMapVirtualAddress", 0) {
+        crate::xlog_info!("apu-trace: ApuMapVirtualAddress({va:p}, {size:#x}) -> apu {a:#x}");
+    }
     S_OK
 }
 
@@ -415,7 +561,11 @@ unsafe extern "system" fn hal_disconnect(h: *mut Hal) -> HRESULT {
     S_OK
 }
 
-unsafe extern "system" fn hal_submit(h: *mut Hal, kind: u32, id: u64, _frame: u32, _data: *const c_void, _size: u32) -> HRESULT {
+unsafe extern "system" fn hal_submit(h: *mut Hal, kind: u32, id: u64, frame: u32, data: *const c_void, size: u32) -> HRESULT {
+    if trace_command("acphal", kind) {
+        let dump = if data.is_null() || size == 0 { "none".to_string() } else { hex(data, (size as usize).min(96)) };
+        crate::xlog_info!("apu-trace: acphal command {kind:#x} id {id:#x} frame {frame} data {data:p} size {size}: {dump}");
+    }
     static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     {
         let mut s = SEEN.lock().unwrap();
@@ -437,14 +587,22 @@ unsafe extern "system" fn hal_pop(h: *mut Hal, m: *mut Message) -> bool {
     }
     match (*h).channel.lock().unwrap().pop(Instant::now()) {
         Some(x) => {
+            if trace_command("acphal-pop", x.kind) {
+                let (kind, value, id) = (x.kind, x.value, x.id);
+                crate::xlog_info!("apu-trace: acphal PopMessage -> kind {kind:#x} value {value:#x} id {id:#x}");
+            }
             *m = x;
             true
         }
-        None => false,
+        None => {
+            trace_command("acphal-pop", 0xFFFF_FFFF);
+            false
+        }
     }
 }
 
 unsafe extern "system" fn hal_count(h: *mut Hal) -> u32 {
+    trace_command("acphal-count", 0);
     (*h).channel.lock().unwrap().count(Instant::now())
 }
 
@@ -537,11 +695,22 @@ pub struct XApuConnectOutput {
 }
 
 const XAPU_ACTIVATE: u32 = 1;
+const XAPU_DEACTIVATE: u32 = 2;
 const XAPU_PROCESS: u32 = 3;
+
+/// What one decoder stream holds between commands.
+struct XApuStream {
+    /// 1 or 2 (what Activate asked for)
+    channels: u32,
+    /// the Opus decoder of the stream (made by the first Activate; none: no decoder in this process)
+    decoder: Option<opus::Decoder>,
+    /// between Activate and Deactivate; the decoder is kept across them and reset by the next Activate
+    active: bool,
+}
 
 struct XApu {
     results: Mutex<VecDeque<XApuResult>>,
-    channels: Mutex<Vec<u32>>,
+    channels: Mutex<Vec<XApuStream>>,
     data: usize,
     ready: usize,
     frames_per_output: u32,
@@ -602,13 +771,86 @@ where
         clear_out();
         return E_OUTOFMEMORY;
     }
-    channels.resize(n_streams, 2);
+    channels.resize_with(n_streams, || XApuStream { channels: 2, decoder: None, active: false });
     let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output });
     std::ptr::write_unaligned(output, XApuConnectOutput { data: data as *mut c_void, ready: ready as *mut c_void });
     *handle = Box::into_raw(x) as *mut c_void;
     let (process, streams) = (i.process, i.streams);
-    crate::xlog_info!("xapu: decoder connected (process {process}, {streams} streams) – it answers with silence");
+    if trace_on() {
+        let (data_bytes, per_stream, frames, options) = (i.data_bytes, i.commands_per_stream, i.frames_per_output, i.options);
+        crate::xlog_info!("apu-trace: XApuConnect: data {data_bytes:#x} B at {data:#x}, {per_stream} commands per stream, {frames} frames per output, options {options:#x}");
+    }
+    crate::xlog_info!("xapu: decoder connected (process {process}, {streams} streams) – Opus packets are decoded (silence without an Opus decoder)");
     S_OK
+}
+
+/// The Opus decoder of a stream Activate (re)started. None when the process has no decoder (logged once).
+fn new_decoder(stream: u32, channels: u32) -> Option<opus::Decoder> {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    match opus::Decoder::new(channels as u16, 48_000, &[]) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            WARNED.call_once(|| crate::xlog_warn!("xapu: no Opus decoder ({e}) – the decoder answers with silence"));
+            crate::xlog_debug!("xapu: stream {stream} without decoder");
+            None
+        }
+    }
+}
+
+/// Decodes a Process command's input (an Opus packet) into `out` (float32 samples, `channels` interleaved):
+/// `first_frame` frames of what the decoder produces are skipped, the rest fills `out` (what is not
+/// produced stays silent). Returns the frames written (None: nothing was decoded).
+unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out: &mut [f32]) -> Option<usize> {
+    let (input, input_bytes, first_frame) = (p.input, p.input_bytes, p.first_frame);
+    if !s.active {
+        return None;
+    }
+    let dec = s.decoder.as_mut()?;
+    if input.is_null() || input_bytes == 0 {
+        return None;
+    }
+    let packet = std::slice::from_raw_parts(input as *const u8, input_bytes as usize);
+    let mut pcm: Vec<i16> = Vec::with_capacity(960 * 2);
+    let ch = s.channels as usize;
+    match dec.decode_packet(packet, &mut pcm) {
+        Ok(frames) if frames > 0 => {
+            let skip = (first_frame as usize).min(frames);
+            let produced = (frames - skip).min(out.len() / ch);
+            let mut nonzero = 0u64;
+            for (o, &v) in out.iter_mut().zip(pcm[skip * ch..(skip + produced) * ch].iter()) {
+                *o = v as f32 / 32768.0;
+                nonzero += (v != 0) as u64;
+            }
+            xaudio2::note_console_decode(1, 0, produced as u64, nonzero);
+            Some(produced)
+        }
+        other => {
+            xaudio2::note_console_decode(0, 1, 0, 0);
+            if trace_on() {
+                crate::xlog_info!("apu-trace: stream {stream}: {input_bytes} B did not decode ({other:?})");
+            }
+            None
+        }
+    }
+}
+
+/// Every 5 s while the decoder works: what it decoded (the log is what a run that is cut short
+/// leaves; report.json is written at the start).
+fn report_progress() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    {
+        let mut l = LAST.lock().unwrap();
+        match *l {
+            Some(t) if now.duration_since(t) < Duration::from_secs(5) => return,
+            _ => *l = Some(now),
+        }
+    }
+    let a = xaudio2::stats();
+    crate::xlog_info!(
+        "xapu: {} Opus packets decoded ({} errors), {} frames, {} non-zero samples",
+        a.xapu_packets_decoded, a.xapu_decode_errors, a.xapu_frames, a.xapu_nonzero_samples
+    );
 }
 
 /// XApuConnect(&input, &output, &handle)
@@ -637,7 +879,8 @@ pub unsafe extern "system" fn XApuDisconnect(handle: *mut c_void) -> HRESULT {
 }
 
 /// XApuEnqueueCommand(handle, &command, &results waiting): done at once – a Process command
-/// with silence of the length asked for
+/// decodes its Opus packet into the output buffer (silence of the length asked for where there is
+/// nothing to decode)
 pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *const XApuCommand, count: *mut u32) -> HRESULT {
     use windows_sys::Win32::System::Threading::SetEvent;
     if handle.is_null() || command.is_null() {
@@ -645,20 +888,58 @@ pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *
     }
     let x = &*(handle as *const XApu);
     let c = std::ptr::read_unaligned(command);
+    if trace_command("xapu", c.kind) {
+        let (kind, stream, seq, opts, ctx) = (c.kind, c.stream, c.sequence, c.options, c.context);
+        crate::xlog_info!("apu-trace: xapu command {kind:#x} stream {stream} seq {seq} options {opts:#x} context {ctx:p}: {}", hex(command as *const c_void, command_len(kind)));
+        trace_callers(kind);
+        if kind == XAPU_PROCESS {
+            let p = std::ptr::read_unaligned(command as *const XApuProcess);
+            let (ramp, pitch, first, frames, ib, input, ob, output) = (p.ramp, p.pitch, p.first_frame, p.frames, p.input_bytes, p.input, p.output_bytes, p.output);
+            crate::xlog_info!(
+                "apu-trace:   process ramp {ramp} pitch {pitch} first_frame {first} frames {frames} input {ib} B at {input:p} output {ob} B at {output:p}; input starts {}",
+                hex(input, (ib as usize).min(512))
+            );
+        }
+    }
     let mut r = XApuResult { id: c, state: 0, state_data: 0, time: 0, error: S_OK, frames: 0, output_bytes: 0, output: std::ptr::null_mut(), pitch: 1.0, input_bytes: 0, input: std::ptr::null_mut() };
     {
         let mut ch = x.channels.lock().unwrap();
-        let s = if (c.stream as usize) < ch.len() { c.stream as usize } else { 0 };
+        // a stream the connection does not have: no decoder, no state; a Process answers with silence
+        // of the length asked for, with the channel count of the first stream (if any; else stereo)
+        let known = (c.stream as usize) < ch.len();
         if c.kind == XAPU_ACTIVATE {
             let n = std::ptr::read_unaligned(command as *const XApuActivate).channels;
-            ch[s] = if n == 1 { 1 } else { 2 };
+            let channels = if n == 1 { 1 } else { 2 };
+            if let Some(s) = ch.get_mut(c.stream as usize) {
+                match s.decoder.as_mut() {
+                    // the stream started again with the same layout: its decoder is reset, not
+                    // rebuilt (on Windows a new decoder is a new Media Foundation transform)
+                    Some(d) if s.channels == channels => d.flush(),
+                    _ => s.decoder = new_decoder(c.stream, channels),
+                }
+                s.channels = channels;
+                s.active = true;
+            }
+        } else if c.kind == XAPU_DEACTIVATE {
+            if let Some(s) = ch.get_mut(c.stream as usize) {
+                s.active = false;
+            }
         } else if c.kind == XAPU_PROCESS {
             let p = std::ptr::read_unaligned(command as *const XApuProcess);
-            let frame_bytes = ch[s] * 4;
+            let channels = if known { ch[c.stream as usize].channels } else { ch.first().map_or(2, |s| s.channels) };
+            let frame_bytes = channels * 4;
             let asked = if p.frames != 0 { p.frames } else { x.frames_per_output };
-            let frames = (if asked != 0 { asked } else { 960 }).min(p.output_bytes / frame_bytes);
+            let mut frames = (if asked != 0 { asked } else { 960 }).min(p.output_bytes / frame_bytes);
             if !p.output.is_null() && frames != 0 {
-                std::ptr::write_bytes(p.output as *mut u8, 0, (frames * frame_bytes) as usize);
+                // decoded here, then copied byte by byte: the title's buffer is not known to be 4-byte aligned
+                let mut out = vec![0.0f32; (frames * channels) as usize];
+                // decoded: the frames after first_frame; not decoded: silence of the length asked for
+                if known {
+                    if let Some(n) = decode_into(&mut ch[c.stream as usize], c.stream, &p, &mut out) {
+                        frames = n as u32;
+                    }
+                }
+                std::ptr::copy_nonoverlapping(out.as_ptr() as *const u8, p.output as *mut u8, out.len() * 4);
             }
             // output ready, more input wanted
             r.state = 1 | 2;
@@ -668,6 +949,7 @@ pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *
             r.pitch = p.pitch;
             r.input_bytes = p.input_bytes;
             r.input = p.input;
+            report_progress();
         }
     }
     let n = {
@@ -689,6 +971,7 @@ pub unsafe extern "system" fn XApuDequeueResult(handle: *mut c_void, result: *mu
     if handle.is_null() || result.is_null() {
         return E_INVALIDARG;
     }
+    trace_command("xapu-dequeue", 0);
     match (*(handle as *const XApu)).results.lock().unwrap().pop_front() {
         Some(r) => {
             std::ptr::write_unaligned(result, r);
@@ -747,7 +1030,10 @@ pub unsafe extern "system" fn XDspDisconnect(handle: *mut c_void) -> HRESULT {
     S_OK
 }
 
-pub unsafe extern "system" fn XDspActivate(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+pub unsafe extern "system" fn XDspActivate(handle: *mut c_void, a: usize, b: usize, c: usize) -> HRESULT {
+    if trace_command("dsp", 0xA0) {
+        crate::xlog_info!("apu-trace: XDspActivate({a:#x}, {b:#x}, {c:#x})");
+    }
     if handle.is_null() {
         E_INVALIDARG
     } else {
@@ -763,8 +1049,11 @@ pub unsafe extern "system" fn XDspDeactivate(handle: *mut c_void, _a: usize, _b:
     }
 }
 
-pub unsafe extern "system" fn XDspSubmitCommand(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+pub unsafe extern "system" fn XDspSubmitCommand(handle: *mut c_void, a: usize, b: usize, c: usize) -> HRESULT {
     static FIRST: std::sync::Once = std::sync::Once::new();
+    if trace_command("dsp", 0x5C) {
+        crate::xlog_info!("apu-trace: XDspSubmitCommand({a:#x}, {b:#x}, {c:#x})");
+    }
     if handle.is_null() {
         return E_INVALIDARG;
     }

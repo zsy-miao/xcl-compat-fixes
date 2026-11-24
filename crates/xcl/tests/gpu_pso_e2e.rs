@@ -30,6 +30,47 @@ fn f(x: f32) -> u32 {
     x.to_bits()
 }
 
+#[test]
+fn sample_pack_read_errors_fail_instead_of_skipping() {
+    use std::path::Path;
+    use std::process::Command;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-sample-path-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("missing-shaders.rpf");
+    // Separate processes exercise the real setup path without racing environment variables
+    // or reusing PACK's cached result. An unset sample needs no GPU, DXC or game data.
+    let run = |path: Option<&Path>| {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "retail_vs_ps_through_the_pso_hook_render_and_read_back", "--nocapture"]);
+        cmd.env_remove("XCL_SAMPLE_RPF");
+        if let Some(path) = path {
+            cmd.env("XCL_SAMPLE_RPF", path);
+        }
+        cmd.output().unwrap()
+    };
+    let unset = run(None);
+    let missing_output = run(Some(&missing));
+    let directory_output = run(Some(&dir));
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let unset_stdout = String::from_utf8_lossy(&unset.stdout);
+    assert!(unset.status.success(), "unset sample should skip: {unset:?}");
+    assert!(unset_stdout.contains("running 1 test") && unset_stdout.contains("XCL_SAMPLE_RPF not set"));
+    for (path, output) in [(&missing, missing_output), (&dir, directory_output)] {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "configured unreadable sample must fail: {output:?}");
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(stderr.contains("cannot read XCL_SAMPLE_RPF") && stderr.contains(&*path.to_string_lossy()), "{stderr}");
+        assert!(!stdout.contains("XCL_SAMPLE_RPF not set"), "{stdout}");
+    }
+}
+
 /// Console GS and NGG programs are drawn through a mesh pass: they need mesh shaders, which
 /// not every adapter has (an integrated RDNA2 GPU reports none).
 fn mesh_shaders(dev: &ID3D12Device) -> bool {
@@ -50,7 +91,13 @@ fn mesh_shaders(dev: &ID3D12Device) -> bool {
 fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::MutexGuard<'static, ()>)> {
     let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     static PACK: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    let data = PACK.get_or_init(|| std::env::var("XCL_SAMPLE_RPF").ok().and_then(|p| std::fs::read(p).ok())).as_ref();
+    let data = PACK.get_or_init(|| {
+        std::env::var_os("XCL_SAMPLE_RPF").map(|path| {
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("cannot read XCL_SAMPLE_RPF '{}': {error}", std::path::Path::new(&path).display())
+            })
+        })
+    }).as_ref();
     let Some(data) = data else {
         println!("XCL_SAMPLE_RPF not set – skipping");
         return None;

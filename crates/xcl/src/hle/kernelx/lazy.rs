@@ -199,4 +199,57 @@ mod tests {
             assert_ne!(VirtualFree(r as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
+
+
+    #[test]
+    fn a_lazy_page_is_committed_on_first_use() {
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            mark(r);
+            mark(r + PAGE);
+            assert_eq!(std::ptr::read_volatile((r + 8) as *const u32), 0);
+            std::ptr::write_volatile((r + 8) as *mut u32, 7);
+            assert_eq!(std::ptr::read_volatile((r + 8) as *const u32), 7);
+            assert!(!unmark(r), "used: no longer lazy");
+            ensure(r + PAGE + 4, 4);
+            assert!(PAGES.read().unwrap().get(&(r + PAGE)) == Some(&PageState::Committed));
+            assert!(crate::gpu::shader::readable(r + PAGE, 4));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            forget_released(r);
+        }
+    }
+
+    #[test]
+    fn threads_first_touching_one_lazy_page_together_all_go_on() {
+        const THREADS: usize = 8;
+        const PAGES: usize = 256;
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            for i in 0..PAGES {
+                mark(r + i * PAGE);
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..PAGES {
+                            barrier.wait();
+                            std::ptr::write_volatile((r + i * PAGE + t * 64) as *mut u64, (i * THREADS + t) as u64);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            for i in 0..PAGES {
+                for t in 0..THREADS {
+                    assert_eq!(std::ptr::read_volatile((r + i * PAGE + t * 64) as *const u64), (i * THREADS + t) as u64);
+                }
+            }
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            forget_released(r);
+        }
+    }
 }

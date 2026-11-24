@@ -29,6 +29,8 @@ pub enum Decision {
     /// on an un-overlaid game file becomes `CREATE_ALWAYS` in the overlay so no placeholder
     /// file is published before the native open succeeds).
     UseWithDisposition(String, u32),
+    /// CREATE_ALWAYS creates an overlay file over an existing original.
+    CreateOverOriginal(String),
     /// Fail with this Win32 error code.
     Fail(u32),
 }
@@ -67,6 +69,10 @@ pub struct Vfs {
     game_root_lc: String,
     /// XCL's data folder for the title, absolute and lower-case.
     data_root_lc: String,
+    pls_root: PathBuf,
+    pls_root_lc: String,
+    /// Other folders XCL itself reads and writes (`own_folder`), absolute and lower-case.
+    own_roots_lc: Vec<String>,
     overlay: String,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
@@ -165,9 +171,14 @@ impl Vfs {
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let data_root = data_dir.to_string_lossy();
         let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
+        let pls_root = Path::new(&data_root).join("pls");
+        let pls_root_lc = strip_verbatim(&norm(&pls_root.to_string_lossy())).to_lowercase();
         Vfs {
             game_root_lc: game_root.to_lowercase(),
             data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
+            pls_root,
+            pls_root_lc,
+            own_roots_lc: Vec::new(),
             game_root,
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
             mounts,
@@ -179,8 +190,31 @@ impl Vfs {
         }
     }
 
+    /// `dir` is a folder of XCL's own outside the title's data folder – the shader cache, which
+    /// titles share. A console drive mount must not translate its paths either: with the cache on
+    /// the PC's D: drive ("D:" is the console's game drive) the title's process wrote its DXIL
+    /// into the overlay and looked for it in the game folder, so what `xcl shaders --precompile`
+    /// had put into the cache was never found and every run compiled again.
+    pub fn own_folder(mut self, dir: &Path) -> Vfs {
+        let dir = dir.to_string_lossy();
+        let dir = full_path(&dir).unwrap_or_else(|| dir.into_owned());
+        let dir = trim_sep(&strip_verbatim(&norm(&dir))).to_lowercase();
+        if !dir.is_empty() {
+            self.own_roots_lc.push(dir);
+        }
+        self
+    }
+
     pub fn game_root(&self) -> &str {
         &self.game_root
+    }
+
+    /// Find the quota root for a path already translated by this VFS.
+    pub(crate) fn pls_root_for(&self, translated: &str) -> Option<&Path> {
+        let path = translated.to_lowercase();
+        path.strip_prefix(&self.pls_root_lc)
+            .filter(|rest| rest.is_empty() || rest.starts_with('\\'))
+            .map(|_| self.pls_root.as_path())
     }
 
     fn apply_mounts(&self, p: &str) -> Option<String> {
@@ -271,8 +305,9 @@ impl Vfs {
         }
     }
 
-    /// A path that already names the game folder or XCL's data folder on the PC. A console
-    /// drive mount ("D:") must not translate it when the PC has its folders on that drive.
+    /// A path that already names the game folder or one of XCL's own folders on the PC (the
+    /// title's data, `own_folder`). A console drive mount ("D:") must not translate it when the
+    /// PC has its folders on that drive.
     /// Only a plain drive path counts: "<game>\GAME:\x" still names a console mount.
     fn in_own_folders(&self, p: &str, full: impl Fn(&str) -> Option<String>) -> bool {
         let b = p.as_bytes();
@@ -281,7 +316,7 @@ impl Vfs {
         }
         let Some(abs) = full(p) else { return false };
         let lc = trim_sep(&strip_verbatim(&norm(&abs))).to_lowercase();
-        [&self.game_root_lc, &self.data_root_lc].iter().any(|root| {
+        [&self.game_root_lc, &self.data_root_lc].into_iter().chain(&self.own_roots_lc).any(|root| {
             lc.strip_prefix(root.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
         })
     }
@@ -464,6 +499,14 @@ impl Vfs {
         self.record_write(rel);
     }
 
+    /// Record removal of an overlay file and hide the game file it covered.
+    pub fn commit_overlay_removal(&self, rel: &str) {
+        if Path::new(&self.original_path(rel)).exists() {
+            self.add_whiteout(rel);
+        }
+        self.record_write(rel);
+    }
+
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
     /// and return the overlay path.
     pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
@@ -539,8 +582,13 @@ impl Vfs {
                     }
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
+                let replaces_original = disposition == CREATE_ALWAYS
+                    && !ov_entry
+                    && in_orig
+                    && Path::new(&self.original_path(&rel)).is_file();
                 match self.prepare_write(&rel, keep) {
                     Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
+                    Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
                     Ok(p) => Decision::Use(p),
                     Err(e) => Decision::Fail(e),
                 }
@@ -560,10 +608,7 @@ impl Vfs {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
-            if Path::new(&self.original_path(rel)).exists() {
-                self.add_whiteout(rel);
-            }
-            self.record_write(rel);
+            self.commit_overlay_removal(rel);
             return Ok(());
         }
         if !self.visible_in_original(rel) {
@@ -720,6 +765,33 @@ mod tests {
         let mangled = format!("{drive}\\cwd\\GAME:\\data\\hello.txt");
         assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shader cache on the drive the console's "D:" mount names: without `own_folder` the
+    /// title's process writes it into the overlay (and reads the game folder) – a cache filled
+    /// outside the title, where no mount applies, is not the one it then uses.
+    #[test]
+    fn a_console_drive_mount_leaves_xcls_shader_cache_on_that_drive() {
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_cache_{}", std::process::id()));
+        let game_s = full_path(&dir.join("game").to_string_lossy()).unwrap();
+        let drive = game_s[..2].to_string();
+        let cache = full_path(&dir.join("shader cache").join("dxil").to_string_lossy()).unwrap();
+        let file = format!("{cache}\\0123456789abcdef.dxil");
+        let mounts = || vec![(drive.clone(), game_s.clone())];
+
+        let before = Vfs::new(Path::new(&game_s), &dir.join("xcldata"), mounts());
+        // (the mount's target is the game folder: the cache file is taken for a game file)
+        assert_eq!(before.classify(&file), Target::Game { rel: file[3..].to_string() });
+
+        let v = Vfs::new(Path::new(&game_s), &dir.join("xcldata"), mounts()).own_folder(Path::new(&cache));
+        assert_eq!(v.classify(&file), Target::Pass);
+        assert_eq!(v.classify(&cache), Target::Pass);
+        assert_eq!(v.classify(&format!("{cache}\\translated\\0_Compute_0_4_1.bin")), Target::Pass);
+        // the folder's name is not a prefix of other names, and the rest of the drive is the console's
+        assert_eq!(v.classify(&format!("{cache}2\\x.dxil")), Target::Game { rel: format!("{}2\\x.dxil", &cache[3..]) });
+        assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
+        // a verbatim path (`std::fs::canonicalize`, which the DXIL cache uses for its folder)
+        assert_eq!(v.classify(&format!("\\\\?\\{file}")), Target::Pass);
     }
 
     #[test]
@@ -892,7 +964,11 @@ mod tests {
                 )
             };
             assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
-            assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            // Windows' own codes are the reference; Wine answers a directory opened with
+            // FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS
+            if !crate::util::under_wine() {
+                assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            }
             assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
         }
         assert!(!v.visible_in_overlay("data"));

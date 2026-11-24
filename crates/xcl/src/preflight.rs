@@ -44,6 +44,8 @@ pub struct Gpu {
 #[derive(Debug, Clone)]
 pub struct Found {
     pub dxc: Result<String, String>,
+    /// the DXC in that folder, for its version
+    pub dxc_toolchain: crate::gpu::recomp::dxc::Toolchain,
     pub xgameruntime: bool,
     pub gpu: Result<Gpu, String>,
 }
@@ -78,11 +80,18 @@ pub fn checks(f: &Found) -> Vec<Check> {
         }
     }
     match &f.dxc {
-        Ok(dir) => v.push(check(Level::Ok, format!("DXC: {dir}"), None)),
+        Ok(dir) => {
+            use crate::gpu::recomp::dxc;
+            let t = &f.dxc_toolchain;
+            v.push(check(Level::Ok, format!("DXC {}: {dir}", t.dxcompiler), None));
+            if t.outdated() {
+                v.push(check(Level::Note, format!("DXC is older than {}.{}: {}", dxc::RECOMMENDED.0, dxc::RECOMMENDED.1, dxc::OUTDATED_COST), Some(dxc::OUTDATED_FIX)));
+            }
+        }
         Err(_) => v.push(check(Level::Error, "no DXC (dxcompiler.dll + dxil.dll): no shader can be compiled, the game draws nothing", Some("install the Windows SDK, or put dxcompiler.dll and dxil.dll next to xcl.exe (or in %XCL_DXC_DIR%)"))),
     }
     if !f.xgameruntime {
-        v.push(check(Level::Warning, "no System32\\xgameruntime.dll: XCL's own XGameRuntime parts work, the rest (task queues, networking, dialogs) is missing", Some("install Gaming Services (Microsoft Store)")));
+        v.push(check(Level::Warning, "no System32\\xgameruntime.dll: dialogs, text entry, game invites and game streaming are missing (XCL's own task queues, async and networking are used)", Some("install Gaming Services (Microsoft Store)")));
     }
     v
 }
@@ -148,6 +157,7 @@ fn xgameruntime_present() -> bool {
 pub fn run(setting: &str) -> Vec<Check> {
     let found = Found {
         dxc: crate::gpu::recomp::dxc::location().map(|p| p.display().to_string()),
+        dxc_toolchain: crate::gpu::recomp::dxc::toolchain(),
         xgameruntime: xgameruntime_present(),
         gpu: probe_gpu(setting),
     };
@@ -180,7 +190,12 @@ mod tests {
     }
 
     fn found(gpu: Gpu) -> Found {
-        Found { dxc: Ok(r"C:\dxc".into()), xgameruntime: true, gpu: Ok(gpu) }
+        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, gpu: Ok(gpu) }
+    }
+
+    fn dxc(major: u32, minor: u32) -> crate::gpu::recomp::dxc::Toolchain {
+        let dxcompiler = crate::gpu::recomp::dxc::Library { major, minor, ..Default::default() };
+        crate::gpu::recomp::dxc::Toolchain { dir: r"C:\dxc".into(), dxcompiler, ..Default::default() }
     }
 
     fn levels(f: &Found) -> Vec<Level> {
@@ -200,6 +215,9 @@ mod tests {
         let c = checks(&f);
         assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Warning, Level::Error, Level::Warning]);
         assert!(c[1].what.contains("has 6.5"), "{:?}", c[1]);
+        // XCL's own task queues and networking stand in for the PC runtime's: not missing
+        let missing = c[4].what.split(" missing").next().unwrap();
+        assert!(missing.contains("dialogs") && !missing.contains("task queues") && !missing.contains("networking"), "{:?}", c[4]);
         assert!(c.iter().filter(|c| c.level != Level::Ok).all(|c| c.fix.is_some()), "{c:?}");
     }
 
@@ -212,6 +230,15 @@ mod tests {
         // 64 in range: nothing; 8–16 (neither size): an error
         assert_eq!(levels(&found(Gpu { wave_min: 64, wave_max: 64, ..gpu() })), [Level::Ok, Level::Ok]);
         assert_eq!(levels(&found(Gpu { wave_min: 8, wave_max: 16, ..gpu() }))[1], Level::Error);
+    }
+
+    #[test]
+    fn an_old_dxc_is_a_note_with_a_fix() {
+        let c = checks(&Found { dxc_toolchain: dxc(1, 7), ..found(gpu()) });
+        assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Ok, Level::Note]);
+        assert_eq!(c[1].what, r"DXC 1.7: C:\dxc");
+        assert!(c[2].what.contains("older than 1.8") && c[2].fix.as_deref().is_some_and(|f| f.contains("XCL_DXC_DIR")), "{:?}", c[2]);
+        assert_eq!(levels(&Found { dxc_toolchain: dxc(1, 8), ..found(gpu()) }), [Level::Ok, Level::Ok]);
     }
 
     #[test]

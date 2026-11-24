@@ -261,11 +261,66 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
     allow_stub.then(|| stub_for(key, None, what))
 }
 
+/// `XCL_TRACE_IMPORTS`: which imports get a call tracer (arguments and result of every call
+/// logged). Comma-separated: `1`/`hle` – every HLE function (the default); `all` – system
+/// functions too (a data export imported from a system DLL would be wrapped as well, so this
+/// is for short runs); any other word – a prefix of `dll!Function` to include, `-word` one to
+/// exclude (e.g. `hle,-kernelx!GetTickCount,gameinput`).
+struct TraceFilter {
+    hle: bool,
+    all: bool,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+fn trace_filter() -> Option<&'static TraceFilter> {
+    static FILTER: std::sync::OnceLock<Option<TraceFilter>> = std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let v = std::env::var("XCL_TRACE_IMPORTS").ok()?;
+            let mut f = TraceFilter { hle: false, all: false, include: Vec::new(), exclude: Vec::new() };
+            for w in v.split(',').map(|w| w.trim().to_ascii_lowercase()).filter(|w| !w.is_empty()) {
+                match w.as_str() {
+                    "1" | "hle" => f.hle = true,
+                    "all" => f.all = true,
+                    _ => match w.strip_prefix('-') {
+                        Some(x) => f.exclude.push(x.to_string()),
+                        None => f.include.push(w),
+                    },
+                }
+            }
+            if !f.all && f.include.is_empty() {
+                f.hle = true;
+            }
+            Some(f)
+        })
+        .as_ref()
+}
+
+impl TraceFilter {
+    fn wants(&self, key: &str, function: &str, source: &Source) -> bool {
+        let full = format!("{key}!{function}").to_ascii_lowercase();
+        if self.exclude.iter().any(|p| full.starts_with(p.as_str())) {
+            return false;
+        }
+        match source {
+            Source::Stub => false, // a stub logs its own calls
+            Source::Hle(_) | Source::HleOther(_) if self.hle => true,
+            _ => self.all || self.include.iter().any(|p| full.starts_with(p.as_str())),
+        }
+    }
+}
+
 /// Resolve one static/delay import and record the outcome for the report.
 pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool) -> usize {
     let key = dll_key(dll);
-    let (addr, source) = resolve_inner(&key, what, 0);
+    let (mut addr, source) = resolve_inner(&key, what, 0);
     crate::xlog_debug!("import {importer}: {key}!{what} → {source:?}");
+    if let Some(f) = trace_filter() {
+        if f.wants(&key, &fname(what), &source) {
+            addr = crate::hle::d3d12x::guard::make_call_tracer(addr, format!("{key}!{what}"));
+        }
+    }
     RECORDS.lock().unwrap().push(ImportRecord {
         importer: importer.to_string(),
         dll: key,
@@ -409,6 +464,8 @@ mod tests {
         assert!(a != 0 && matches!(s, Source::System(ref d) if d == "user32.dll"), "{s:?}");
         let (a, s) = resolve_inner("kernel32legacy.dll", &name("GetProcessAffinityMask"), 0);
         assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
+        let (a, s) = resolve_inner("kernel32legacy.dll", &name("SetThreadAffinityMask"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("minappmodelx.dll", &name("RegisterAppStateChangeNotification"), 0);
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("advapi32legacy.dll", &name("RegOpenKeyW"), 0);

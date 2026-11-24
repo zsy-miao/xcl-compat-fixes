@@ -132,6 +132,32 @@ pub fn user_data(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR, l.inline, args, table_at)
 }
 
+/// Bytes of a compute dispatch's arguments that go in user SGPRs: the layout's rule, but
+/// never more than the shader itself has registers for. `user_sgprs` is the shader's own
+/// count (`real::pso_user_sgprs`; None = not known, the rule alone). The console's newer
+/// compiler follows the rule; XboxBvhBuilder.dll's shaders were built with four user SGPRs
+/// whatever their root signature (s4 is the group id) and take every argument from the
+/// table, also where the first ones would fit. Parameters stay whole: the inline part ends
+/// where the last parameter that fits the shader's registers ends.
+pub fn inline_for(l: &Layout, user_sgprs: Option<u32>) -> u32 {
+    let Some(user) = user_sgprs else { return l.inline };
+    let has = 4 * user.saturating_sub(FIRST_SGPR as u32);
+    if l.inline <= has {
+        return l.inline;
+    }
+    let end = |p: &Param| match *p {
+        Param::Constants { at, count } => at + 4 * count,
+        Param::Descriptor { at } => at + 8,
+        Param::Table { at } => at + 4,
+    };
+    l.params.iter().map(end).take_while(|&e| e <= has).last().unwrap_or(0)
+}
+
+/// `user_data` for a shader with `user_sgprs` user SGPRs (`inline_for`).
+pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at: u64) -> Vec<u32> {
+    sgprs(FIRST_SGPR, inline_for(l, user_sgprs), args, table_at)
+}
+
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
 pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
@@ -660,6 +686,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         return Err("the UMA buffer is not open on the GPU".into());
     }
     let _ = u;
+    // the whole recording is replayed into the PC list here: its transitions of textures kept
+    // in step are these
+    super::title_textures::list_reset(st.pc);
     let windows = super::real::uma_window_vas();
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
     let mut out = Translation::default();
@@ -703,6 +732,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     // borrowed (ManuallyDrop fields, nothing released)
                     let mut b: Vec<u64> = vec![0; 4 * n];
                     std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * n);
+                    if super::title_textures::any() {
+                        // each barrier: type | flags, resource, subresource | before, after
+                        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
+                            b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
+                        super::title_textures::note_transitions(st.pc, &t);
+                    }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
                 out.barriers += n as u32;
@@ -782,10 +817,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             out.skipped_dispatches += 1;
                             continue;
                         }
-                        let inline = layout.as_ref().map_or(0, |l| l.inline as usize).min(table.len());
+                        let user_sgprs = super::real::pso_user_sgprs(real);
+                        let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
-                            Some(l) => user_data(l, &table, table_at as u64),
+                            Some(l) => user_data_for(l, user_sgprs, &table, table_at as u64),
                             None => vec![table_at as u32, (table_at >> 32) as u32],
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
@@ -895,6 +931,25 @@ mod tests {
         assert_eq!(l.params, vec![Param::Constants { at: 0, count: 19 }, Param::Descriptor { at: 76 }, Param::Descriptor { at: 84 }, Param::Descriptor { at: 92 }]);
         assert_eq!(l.size, 100);
         assert_eq!(l.inline, 0, "19 constants do not fit in user SGPRs: everything in the table");
+    }
+
+    /// The shader's own count of user SGPRs caps what goes inline: a shader built with four
+    /// (XboxBvhBuilder.dll's, whatever the root signature) takes every argument from the table.
+    #[test]
+    fn a_shader_with_four_user_sgprs_takes_every_argument_from_the_table() {
+        // two root descriptors and 16 constants: by the rule alone the descriptors are inline
+        let l = layout_from_blob(&rts0(&[(4, 0), (4, 0), (1, 16)])).unwrap();
+        assert_eq!((l.size, l.inline), (80, 16));
+        let args: Vec<u8> = (0..80u8).collect();
+        assert_eq!(inline_for(&l, None), 16, "count not known: the rule");
+        assert_eq!(inline_for(&l, Some(8)), 16, "four registers of arguments: the rule");
+        assert_eq!(inline_for(&l, Some(20)), 16, "more registers than the rule uses: the rule");
+        assert_eq!(inline_for(&l, Some(6)), 8, "two registers of arguments: one descriptor");
+        assert_eq!(inline_for(&l, Some(7)), 8, "three: still one descriptor, a parameter stays whole");
+        assert_eq!(inline_for(&l, Some(4)), 0, "s4 is not an argument: everything in the table");
+        assert_eq!(inline_for(&l, Some(0)), 0, "no user SGPR at all");
+        assert_eq!(user_data_for(&l, Some(4), &args, 0x7_0000_0100), vec![0x100, 7, 0, 0]);
+        assert_eq!(user_data_for(&l, Some(8), &args, 0x7_0000_0100), user_data(&l, &args, 0x7_0000_0100));
     }
 
     /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)

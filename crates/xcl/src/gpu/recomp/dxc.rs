@@ -1,9 +1,12 @@
 //! In-process HLSL → DXIL compilation with DXC.
 //!
 //! `dxcompiler.dll` is not part of Windows, so it is loaded at run time from
-//! `%XCL_DXC_DIR%`, the folder of xcl.exe, or the newest Windows SDK
+//! `%XCL_DXC_DIR%`, the folder of xcl.exe, or the Windows SDK with the newest DXC
 //! (`Windows Kits\10\bin\<ver>\x64`). `dxil.dll` from the same folder is loaded first so
 //! the compiler can sign the DXIL (unsigned DXIL is rejected by D3D12).
+//!
+//! Which DXC it is matters ([`Toolchain::outdated`]), so the one that was loaded is logged and
+//! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,6 +20,59 @@ use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
+/// A dotted version, `10.0.26100.0` or `1.9.2602.17`, as four numbers (missing ones are 0).
+fn parse_version(s: &str) -> Option<[u32; 4]> {
+    let mut v = [0u32; 4];
+    let mut parts = s.split('.');
+    for x in v.iter_mut() {
+        match parts.next() {
+            Some(p) => *x = p.parse().ok()?,
+            None => break,
+        }
+    }
+    parts.next().is_none().then_some(v)
+}
+
+/// The version resource of a file.
+fn file_version(path: &Path) -> Option<[u32; 4]> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO};
+    let name = crate::util::wide(&path.to_string_lossy());
+    unsafe {
+        let n = GetFileVersionInfoSizeW(name.as_ptr(), std::ptr::null_mut());
+        if n == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; n as usize];
+        if GetFileVersionInfoW(name.as_ptr(), 0, n, data.as_mut_ptr() as *mut c_void) == 0 {
+            return None;
+        }
+        let (mut p, mut len) = (std::ptr::null_mut::<c_void>(), 0u32);
+        if VerQueryValueW(data.as_ptr() as *const c_void, crate::util::wide("\\").as_ptr(), &mut p, &mut len) == 0 || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>() {
+            return None;
+        }
+        let f = std::ptr::read_unaligned(p as *const VS_FIXEDFILEINFO);
+        Some([f.dwFileVersionMS >> 16, f.dwFileVersionMS & 0xFFFF, f.dwFileVersionLS >> 16, f.dwFileVersionLS & 0xFFFF])
+    }
+}
+
+/// The DXC release a `dxcompiler.dll` with this version resource is, for comparing folders:
+/// `1.7.2308.16` is itself; the old SDKs' compilers carry the number of their Windows build
+/// (`10.0.19041.x`, DXC 1.5 and before), so those, and files that say nothing, come last.
+fn dxc_release(file: Option<[u32; 4]>) -> [u32; 4] {
+    match file {
+        Some(v) if v[0] < 10 => v,
+        _ => [0; 4],
+    }
+}
+
+/// Windows SDK folders (name, version resource of the `dxcompiler.dll` in its `x64`), the one
+/// to try first in front: the newest DXC, and between equal ones the newest SDK. The names are
+/// compared as versions (`10.0.100000.0` is newer than `10.0.26100.0`), other names last.
+fn order_sdk_folders(mut v: Vec<(String, Option<[u32; 4]>)>) -> Vec<String> {
+    v.sort_by(|a, b| (dxc_release(b.1), parse_version(&b.0), &b.0).cmp(&(dxc_release(a.1), parse_version(&a.0), &a.0)));
+    v.into_iter().map(|(name, _)| name).collect()
+}
+
 fn candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(d) = std::env::var_os("XCL_DXC_DIR") {
@@ -27,17 +83,208 @@ fn candidates() -> Vec<PathBuf> {
     }
     for root in [r"C:\Program Files (x86)\Windows Kits\10\bin", r"C:\Program Files\Windows Kits\10\bin"] {
         if let Ok(rd) = std::fs::read_dir(root) {
-            let mut vers: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-            vers.sort();
-            for ver in vers.into_iter().rev() {
-                v.push(ver.join("x64"));
+            let vers = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir());
+            let vers = vers.map(|p| (p.file_name().unwrap_or_default().to_string_lossy().into_owned(), file_version(&p.join("x64").join("dxcompiler.dll"))));
+            for ver in order_sdk_folders(vers.collect()) {
+                v.push(Path::new(root).join(ver).join("x64"));
             }
         }
     }
     v
 }
 
+/// One of DXC's two libraries, as it identifies itself.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Library {
+    /// the file's version resource: `1.9.2602.17` is the GitHub release 1.9.2602. The Windows
+    /// SDK's `dxil.dll` says `101.7.2308.24`, and SDKs before 10.0.22000 the number of their
+    /// Windows build
+    pub file_version: String,
+    /// `IDxcVersionInfo::GetVersion`: the newest DXIL the library knows, which is not always
+    /// its release (1.8.2505 says 1.9). 0 and 0: the library did not say
+    pub major: u32,
+    pub minor: u32,
+    /// `IDxcVersionInfo2::GetCommitInfo`: the commit DXC was built from
+    pub commit: String,
+}
+
+impl Library {
+    /// The file's version when it is a DXC release number.
+    fn release(&self) -> Option<[u32; 4]> {
+        parse_version(&self.file_version).filter(|v| (1..10).contains(&v[0]))
+    }
+
+    /// The release, (1, 9) for 1.9.2602: from the file, else what the library said.
+    pub fn version(&self) -> Option<(u32, u32)> {
+        match self.release() {
+            Some(v) => Some((v[0], v[1])),
+            None => ((self.major, self.minor) != (0, 0)).then_some((self.major, self.minor)),
+        }
+    }
+}
+
+impl std::fmt::Display for Library {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.release(), self.version(), self.file_version.is_empty()) {
+            (Some(_), ..) => write!(f, "{}", self.file_version)?,
+            (None, Some((major, minor)), true) => write!(f, "{major}.{minor}")?,
+            (None, Some((major, minor)), false) => write!(f, "{major}.{minor} (file {})", self.file_version)?,
+            (None, None, false) => write!(f, "(file {})", self.file_version)?,
+            (None, None, true) => write!(f, "of unknown version")?,
+        }
+        if !self.commit.is_empty() {
+            write!(f, " ({})", self.commit)?;
+        }
+        Ok(())
+    }
+}
+
+/// The DXC this process compiles with (`dxc` in `report.json`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Toolchain {
+    /// the folder the libraries came from; empty while DXC is not loaded
+    pub dir: String,
+    pub dxcompiler: Library,
+    /// the signer from the same folder; empty when the folder has none
+    pub dxil: Library,
+}
+
+/// The oldest DXC release XCL recommends (see [`Toolchain::outdated`]).
+pub const RECOMMENDED: (u32, u32) = (1, 8);
+
+impl Toolchain {
+    /// Whether the compiler is older than [`RECOMMENDED`]. Measured with 1.7.2308 (what Windows
+    /// SDK 10.0.26100.4654 installs; other revisions of that SDK have 1.8.2502) against
+    /// 1.9.2602 on an RTX 5070 Ti, synthetic translated compute programs (issue #156): DXIL
+    /// 2.1–2.7 times the size, pipeline creation in the driver 1.4–2.2 times as long. 1.7 also
+    /// rejects `[WaveSize]` on the entries of a library, which 1.8 accepts; the sizes of 1.8's
+    /// DXIL were not measured.
+    pub fn outdated(&self) -> bool {
+        self.dxcompiler.version().is_some_and(|v| v < RECOMMENDED)
+    }
+}
+
+/// Why an outdated DXC is worth replacing, and how.
+pub const OUTDATED_COST: &str = "DXC 1.7 made DXIL 2–2.7 times the size of DXC 1.9's from translated compute programs, and an NVIDIA driver took 1.4–2.2 times as long to build pipelines from it";
+pub const OUTDATED_FIX: &str = r"download DXC 1.8 or newer from github.com/microsoft/DirectXShaderCompiler/releases and set XCL_DXC_DIR to its bin\x64 folder";
+
+/// Ask a DXC library for its version. Nothing here fails the load: what the library does not
+/// answer stays empty.
+unsafe fn library(create: CreateInstance, class: &GUID, file: &Path) -> Library {
+    use windows::Win32::Graphics::Direct3D::Dxc::{IDxcVersionInfo, IDxcVersionInfo2};
+    let mut lib = Library { file_version: file_version(file).map(|v| format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3])).unwrap_or_default(), ..Default::default() };
+    let mut p = std::ptr::null_mut();
+    if create(class, &IDxcVersionInfo::IID, &mut p).is_err() || p.is_null() {
+        return lib;
+    }
+    let info = IDxcVersionInfo::from_raw(p);
+    let _ = info.GetVersion(&mut lib.major, &mut lib.minor);
+    if let Ok(info2) = info.cast::<IDxcVersionInfo2>() {
+        let (mut count, mut hash) = (0u32, std::ptr::null_mut::<i8>());
+        if info2.GetCommitInfo(&mut count, &mut hash).is_ok() && !hash.is_null() {
+            lib.commit = std::ffi::CStr::from_ptr(hash).to_string_lossy().into_owned();
+            windows::Win32::System::Com::CoTaskMemFree(Some(hash as *const c_void));
+        }
+    }
+    lib
+}
+
 static LIB: OnceLock<Result<(PathBuf, usize), String>> = OnceLock::new();
+static TOOLCHAIN: OnceLock<Toolchain> = OnceLock::new();
+
+/// The DXC in use; empty while none is loaded (asking does not load it).
+pub fn toolchain() -> Toolchain {
+    TOOLCHAIN.get().cloned().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn versions_parse_and_compare_as_numbers() {
+        assert_eq!(parse_version("10.0.26100.0"), Some([10, 0, 26100, 0]));
+        assert_eq!(parse_version("1.9.2602.17"), Some([1, 9, 2602, 17]));
+        assert_eq!(parse_version("1.8"), Some([1, 8, 0, 0]));
+        for bad in ["", "x64", "1.8.", "1.x", "1.2.3.4.5", "-1.0"] {
+            assert_eq!(parse_version(bad), None, "{bad:?}");
+        }
+        assert!(parse_version("10.0.100000.0") > parse_version("10.0.26100.0"));
+        assert!(parse_version("1.10") > parse_version("1.9.2602.17"));
+    }
+
+    #[test]
+    fn the_sdk_with_the_newest_dxc_is_tried_first() {
+        let sdk = |name: &str, dxc: Option<[u32; 4]>| (name.to_string(), dxc);
+        let order = order_sdk_folders(vec![
+            sdk("arm64", None),
+            sdk("10.0.19041.0", Some([10, 0, 19041, 5609])), // DXC 1.5 under Windows' own number
+            sdk("10.0.22621.0", Some([1, 6, 2112, 16])),
+            sdk("10.0.26100.0", Some([1, 7, 2308, 16])),
+            sdk("10.0.100000.0", Some([1, 7, 2308, 16])), // sorts below 10.0.2… as a name
+            sdk("10.0.22000.0", Some([1, 8, 2505, 32])), // a newer DXC copied into an older SDK
+            sdk("10.0.17134.0", None),
+            sdk("x64", None),
+        ]);
+        assert_eq!(order, ["10.0.22000.0", "10.0.100000.0", "10.0.26100.0", "10.0.22621.0", "10.0.19041.0", "10.0.17134.0", "x64", "arm64"]);
+    }
+
+    #[test]
+    fn dxc_below_1_8_is_outdated() {
+        let lib = |major, minor, file: &str| Library { major, minor, file_version: file.into(), commit: String::new() };
+        let outdated = |l: Library| Toolchain { dir: r"C:\dxc".into(), dxcompiler: l, dxil: Library::default() }.outdated();
+        // the four compilers of the note in the pull request, as they answer
+        assert!(outdated(lib(1, 7, "1.7.2308.16")));
+        assert!(outdated(lib(1, 5, "10.0.19041.5609")));
+        assert!(!outdated(lib(1, 9, "1.8.2505.32")), "the release counts, not the DXIL version it knows");
+        assert!(!outdated(lib(1, 9, "1.9.2602.17")));
+        assert!(outdated(lib(1, 9, "1.7.2308.16")));
+        // a file that says nothing of the release: what the library says; neither: no verdict
+        assert!(outdated(lib(1, 6, "")));
+        assert!(!outdated(lib(1, 10, "")));
+        assert!(!outdated(lib(2, 0, "101.0.1.2")));
+        assert!(outdated(lib(0, 0, "1.6.2112.16")));
+        assert!(!outdated(lib(0, 0, "10.0.19041.5609")));
+        assert!(!outdated(lib(0, 0, "")));
+        assert!(!Toolchain::default().outdated());
+
+        assert_eq!(lib(1, 9, "1.8.2505.32").to_string(), "1.8.2505.32");
+        assert_eq!(lib(1, 5, "10.0.19041.5609").to_string(), "1.5 (file 10.0.19041.5609)");
+        assert_eq!(lib(1, 7, "101.7.2308.24").to_string(), "1.7 (file 101.7.2308.24)");
+        assert_eq!(Library { commit: "21d28f72".into(), ..lib(1, 9, "1.9.2602.17") }.to_string(), "1.9.2602.17 (21d28f72)");
+        assert_eq!(lib(1, 9, "").to_string(), "1.9");
+        assert_eq!(lib(0, 0, "10.0.1.2").to_string(), "(file 10.0.1.2)");
+    }
+
+    /// The DXC of this PC, when it has one: what `report.json` says of it.
+    #[test]
+    fn the_loaded_dxc_is_identified() {
+        let Ok(dir) = location() else {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        };
+        let t = toolchain();
+        assert_eq!(Path::new(&t.dir), dir);
+        let major = t.dxcompiler.major;
+        assert!(major >= 1, "IDxcVersionInfo of dxcompiler.dll: {t:?}");
+        assert!(!t.dxcompiler.file_version.is_empty(), "{t:?}");
+        assert_eq!(Some(t.outdated()), t.dxcompiler.version().map(|v| v < RECOMMENDED));
+        if dir.join("dxil.dll").is_file() {
+            assert!(t.dxil.version().is_some(), "{t:?}");
+        }
+        // as the `dxc` of a report, and a report from before the field reads as "not loaded"
+        let report = crate::report::Report { dxc: t.clone(), ..Default::default() };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["dxc"]["dir"], t.dir);
+        assert_eq!(json["dxc"]["dxcompiler"]["major"], major);
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("dxc");
+        assert_eq!(serde_json::from_value::<crate::report::Report>(old).unwrap().dxc, Toolchain::default());
+        println!("DXC: dxcompiler {}, dxil {}, from {}", t.dxcompiler, t.dxil, t.dir);
+    }
+}
 
 /// Folder with dxcompiler.dll (+ dxil.dll) that will be used.
 pub fn location() -> Result<&'static Path, String> {
@@ -54,14 +301,23 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
             }
             unsafe {
                 let dxil = dir.join("dxil.dll");
-                if dxil.is_file() {
-                    LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr());
-                }
+                let signer = if dxil.is_file() { LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr()) } else { std::ptr::null_mut() };
                 let h = LoadLibraryW(crate::util::wide(&dxc.to_string_lossy()).as_ptr());
                 if h.is_null() {
                     continue;
                 }
                 if let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) {
+                    let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
+                    t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
+                    if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
+                        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
+                    }
+                    let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
+                    crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
+                    if t.outdated() {
+                        crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
+                    }
+                    let _ = TOOLCHAIN.set(t);
                     return Ok((dir, f as usize));
                 }
             }

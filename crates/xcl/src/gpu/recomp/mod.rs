@@ -236,13 +236,17 @@ impl CsInterface {
         if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
             return None;
         }
-        Some(CsInterface {
+        Some(Self::from_rsrc2(threads, r))
+    }
+
+    fn from_rsrc2(threads: [u32; 3], r: u32) -> Self {
+        Self {
             threads,
             user_sgprs: (r >> 1) & 31,
             tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
             tg_size: (r >> 10) & 1 == 1,
             tid_components: ((r >> 11) & 3) + 1,
-        })
+        }
     }
 }
 
@@ -484,9 +488,10 @@ pub struct Options {
     /// the GPU runs only 32-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`
     /// < 64, e.g. NVIDIA): each console wave of a wave64 kernel / compute / mesh / geometry
     /// program runs as two hardware wave32 halves that exchange masks and lane values through
-    /// groupshared memory (`docs/wave64-on-wave32.md`). A wave64 VS / PS (wave size picked by
-    /// the driver) gets the values of lanes 32..63 it reads where a 32-lane wave lacks them
-    /// (`upper_lanes`). No effect on wave32 programs.
+    /// groupshared memory (`docs/wave64-on-wave32.md`). For a wave64 VS / PS (wave size picked
+    /// by the driver) it means the GPU *can* run 32-lane waves (`pso::graphics_wave32`, also
+    /// RDNA): the program gets the values of lanes 32..63 it reads where a 32-lane wave lacks
+    /// them (`upper_lanes`). No effect on wave32 programs.
     pub split_wave64: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
@@ -1356,7 +1361,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
         em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
     }
-    // a wave64 VS / PS on a GPU with 32-lane waves only: what lanes 32..63 hold where the
+    // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
     // program with a read to change gets the form
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {

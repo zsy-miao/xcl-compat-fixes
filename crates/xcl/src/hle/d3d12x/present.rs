@@ -22,10 +22,11 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -37,6 +38,7 @@ static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAME_DUMP: Mutex<Option<FrameDumpSample>> = Mutex::new(None);
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
@@ -392,15 +394,17 @@ fn window_thread() {
         let title = window_name();
         let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (x, y) = window_position(&cfg.window_pos, w, h);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(inst.into()),
@@ -420,6 +424,45 @@ fn window_thread() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// The XCL window's top-left from `window_pos` (`XCL_WINDOW_POS` overrides): "auto" keeps
+/// CW_USEDEFAULT (Windows may pick any monitor), "center" centers on the primary monitor's
+/// work area, "x,y" is clamped into the nearest monitor's work area — a multi-monitor desktop
+/// otherwise gets the window on whichever monitor Windows' cascade picks.
+unsafe fn window_position(setting: &str, w: i32, h: i32) -> (i32, i32) {
+    let env = std::env::var("XCL_WINDOW_POS").ok();
+    let mode = env.as_deref().unwrap_or(setting).trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    }
+    let work = |pt: POINT, flags: u32| -> Option<RECT> {
+        let mon = MonitorFromPoint(pt, MONITOR_FROM_FLAGS(flags));
+        if mon.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcWork)
+    };
+    if mode.eq_ignore_ascii_case("center") {
+        let Some(r) = work(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY.0) else {
+            return (CW_USEDEFAULT, CW_USEDEFAULT);
+        };
+        return (r.left + ((r.right - r.left) - w).max(0) / 2, r.top + ((r.bottom - r.top) - h).max(0) / 2);
+    }
+    let Some((xs, ys)) = mode.split_once(',') else {
+        crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    };
+    let (Ok(x), Ok(y)) = (xs.trim().parse::<i32>(), ys.trim().parse::<i32>()) else {
+        crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    };
+    // clamp into the work area of the monitor nearest the requested top-left
+    let Some(r) = work(POINT { x, y }, MONITOR_DEFAULTTONEAREST.0) else {
+        return (x, y);
+    };
+    (x.clamp(r.left, (r.right - w).max(r.left)), y.clamp(r.top, (r.bottom - h).max(r.top)))
 }
 
 fn ensure_window() -> Option<HWND> {
@@ -712,6 +755,25 @@ pub fn presents() -> u64 {
     PRESENTS.load(Ordering::Relaxed)
 }
 
+/// Content sampled by an existing `XCL_FRAME_DUMP` readback, not proof of gameplay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrameDumpSample {
+    /// Zero-based presentation index, as in `frame_<n>.bmp`.
+    pub frame: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: i32,
+    /// One texel every `sample_step` pixels in each direction (normally 4).
+    pub sample_step: u32,
+    pub sampled_pixels: u64,
+    /// Samples whose decoded 8-bit R+G+B exceeds 30; None for an undecoded format.
+    pub non_dark_samples: Option<u64>,
+}
+
+pub fn last_frame_dump() -> Option<FrameDumpSample> {
+    LAST_FRAME_DUMP.lock().ok().and_then(|s| *s)
+}
+
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
 unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let dev: ID3D12Device = {
@@ -865,6 +927,20 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     rb.Unmap(0, None);
     let n = PRESENTS.load(Ordering::Relaxed);
+    // `XCL_TRACE_FRAME` also dumps intermediate targets; only the presented image belongs here.
+    if tag == "frame" {
+        if let Ok(mut last) = LAST_FRAME_DUMP.lock() {
+            *last = Some(FrameDumpSample {
+                frame: n,
+                width: w as u32,
+                height: h as u32,
+                format: format.0,
+                sample_step: step as u32,
+                sampled_pixels: (ow * oh) as u64,
+                non_dark_samples: decoded.then_some(lit as u64),
+            });
+        }
+    }
     let Some(boot) = crate::state::boot() else { return };
     let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
     let _ = std::fs::write(&path, &bmp);
@@ -884,6 +960,128 @@ impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
+    #[test]
+    fn window_position_modes() {
+        unsafe {
+            std::env::remove_var("XCL_WINDOW_POS");
+            assert_eq!(window_position("auto", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("nonsense", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("12,abc", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+
+            let (cx, cy) = window_position("center", 1280, 720);
+            if cx != CW_USEDEFAULT {
+                // centered on the primary work area: inside it, and not off its left/top
+                let mi = {
+                    let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    assert!(GetMonitorInfoW(mon, &mut mi).as_bool());
+                    mi
+                };
+                assert!(cx >= mi.rcWork.left && cy >= mi.rcWork.top);
+                assert!(cx + 1280 <= mi.rcWork.right || mi.rcWork.right - mi.rcWork.left < 1280);
+            }
+
+            // a position far outside every monitor clamps into the nearest work area
+            let (x, y) = window_position("100000,100000", 1280, 720);
+            let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+            assert!(!mon.is_invalid());
+
+            // the env override wins over the setting
+            std::env::set_var("XCL_WINDOW_POS", "center");
+            assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
+            std::env::remove_var("XCL_WINDOW_POS");
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_dump_tests {
+    use super::*;
+    use super::super::real::D3d12Stats;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    #[test]
+    fn reports_without_frame_dumps_remain_readable() {
+        let stats = D3d12Stats { presents: 100, ..Default::default() };
+        let mut json = serde_json::to_value(&stats).unwrap();
+        assert!(json["last_frame_dump"].is_null(), "presents alone do not establish content");
+        json.as_object_mut().unwrap().remove("last_frame_dump");
+        let old: D3d12Stats = serde_json::from_value(json).unwrap();
+        assert_eq!(old.presents, 100);
+        assert_eq!(old.last_frame_dump, None);
+    }
+
+    #[test]
+    fn mapped_frame_dump_distinguishes_dark_bright_and_undecoded_content() {
+        unsafe {
+            // WARP needs no physical GPU. Fill a CPU-visible buffer with the same padded
+            // footprint used by a readback, so this exercises write_frame's actual decoder.
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 512 + 256 * 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer,
+            ).unwrap();
+            let buffer = buffer.unwrap();
+            let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 512,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 8, Height: 8, Depth: 1, RowPitch: 256,
+                },
+            };
+            let fill = |red: u8| {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, desc.Width as usize);
+                bytes.fill(255); // padding must not be counted as bright pixels
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let start = 512 + y * 256 + x * 4;
+                        bytes[start..start + 4].copy_from_slice(&[red, 0, 0, 255]);
+                    }
+                }
+                buffer.Unmap(0, None);
+            };
+            fill(30);
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            let dark = last_frame_dump().unwrap();
+            assert_eq!((dark.width, dark.height, dark.format), (8, 8, 28));
+            assert_eq!(dark.sampled_pixels, (8 / dark.sample_step).pow(2) as u64);
+            assert_eq!(dark.non_dark_samples, Some(0));
+
+            fill(31);
+            write_frame(&buffer, &fp, fp.Footprint.Format, "rt");
+            assert_eq!(last_frame_dump(), Some(dark), "intermediate targets must not replace frame content");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            let bright = last_frame_dump().unwrap();
+            assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
+            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
+            assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
     }
 }

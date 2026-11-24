@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,10 @@ pub struct Report {
     /// shader formats seen at pipeline creation (dxil / dxbc / container-unknown / rdna2-raw …)
     #[serde(default)]
     pub shaders: crate::gpu::shader::ShaderStats,
+    /// the DXC that compiled them: folder and versions of dxcompiler.dll and dxil.dll (empty:
+    /// none was loaded)
+    #[serde(default)]
+    pub dxc: crate::gpu::recomp::dxc::Toolchain,
     /// D3D12.X backend: adapter, interface layouts, unknown IIDs, fallbacks, presented frames
     #[serde(default)]
     pub d3d12: crate::hle::d3d12x::real::D3d12Stats,
@@ -70,6 +75,10 @@ pub struct Report {
     /// XCL slots it called that XCL does not implement
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
+    /// DirectStorage: BCPack requests refused (no decoder) by mode, and bytes filled under
+    /// `XCL_DSTORAGE_BCPACK_FILL`
+    #[serde(default)]
+    pub dstorage: crate::hle::dstorage::DStorageStats,
     pub notes: Vec<String>,
 }
 
@@ -132,9 +141,11 @@ pub fn build() -> Report {
         modules,
         vfs,
         shaders: crate::gpu::shader::stats(),
+        dxc: crate::gpu::recomp::dxc::toolchain(),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
+        dstorage: crate::hle::dstorage::stats(),
         notes: vec![
             "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
             "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
@@ -143,16 +154,32 @@ pub fn build() -> Report {
     }
 }
 
+/// `m.try_lock()`, retried for `wait`: never an endless wait – the holder may be this very
+/// thread, crashed inside `build()`.
+fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
+    let end = Instant::now() + wait;
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(TryLockError::WouldBlock) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Write `report.json` (host side). `crash` is remembered for later writes.
 pub fn write_final(crash: Option<String>) {
     // the process ends: a cursor held in the XCL window is let go
     crate::hle::kbm::release();
-    let Ok(_g) = WRITE_LOCK.try_lock() else { return };
+    // a crash is kept even while another thread writes the report, and is written once that
+    // thread is done – the process ends right after (#106); other calls give way at once
+    let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };
     if let Some(c) = crash {
-        if let Ok(mut g) = CRASH.lock() {
+        if let Some(mut g) = lock_within(&CRASH, wait) {
             g.get_or_insert(c);
         }
     }
+    let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
     let Some(boot) = crate::state::boot() else { return };
     let r = build();
     if let Ok(s) = serde_json::to_string_pretty(&r) {
@@ -162,4 +189,25 @@ pub fn write_final(crash: Option<String>) {
 
 pub fn load(path: &std::path::Path) -> Option<Report> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_crash_is_kept_while_another_thread_writes_the_report() {
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _g = WRITE_LOCK.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        wait_held.recv().unwrap();
+        // no boot record in unit tests: nothing is written to disk
+        write_final(Some("boom".into()));
+        writer.join().unwrap();
+        assert_eq!(CRASH.lock().unwrap().as_deref(), Some("boom"));
+        *CRASH.lock().unwrap() = None;
+    }
 }

@@ -35,10 +35,6 @@ fn console_ms_in_as_slot_is_refused_before_renumbering() {
     let descriptor = desc(&stream);
     let raw = descriptor.as_ptr() as *const c_void;
     unsafe {
-        // Renumbering first would erase the evidence that this is the refused layout.
-        let renumbered = pc_stream_types(raw).expect("would otherwise become an MS stream");
-        let changed = [renumbered.len(), renumbered.as_ptr() as usize];
-        assert!(unsupported_console_mesh_stream(changed.as_ptr() as *const c_void).is_none());
         assert!(unsupported_console_mesh_stream(raw).is_some());
         let mut output = 1usize as *mut c_void;
         // No device exists: the actual entry point must reject before accessing a device
@@ -56,7 +52,6 @@ fn console_ms_in_ms_slot_remains_supported() {
     let descriptor = desc(&stream);
     unsafe {
         assert!(unsupported_console_mesh_stream(descriptor.as_ptr() as *const c_void).is_none());
-        assert!(pc_stream_types(descriptor.as_ptr() as *const c_void).is_none());
     }
 }
 

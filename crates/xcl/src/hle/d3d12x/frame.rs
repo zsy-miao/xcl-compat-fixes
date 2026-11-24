@@ -113,6 +113,29 @@ static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
 /// semaphore counts up to ORIGIN_SEMAPHORE_MAX): each token gets its own frame's origin, not
 /// the latest one (#103 – with 2–3 frames in flight the statistics named a newer frame's)
 static ORIGINS: Mutex<VecDeque<i64>> = Mutex::new(VecDeque::new());
+
+/// The clock's origin `now`: the origin semaphore `sem` released, `now` queued in `q` for the
+/// wait it wakes (`take_origin`); `after_release` runs in between (a test's pause). The queue
+/// stays locked across both, so a woken wait takes its origin only once it is queued (released
+/// first, it found the queue empty and took a newer QPC, and the next wait this older origin).
+/// false: the semaphore is full (ORIGIN_SEMAPHORE_MAX pending) – an origin lost to the title too.
+unsafe fn publish_origin(q: &Mutex<VecDeque<i64>>, sem: HANDLE, now: i64, after_release: impl FnOnce()) -> bool {
+    let mut o = q.lock().unwrap();
+    if ReleaseSemaphore(sem, 1, std::ptr::null_mut()) == 0 {
+        return false;
+    }
+    after_release();
+    o.push_back(now);
+    while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
+        o.pop_front();
+    }
+    true
+}
+
+/// The origin a wait the origin semaphore woke consumes (`publish_origin`).
+fn take_origin(q: &Mutex<VecDeque<i64>>) -> Option<i64> {
+    q.lock().unwrap().pop_front()
+}
 static THREAD: AtomicBool = AtomicBool::new(false);
 
 pub fn qpc() -> i64 {
@@ -330,7 +353,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     let issue = index == -2 || (index == -1 && flags & TOKEN_ON_TIMEOUT != 0);
     if ty == 0 && issue {
         // the origin this wait consumed (a timeout with TOKEN_ON_TIMEOUT: now)
-        let origin = if index == -2 { ORIGINS.lock().unwrap().pop_front() } else { None }.unwrap_or_else(qpc);
+        let origin = if index == -2 { take_origin(&ORIGINS) } else { None }.unwrap_or_else(qpc);
         let mut issued = ISSUED.lock().unwrap();
         if token_in != 0 {
             if let Some(e) = issued.iter_mut().find(|e| e.0 == token_in) {
@@ -460,14 +483,7 @@ fn clock_thread() {
                 if ty == 0 {
                     let now = qpc();
                     LAST_ORIGIN.store(now, Ordering::Relaxed);
-                    // an origin the semaphore cannot hold (ORIGIN_SEMAPHORE_MAX pending) is lost to the title too
-                    if ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut()) != 0 {
-                        let mut o = ORIGINS.lock().unwrap();
-                        o.push_back(now);
-                        while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
-                            o.pop_front();
-                        }
-                    }
+                    publish_origin(&ORIGINS, internal as HANDLE, now, || {});
                 } else {
                     SetEvent(internal as HANDLE);
                 }
@@ -487,6 +503,32 @@ mod tests {
 
     /// the clock is one per process: the tests that run it take turns
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// A wait the origin semaphore wakes takes the origin that woke it, also when it runs between
+    /// the clock's release and the queueing (a pause there, `after_release`): finding the queue
+    /// empty, it would take a newer QPC, and the next wait the older origin – origins going
+    /// backwards (`statistics_name_each_frames_origin_...`, "each frame its own origin").
+    #[test]
+    fn a_woken_wait_takes_the_origin_that_woke_it() {
+        let q = Mutex::new(VecDeque::new());
+        unsafe {
+            let sem = CreateSemaphoreW(std::ptr::null(), 0, ORIGIN_SEMAPHORE_MAX, std::ptr::null()) as usize;
+            assert_ne!(sem, 0);
+            std::thread::scope(|s| {
+                let q = &q;
+                let waiter = s.spawn(move || {
+                    let r = WaitForMultipleObjects(1, &(sem as HANDLE), 0, 5000);
+                    (r == WAIT_OBJECT_0, take_origin(q))
+                });
+                assert!(publish_origin(q, sem as HANDLE, 42, || std::thread::sleep(std::time::Duration::from_millis(100))));
+                assert_eq!(waiter.join().unwrap(), (true, Some(42)), "the woken wait's origin");
+            });
+            // two origins, two waits: in order
+            assert!(publish_origin(&q, sem as HANDLE, 43, || {}) && publish_origin(&q, sem as HANDLE, 44, || {}));
+            assert_eq!((take_origin(&q), take_origin(&q), take_origin(&q)), (Some(43), Some(44), None));
+            CloseHandle(sem as HANDLE);
+        }
+    }
 
     #[test]
     fn console_intervals_and_deadlines() {

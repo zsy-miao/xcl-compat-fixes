@@ -97,7 +97,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
         dll.display()
     );
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("..").join("..").join("target").join("e2e");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
     let _ = std::fs::remove_dir_all(&root);
     let game = root.join("game");
     let data = root.join("data");
@@ -120,8 +120,12 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
 
+    // Only the launcher's own verdict on the file counts here: preflight warnings about the host
+    // (no Gaming Services / xgameruntime.dll, no mesh shaders, WARP) say nothing about the title.
     assert!(
-        stdout.contains("console: imports kernelx.dll") && !stdout.contains("WARNING"),
+        stdout.contains("console: imports kernelx.dll")
+            && !stdout.contains("imports no console library")
+            && !stdout.contains("not a valid x64 PE file"),
         "the launcher should recognize a console title"
     );
     let fails: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[FAIL]")).collect();
@@ -247,4 +251,37 @@ fn test_title_runs_and_game_folder_is_untouched() {
         "{listings:?}"
     );
     assert!(listings.iter().any(|t| t.contains("FSSM #0 [PS]") && t.contains("v_mac_f32 v6, s40, v21")), "{listings:?}");
+}
+
+/// The test title's draws under the D3D12 debug layer (`XCL_D3D12_DEBUG=1`): none without a
+/// root signature. Its untranslated pipelines (PC shaders, stand-ins, fallbacks) were drawn with
+/// no root signature on the PC list – console SetGraphicsRootSignature binds nothing there –
+/// which the debug layer reports on every GPU and WARP faults on. Needs the debug layer
+/// (Graphics Tools) and the system XGameRuntime, as the run above does; skipped without them.
+#[test]
+fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
+    let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
+    for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
+        if !sys.join(dll).is_file() {
+            eprintln!("SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
+            return;
+        }
+    }
+    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
+    let bin_dir = xcl.parent().unwrap();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.join("..").join("..").join("target").join("e2e-debug-layer");
+    let _ = std::fs::remove_dir_all(&root);
+    let (game, data) = (root.join("game"), root.join("data"));
+    copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
+    for f in ["xcl_testtitle.exe", "testgame_mw.dll"] {
+        std::fs::copy(bin_dir.join(f), game.join(f)).unwrap_or_else(|e| panic!("{f}: {e} – build first: cargo build --workspace"));
+    }
+    let out = Command::new(&xcl).arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1").output().expect("spawn xcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end:\n{stdout}");
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap();
+    assert!(log.contains("D3D12: debug layer enabled"), "the debug layer did not come up");
+    let bad: Vec<&str> = log.lines().filter(|l| l.contains("No root signature has been set")).collect();
+    assert!(bad.is_empty(), "{} draws without a root signature, first: {}", bad.len(), bad[0]);
 }

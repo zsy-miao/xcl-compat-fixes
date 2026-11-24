@@ -125,6 +125,13 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
         runner::skip_test("no GPU");
         return;
     }
+    // 32- or 64-lane waves (not WARP / the Basic Render Driver: 4): the driver rejects the
+    // translated program otherwise
+    if runner::wave64_programs_supported() != Ok(true) {
+        println!("no 32- or 64-lane waves – skipping");
+        runner::skip_test("no wave64");
+        return;
+    }
     let raw = real::device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
     println!("backend device: {}", real::stats().adapter);
@@ -189,6 +196,13 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
     if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
         println!("no real D3D12 device – skipping");
         runner::skip_test("no GPU");
+        return;
+    }
+    // 32- or 64-lane waves (not WARP / the Basic Render Driver: 4): the driver rejects the
+    // translated program otherwise
+    if runner::wave64_programs_supported() != Ok(true) {
+        println!("no 32- or 64-lane waves – skipping");
+        runner::skip_test("no wave64");
         return;
     }
     if !pso_async::enabled() {
