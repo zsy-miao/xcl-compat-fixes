@@ -109,8 +109,14 @@ function Assert-ArchiveMatchesPackage {
     param([string]$Archive, [string]$Directory)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $expected = @{}
+    $expectedDirectories = @{}
     $prefix = $Directory.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     $rootName = Split-Path -Leaf $Directory
+    $expectedDirectories["$rootName/"] = $true
+    foreach ($folder in @(Get-ChildItem -LiteralPath $Directory -Recurse -Directory -Force)) {
+        $relative = $folder.FullName.Substring($prefix.Length).Replace('\', '/')
+        $expectedDirectories["$rootName/$relative/"] = $true
+    }
     foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Recurse -File)) {
         $relative = $file.FullName.Substring($prefix.Length).Replace('\', '/')
         $expected["$rootName/$relative"] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -118,9 +124,16 @@ function Assert-ArchiveMatchesPackage {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
         $seen = @{}
+        $seenDirectories = @{}
         foreach ($entry in $zip.Entries) {
-            if ($entry.FullName.EndsWith('/')) { continue }
             $name = $entry.FullName.Replace('\', '/')
+            if ($name.EndsWith('/')) {
+                if ($entry.Length -ne 0 -or -not $expectedDirectories.ContainsKey($name) -or $seenDirectories.ContainsKey($name)) {
+                    throw "Unexpected, duplicate or nonempty archive directory: $name."
+                }
+                $seenDirectories[$name] = $true
+                continue
+            }
             if (-not $expected.ContainsKey($name) -or $seen.ContainsKey($name)) { throw "Unexpected or duplicate archive entry: $name." }
             $stream = $entry.Open()
             $sha = [Security.Cryptography.SHA256]::Create()
@@ -373,7 +386,7 @@ try {
             finally { [Environment]::SetEnvironmentVariable('XCL_BCPACK_EXTERNAL_DECODER', $null, 'Process') }
         }
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::d3d12x::title_textures::mirror_tests', '--', '--test-threads=1', '--nocapture') -CountTests
-        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_depth_buffers_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_depth_buffers_and_their_views_are_the_pcs', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'real::depth_regression_tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'real::texture_regression_tests', '--', '--test-threads=1', '--nocapture') -CountTests
@@ -381,9 +394,9 @@ try {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'compute_first_use_is_a_persistent_per_title_opt_in', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'pso_async::scheduling_tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::xg::tests', '--', '--test-threads=1', '--nocapture') -CountTests
-        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_mesh_streams_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'untranslated_stream_rect_lists_get_the_pcs_topology_type', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'gpu_mesh_mode_two_passes', '--', '--test-threads=1', '--nocapture') -CountTests
-        foreach ($filter in @('wait64_', 'clwb', 'real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
+        foreach ($filter in @('wait64_', 'bvh_source::tests', 'clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start', 'a_page_away_at_another_home_goes_home_with_it', 'clwb', 'real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
             Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', $filter, '--', '--test-threads=1', '--nocapture') -CountTests
         }
     }
@@ -534,8 +547,8 @@ try {
             scope = 'Single-stage BC1 reconstruction using the existing bounded entropy decoder and estimated BC1 tables. Tests cover virtual and scattered physical destinations.'
         }
         $info.test_suites += @('connectivity_hint (XCL_NETWORK=0)', 'hle::netoff::tests')
-        $info.test_suites = @('clwb', 'real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
-        $info.test_suites = @('console_depth_buffers_become_pc_ones', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'console_mesh_streams_become_pc_ones', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
+        $info.test_suites = @('wait64_ (recording and submission controls)', 'bvh_source::tests', 'clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start', 'a_page_away_at_another_home_goes_home_with_it', 'clwb (includes eh::clwb_batch_tests)', 'real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
+        $info.test_suites = @('console_depth_buffers_and_their_views_are_the_pcs', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'untranslated_stream_rect_lists_get_the_pcs_topology_type', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
         $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
         if ($bc5HelperTests -gt 0) { $info.test_suites += 'bc5_external_ (separate reference helper)' }
         $patchNote += "`r`nIncludes PR #163 depth fixes ($pr163Revision) and PR #170 mesh pipeline fixes ($pr170Revision)."
