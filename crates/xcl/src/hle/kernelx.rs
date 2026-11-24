@@ -225,9 +225,9 @@ pub mod mirrors {
     /// that physical page, which the title often maps into the CPU view too – XCL keeps its
     /// data where it was mapped last (`super::page_now`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Shown {
-        pub pool: usize,
-        pub page: Option<usize>,
+    struct Shown {
+        pool: usize,
+        page: Option<super::PhysicalPage>,
     }
 
     /// Pages of GPU views the title pointed somewhere else with the queue's page-mapping
@@ -249,15 +249,15 @@ pub mod mirrors {
         fn set(&mut self, va: usize, to: Option<Shown>) {
             let old = self.at.insert(va, to);
             if let Some(p) = old.flatten().and_then(|s| s.page) {
-                if let Some(set) = self.by_page.get_mut(&p) {
+                if let Some(set) = self.by_page.get_mut(&p.number) {
                     set.remove(&va);
                     if set.is_empty() {
-                        self.by_page.remove(&p);
+                        self.by_page.remove(&p.number);
                     }
                 }
             }
             if let Some(p) = to.and_then(|s| s.page) {
-                self.by_page.entry(p).or_default().insert(va);
+                self.by_page.entry(p.number).or_default().insert(va);
             }
             self.note(va);
         }
@@ -353,7 +353,8 @@ pub mod mirrors {
         // the physical page the title has mapped at each pool page: what the console maps
         let changes: Vec<(usize, Option<Shown>)> = {
             let away = super::AWAY.lock().unwrap();
-            let title = |pool: usize| away.as_ref().and_then(|a| a.title_page(pool));
+            let blocks = super::PHYS_BLOCKS.lock().unwrap();
+            let title = |pool: usize| away.as_ref().and_then(|a| a.title_page(pool, &blocks));
             changes.into_iter().map(|(va, to)| (va, to.map(|pool| Shown { pool, page: title(pool) }))).collect()
         };
         let s = STATE.lock().unwrap();
@@ -1036,8 +1037,17 @@ const PHYS_PAGE: usize = 0x1_0000;
 /// Size of one console physical page (64 KiB).
 pub const PHYS_PAGE_SIZE: usize = PHYS_PAGE;
 
+/// The allocator reuses guest page numbers. A queued GPU view keeps referring to the
+/// allocation it originally mapped, even after a different allocation gets that number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhysicalPage {
+    number: usize,
+    generation: u64,
+}
+
 /// An allocation of physical pages: its pages' indices `first..first + count`.
 struct PhysBlock {
+    generation: u64,
     count: usize,
     /// pages still allocated
     live: usize,
@@ -1047,12 +1057,13 @@ struct PhysBlock {
 
 /// first page index → block; and the page indices free again (first, count)
 struct PhysPages {
+    generation: u64,
     blocks: std::collections::BTreeMap<usize, PhysBlock>,
     next: usize,
     free: Vec<(usize, usize)>,
 }
 
-static PHYS_BLOCKS: std::sync::Mutex<PhysPages> = std::sync::Mutex::new(PhysPages { blocks: std::collections::BTreeMap::new(), next: 0, free: Vec::new() });
+static PHYS_BLOCKS: std::sync::Mutex<PhysPages> = std::sync::Mutex::new(PhysPages { generation: 0, blocks: std::collections::BTreeMap::new(), next: 0, free: Vec::new() });
 
 /// Sparse-window ranges `MapTitlePhysicalPages` chose (no address given): address → pages.
 static AUTO_MAPPED: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -1073,17 +1084,19 @@ struct Away {
     /// every address it was mapped at; here its data is in one place (`page`), so an address it
     /// moved away from still names it here (the queue's page-mapping method maps the pages of
     /// such addresses: `mirrors::apply_batches`).
-    title: std::collections::HashMap<usize, usize>,
+    title: std::collections::HashMap<usize, PhysicalPage>,
     /// pages the title freed while others of their allocation live (`page_home` still knows
-    /// the block): no page is behind such a number any more (numbers are never handed out
-    /// again), so `page_now` answers none for it
+    /// the block). Once the whole allocation is freed, its generation distinguishes it
+    /// from a new allocation of the same page numbers.
     freed: std::collections::HashSet<usize>,
 }
 
 impl Away {
     /// The page the title mapped at `at` last, if the title has not freed it.
-    fn title_page(&self, at: usize) -> Option<usize> {
-        self.title.get(&at).copied().filter(|p| !self.freed.contains(p))
+    fn title_page(&self, at: usize, blocks: &PhysPages) -> Option<PhysicalPage> {
+        let page = *self.title.get(&at)?;
+        let (current, _) = blocks.locate(page.number)?;
+        (current == page && !self.freed.contains(&page.number)).then_some(page)
     }
 }
 
@@ -1097,15 +1110,13 @@ static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
 /// Where page `page`'s data is now: the address it is mapped at away from home, else its home
 /// (`None`: no allocated page has that number).
-fn page_now(page: usize) -> Option<usize> {
-    let (freed, away) = match AWAY.lock().unwrap().as_ref() {
-        Some(a) => (a.freed.contains(&page), a.page.get(&page).copied()),
-        None => (false, None),
-    };
-    if freed {
+fn page_now(page: PhysicalPage) -> Option<usize> {
+    let away = AWAY.lock().unwrap();
+    let (current, home) = PHYS_BLOCKS.lock().unwrap().locate(page.number)?;
+    if page != current || away.as_ref().is_some_and(|a| a.freed.contains(&page.number)) {
         return None;
     }
-    away.or_else(|| page_home(page))
+    Some(away.as_ref().and_then(|a| a.page.get(&page.number).copied()).unwrap_or(home))
 }
 
 /// A live physical mapping exists at this 64 KiB page even before lazy backing is
@@ -1138,12 +1149,22 @@ fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
 
+impl PhysPages {
+    fn locate(&self, number: usize) -> Option<(PhysicalPage, usize)> {
+        let index = page_index(number)?;
+        let (&first, block) = self.blocks.range(..=index).next_back()?;
+        let offset = index - first;
+        if block.live == 0 || offset >= block.count {
+            return None;
+        }
+        let home = block.home.checked_add(offset.checked_mul(PHYS_PAGE)?)?;
+        Some((PhysicalPage { number, generation: block.generation }, home))
+    }
+}
+
 /// The home address of page `page` if it belongs to a live allocation.
 fn page_home(page: usize) -> Option<usize> {
-    let index = page_index(page)?;
-    let g = PHYS_BLOCKS.lock().ok()?;
-    let (&first, b) = g.blocks.range(..=index).next_back()?;
-    (b.live > 0 && index < first.checked_add(b.count)?).then(|| b.home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+    PHYS_BLOCKS.lock().ok()?.locate(page).map(|(_, home)| home)
 }
 
 /// Resolve the live virtual addresses of the physical pages covering `offset..offset+len`.
@@ -1417,7 +1438,9 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     for i in 0..n {
         *arr.add(i) = page_number(first + i);
     }
-    g.blocks.insert(first, PhysBlock { count: n, live: n, home });
+    g.generation += 1;
+    let generation = g.generation;
+    g.blocks.insert(first, PhysBlock { count: n, live: n, home, generation });
     1
 }
 
@@ -1427,19 +1450,17 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         return 0;
     }
     // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
-    {
-        let mut g = AWAY.lock().unwrap();
-        let away = g.get_or_insert_with(Away::default);
-        for i in 0..n {
-            let page = *arr.add(i);
-            mirrors::page_moved(page);
-            if let Some(at) = away.page.remove(&page) {
-                away.at.remove(&at);
-                note_mapping_at(at);
-            }
-            if page_index(page).is_some() {
-                away.freed.insert(page);
-            }
+    let mut mappings = AWAY.lock().unwrap();
+    let away = mappings.get_or_insert_with(Away::default);
+    for i in 0..n {
+        let page = *arr.add(i);
+        mirrors::page_moved(page);
+        if let Some(at) = away.page.remove(&page) {
+            away.at.remove(&at);
+            note_mapping_at(at);
+        }
+        if page_index(page).is_some() {
+            away.freed.insert(page);
         }
     }
     // (blocks gone whole: their numbers need no `freed` entries)
@@ -1463,9 +1484,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     }
     drop(g);
     if !gone.is_empty() {
-        if let Some(away) = AWAY.lock().unwrap().as_mut() {
-            away.freed.retain(|&p| page_index(p).is_none_or(|i| !gone.iter().any(|&(f, c)| i >= f && i < f + c)));
-        }
+        away.freed.retain(|&p| page_index(p).is_none_or(|i| !gone.iter().any(|&(f, c)| i >= f && i < f + c)));
     }
     1
 }
@@ -1509,8 +1528,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             }
         }
         away.gone.retain(|home| !homes.contains(home));
-        for (i, &p) in pages.iter().enumerate() {
-            away.title.insert(homes.start + i * PHYS_PAGE, p);
+        {
+            let blocks = PHYS_BLOCKS.lock().unwrap();
+            for (i, &p) in pages.iter().enumerate() {
+                away.title.insert(homes.start + i * PHYS_PAGE, blocks.locate(p).unwrap().0);
+            }
         }
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
@@ -1568,13 +1590,14 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         if p == 0 {
             continue;
         }
+        let (physical, home) = PHYS_BLOCKS.lock().unwrap().locate(p).unwrap();
         if let Some(&old) = away.page.get(&p) {
             // (a move commits `at` and decommits `old`, which may lie in a run already answered:
             // both runs go – #556)
             match move_away(away, old, at, p, in_uma(at)) {
                 Ok(true) => {
                     (at_run, home_run) = Default::default();
-                    away.title.insert(at, p);
+                    away.title.insert(at, physical);
                     continue;
                 }
                 // a lazy page is only unmarked: memory is as it was, the runs stay
@@ -1586,13 +1609,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             }
         }
         let fresh = !in_uma(at) && !committed_page_in(at, &mut at_run);
-        let home = page_home(p).unwrap();
         // Only CPU-only reservations may defer backing. Sparse UMA needs its GPU tiles now.
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
         if fresh && plain && reserved_page_in(at, &mut at_run) && !committed_page_in(home, &mut home_run) && lazy::mark(at) {
             away.at.insert(at, p);
             away.page.insert(p, at);
-            away.title.insert(at, p);
+            away.title.insert(at, physical);
             note_mapping_at(at);
             continue;
         }
@@ -1613,7 +1635,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
-        away.title.insert(at, p);
+        away.title.insert(at, physical);
         note_mapping_at(at);
     }
     // a range chosen here (no address given), all of it unmapped: back to the sparse windows
@@ -3213,9 +3235,16 @@ mod tests {
             assert_eq!(mapped_source(gpu + PAGE + 4), Some(Some(pool + 2 * PAGE + 4)), "the pool page, not the page's home");
             assert_eq!(*((pool + 2 * PAGE) as *const u32), 0xBEEF);
             assert_eq!(apply_batches(1, [batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, pool, 4), Some(Mapped { mapped: 1, ..Mapped::default() }), "no physical page behind it now");
-            mirrors::released(cpu);
             assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr()), 1);
             assert!(AWAY.lock().unwrap().as_ref().is_some_and(|a| !a.freed.contains(&pages[1])), "the whole block gone: its numbers are forgotten");
+            // The fork can use these physical numbers for another allocation. Neither an
+            // existing GPU view nor a newly submitted mapping of the old pool may follow it.
+            let mut replacement = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, replacement.as_mut_ptr()), 1);
+            assert_eq!(mapped_source(gpu + PAGE), Some(Some(pool + 2 * PAGE)), "an old view cannot follow a recycled physical number");
+            assert_eq!(apply_batches(1, [batch(gpu + 3 * PAGE, &r)].as_ptr() as usize, pool, 4), Some(Mapped { mapped: 1, ..Mapped::default() }), "the released pool has no page from the replacement allocation");
+            assert_eq!(FreeTitlePhysicalPages(null, 2, replacement.as_mut_ptr()), 1);
+            mirrors::released(cpu);
             mem::VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
