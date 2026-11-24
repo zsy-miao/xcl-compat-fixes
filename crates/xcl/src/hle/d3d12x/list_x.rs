@@ -1030,6 +1030,12 @@ struct SubmittedSignal {
     seq: u64,
 }
 
+// Follow-up to the queue diagnostics introduced in #795 by gsucristo. The graph assigns
+// submitted_queue before the host Signal call, so it is not proof of API success or completion.
+fn wait_queue_provenance(requested: u64, submitted_max: u64, submitted_queue: Option<usize>, recorded_last: Option<usize>) -> (Option<usize>, Option<usize>) {
+    (submitted_queue.filter(|_| submitted_max >= requested), recorded_last)
+}
+
 /// Per-address GPU fence state bridging `Write64BitValue{Bottom,Top}OfPipeX` to cross-queue
 /// `Wait64BitValueX` (`GREATER_EQUAL`, full 64-bit mask).
 #[derive(Default)]
@@ -1043,9 +1049,9 @@ struct SyncCell {
     recorded_list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     /// Last queue the recording list was executed on (if known).
     recorded_last_queue: Option<usize>,
-    /// Highest value submitted via `queue.Signal(&fence, v)` or released on CPU.
+    /// Highest graph-assigned GPU signal value or value released on CPU.
     submitted_max: u64,
-    /// Queue that issued the latest GPU `Signal` (`None` if released on CPU).
+    /// Queue assigned to the latest graph GPU signal; not proof of host Signal success.
     submitted_queue: Option<usize>,
     /// Highest value explicitly released on CPU (cycle-break or watchdog). Protects against
     /// vkd3d-proton rewinding `fence->virtual_value` when an older in-flight GPU signal retires.
@@ -1057,6 +1063,16 @@ struct SyncCell {
     armed_waits: Vec<ArmedGpuWait>,
     /// Active GPU `queue.Signal(&fence, v)` calls on this cell not yet confirmed completed on GPU.
     submitted_signals: Vec<SubmittedSignal>,
+}
+
+impl SyncCell {
+    fn note_recorded_queue(&mut self, value: u64, ty: Option<D3D12_COMMAND_LIST_TYPE>, last_queue: Option<usize>) {
+        if value > self.recorded_max {
+            self.recorded_max = value;
+            self.recorded_list_type = ty;
+            self.recorded_last_queue = last_queue;
+        }
+    }
 }
 
 // SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
@@ -1370,7 +1386,7 @@ fn wake_sync_watchdog() {
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
-                let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
+                let mut out = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
                 if let Some(graph) = g.as_mut() {
                     for (&va, cell) in graph.cells.iter_mut() {
@@ -1420,7 +1436,7 @@ fn wake_sync_watchdog() {
                                     f.clone(),
                                     waiter_q,
                                     waiter_ty,
-                                    cell.submitted_queue.or(cell.recorded_last_queue),
+                                    wait_queue_provenance(max_exp, cell.submitted_max, cell.submitted_queue, cell.recorded_last_queue),
                                     cell.recorded_list_type.map(|t| t.0),
                                     cell.recorded_max,
                                     cell.submitted_max,
@@ -1438,14 +1454,15 @@ fn wake_sync_watchdog() {
                 }
             }
             let had_expired = !expired.is_empty();
-            for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
+            for (va, val, fence, waiter_q, waiter_ty, (graph_signal_q, recorded_last_q), recorded_ty, rec, sub, done) in expired {
                 unsafe {
                     let _ = fence.Signal(val);
                 }
                 let wq = queue_id(waiter_q);
-                let pq = prod_q.map(queue_id);
+                let sq = graph_signal_q.map(queue_id);
+                let rq = recorded_last_q.map(queue_id);
                 crate::xlog_warn!(
-                    "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
+                    "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, graph_signal_queue=q{sq:?}, recorded_list_last_queue=q{rq:?}/ty{recorded_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
                     GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
                 );
             }
@@ -1528,15 +1545,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
             let old_fence = cell.fence.take();
             old_fence.filter(|_| max_armed > 0).map(|f| (f, max_armed, prev_sub))
         } else {
-            if value > cell.recorded_max {
-                cell.recorded_max = value;
-                if lty.is_some() {
-                    cell.recorded_list_type = lty;
-                }
-                if last_q.is_some() {
-                    cell.recorded_last_queue = last_q;
-                }
-            }
+            cell.note_recorded_queue(value, lty, last_q);
             None
         }
     };
@@ -1763,7 +1772,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
 
     let Some(fence) = ensure_cell_fence(w.va, &dev, dev_raw) else { return GpuWaitOutcome::FallbackCpu };
 
-    let (unsubmitted, final_rec_ty, final_prod_q, wait_seq) = {
+    let (unsubmitted, final_rec_ty, (graph_signal_q, recorded_last_q), wait_seq) = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let Some(graph) = g.as_mut() else { return GpuWaitOutcome::FallbackCpu };
         let pre_ok = match graph.cells.get_mut(&w.va) {
@@ -1782,7 +1791,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
                     return GpuWaitOutcome::Handled;
                 }
-                (cell.submitted_max < w.value, cell.recorded_list_type, cell.submitted_queue.or(cell.recorded_last_queue))
+                (cell.submitted_max < w.value, cell.recorded_list_type, wait_queue_provenance(w.value, cell.submitted_max, cell.submitted_queue, cell.recorded_last_queue))
             }
             None => return GpuWaitOutcome::FallbackCpu,
         };
@@ -1817,12 +1826,13 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         if once(&LOGGED, 8) {
             crate::xlog_info!(
-                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} bridged to GPU queue.Wait (waiter=q{}/ty{}, prod=q{:?}/ty{:?}; wait-before-signal, after_write64={})",
+                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} bridged to GPU queue.Wait (waiter=q{}/ty{}, graph_signal_queue=q{:?}, recorded_list_last_queue=q{:?}/ty{:?}; wait-before-signal, after_write64={})",
                 w.va,
                 w.value,
                 queue_id(q_raw),
                 q_ty.0,
-                final_prod_q.map(queue_id),
+                graph_signal_q.map(queue_id),
+                recorded_last_q.map(queue_id),
                 final_rec_ty.map(|t| t.0),
                 w.after_write64
             );
@@ -3875,6 +3885,48 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn wait_queue_diagnostic_unsubmitted_value_keeps_history_separate() {
+        assert_eq!(wait_queue_provenance(10, 0, None, Some(1)), (None, Some(1)));
+    }
+
+    #[test]
+    fn wait_queue_diagnostic_older_graph_signal_does_not_name_the_current_producer() {
+        assert_eq!(wait_queue_provenance(10, 9, Some(2), Some(1)), (None, Some(1)));
+    }
+
+    #[test]
+    fn wait_queue_diagnostic_covering_graph_signal_names_its_queue() {
+        assert_eq!(wait_queue_provenance(10, 10, Some(2), Some(1)), (Some(2), Some(1)));
+        assert_eq!(wait_queue_provenance(10, 11, Some(2), Some(1)), (Some(2), Some(1)));
+    }
+
+    #[test]
+    fn wait_queue_diagnostic_new_recording_without_history_clears_the_old_hint() {
+        let mut cell = SyncCell::default();
+        cell.note_recorded_queue(9, Some(D3D12_COMMAND_LIST_TYPE_DIRECT), Some(1));
+        cell.note_recorded_queue(10, None, None);
+        assert_eq!(cell.recorded_max, 10);
+        assert_eq!(cell.recorded_list_type, None);
+        assert_eq!(cell.recorded_last_queue, None);
+    }
+
+    #[test]
+    fn wait_queue_diagnostic_cpu_release_has_no_graph_signal_queue() {
+        assert_eq!(wait_queue_provenance(10, 10, None, Some(1)), (None, Some(1)));
+    }
+
+    #[test]
+    fn wait_queue_diagnostic_older_recording_keeps_the_latest_hint() {
+        let mut cell = SyncCell::default();
+        cell.note_recorded_queue(10, Some(D3D12_COMMAND_LIST_TYPE_COMPUTE), Some(2));
+        cell.note_recorded_queue(9, None, None);
+        assert_eq!(cell.recorded_max, 10);
+        assert_eq!(cell.recorded_list_type, Some(D3D12_COMMAND_LIST_TYPE_COMPUTE));
+        assert_eq!(cell.recorded_last_queue, Some(2));
+    }
+
+
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
     static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
 
@@ -5326,6 +5378,16 @@ mod tests {
                 cq.ExecuteCommandLists(&[Some(ccl.clone())]);
                 signal_write64_fences(cq.as_raw(), chunk);
             });
+
+            {
+                let g = SYNC_GRAPH.lock().unwrap();
+                let cell = &g.as_ref().unwrap().cells[&va];
+                assert_eq!(
+                    wait_queue_provenance(0x677, cell.submitted_max, cell.submitted_queue, cell.recorded_last_queue).0,
+                    Some(cq.as_raw() as usize),
+                    "graph-assigned Signal must name COMPUTE",
+                );
+            }
 
             // DIRECT queue must now unblock and finish promptly on the GPU.
             crate::gpu::fence::wait(&done_fence, 1, &dev, None, 2000).expect("DIRECT queue must complete after COMPUTE signals per-VA fence");

@@ -150,6 +150,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+Wait64 GPU diagnostics separate a graph-assigned signal queue covering the requested value
+from the recording list's last known queue. The graph assignment is made before the host
+Signal call; it does not prove host acceptance or GPU completion.
+
 ## Tests
 
 ```powershell
