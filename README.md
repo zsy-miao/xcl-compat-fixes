@@ -138,6 +138,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Pipelines used in an earlier run are normally built ahead of first use. `XCL_PSO_PRELOAD=graphics`
   limits this to graphics pipelines; compute pipelines still build and wait at their first bind.
   `XCL_PSO_PRELOAD=0` disables preloading of both types. Unset or `1` retains the default.
+- With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
+  XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
+  those on which the GPU completed at least one operation.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),

@@ -83,6 +83,11 @@ const INLINE_SGPRS: u32 = 12;
 const INLINE_SGPRS_GFX: u32 = 24;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
+/// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
+/// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
+/// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
+/// layout instead of one of gigabytes, which every Set*RootSignature allocates.
+const MAX_ARGS: u32 = 4096;
 
 /// Layout from a serialized root signature: a DXBC container with RTS0 or a bare RTS0.
 pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
@@ -108,10 +113,12 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             _ => Param::Table { at: l.size },
         };
         let bytes = match p {
-            Param::Constants { count, .. } => 4 * count,
+            Param::Constants { count, .. } => count.checked_mul(4)?,
             Param::Table { .. } => 4,
             Param::Descriptor { .. } => 8,
         };
+        // the inline sums below are at most the size
+        let size = l.size.checked_add(bytes).filter(|&s| s <= MAX_ARGS)?;
         spilled |= l.inline + bytes > 4 * INLINE_SGPRS;
         if !spilled {
             l.inline += bytes;
@@ -120,7 +127,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         if !spilled_gfx {
             l.inline_gfx += bytes;
         }
-        l.size += bytes;
+        l.size = size;
         l.params.push(p);
     }
     Some(l)
@@ -964,6 +971,19 @@ mod tests {
             r.extend([0, 0, count]);
         }
         r.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A blob whose constant count makes the arguments overflow u32 (0x4000_0000) or take
+    /// gigabytes (0x3FFF_FFFF: 0xFFFF_FFFC bytes, allocated at every Set*RootSignature) has no
+    /// layout; the largest one allowed still has one.
+    #[test]
+    fn a_huge_constant_count_has_no_layout() {
+        assert!(layout_from_blob(&rts0(&[(1, 0x4000_0000)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(1, 0x3FFF_FFFF)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(4, 0), (1, 0xFFFF_FFFF)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(1, MAX_ARGS / 4), (0, 0)])).is_none());
+        let l = layout_from_blob(&rts0(&[(1, MAX_ARGS / 4 - 3), (4, 0), (0, 0)])).unwrap();
+        assert_eq!((l.size, l.inline), (MAX_ARGS, 0));
     }
 
     /// What the console's compiler does (its output on these root signatures): parameters in

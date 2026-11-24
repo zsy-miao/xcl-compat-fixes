@@ -359,6 +359,9 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
             break;
         };
         let poff = if palign == 8 { 8 } else { 4 };
+        if off + poff + psize > size {
+            break; // SizeInBytes ends inside the payload
+        }
         let stage = match ty {
             1 => Some("vs"),
             2 => Some("ps"),
@@ -753,6 +756,28 @@ mod tests {
 
     unsafe fn slot(obj: *mut c_void, i: usize) -> usize {
         *(*(obj as *const *const usize)).add(i)
+    }
+
+    /// A stream whose SizeInBytes ends inside a shader subobject's payload, right at the end of
+    /// readable memory: the bytecode's length past the end is not read (an access violation in
+    /// the device hook before).
+    #[test]
+    fn a_stream_ending_inside_a_shader_payload_is_not_read_past_its_end() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!page.is_null());
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page.add(0x1000) as *const _, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            // VS subobject (type 1) and the pointer half of its D3D12_SHADER_BYTECODE, ending at
+            // the unreadable page
+            let base = page.add(0x1000 - 16);
+            *(base as *mut u64) = 1;
+            *(base.add(8) as *mut u64) = 0x1234;
+            let desc: [usize; 2] = [16, base as usize];
+            capture_stream_desc(desc.as_ptr() as *const u8);
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     #[test]

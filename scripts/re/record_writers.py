@@ -1,7 +1,7 @@
 """Find the D3D12.X inline command-list record writers in XboxBvhBuilder.dll (objdump AT&T
 listing): `mov 0x18(%L),%P ; cmp 0x30|0x28(%L),%P ; jae fallback` … `add $N,%P ; mov %P,0x18(%L)`.
 Per site: list register, bound field, record length, header (immediate or list field) and
-the vtable slot of the fallback call.
+the vtable slot of the fallback call. Branch targets may have or omit the 0x prefix.
 
 usage: objdump -d --no-show-raw-insn XboxBvhBuilder.dll > bvhb.asm; python record_writers.py bvhb.asm"""
 import re, collections, sys
@@ -22,7 +22,7 @@ for i, (a, t) in enumerate(ins):
     if i + 2 >= len(ins):
         continue
     m2 = re.match(rf'cmp\s+0x(30|28)\(%{L}\),%{P}$', ins[i + 1][1])
-    m3 = re.match(r'jae\s+0x([0-9a-f]+)', ins[i + 2][1])
+    m3 = re.match(r'jae\s+(?:0x)?([0-9a-f]+)', ins[i + 2][1])
     if not (m2 and m3):
         continue
     bound, fallback = m2.group(1), int(m3.group(1), 16)
