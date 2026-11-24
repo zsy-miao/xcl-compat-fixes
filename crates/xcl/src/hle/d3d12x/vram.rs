@@ -122,6 +122,7 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 }
 
 pub(super) fn forget(resource: usize) {
+    forget_small(resource);
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -663,10 +664,11 @@ pub(super) fn tile_mappings_for(device: usize, resource: usize) -> Option<(Vec<(
     (used.len() + extra.len() == target.total as usize).then_some((used, extra))
 }
 
-/// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
+/// (bytes of pages in use by tiled textures and of small-texture slots, bytes of their heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
+    let (small, small_heaps) = small_bytes();
     let g = PAGES.lock().unwrap();
-    g.values().flatten().fold((0, 0), |(used, pools), p| {
+    g.values().flatten().fold((small, small_heaps), |(used, pools), p| {
         (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
     })
 }
@@ -695,7 +697,157 @@ pub unsafe fn place_pages(
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
     }
+    if let Some(hr) = place_small(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
+        return Some(hr);
+    }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
+}
+
+/// A slot of the small-texture heaps (4 KiB).
+const SLOT: usize = 0x1000;
+/// slots of one small-texture heap (4 MiB)
+const SLOTS_PER_HEAP: u32 = 1024;
+
+struct SmallSlot {
+    slot: u32,
+    /// textures at its address
+    users: u32,
+}
+
+/// The 4 KiB slots of the small-texture heaps: one per title address (textures at one address
+/// share it, as they share a page's tile), given back slots reusable after `COOL`.
+#[derive(Default)]
+struct Slots {
+    /// slots handed out so far (the next new one; a new heap at each `SLOTS_PER_HEAP`)
+    next: u32,
+    free: Vec<u32>,
+    cooling: std::collections::VecDeque<(u32, std::time::Instant)>,
+    by_va: std::collections::HashMap<usize, SmallSlot>,
+}
+
+impl Slots {
+    /// The slot of `va` for one more texture there: (slot, whether its heap must be made first).
+    fn take(&mut self, va: usize, now: std::time::Instant) -> (u32, bool) {
+        if let Some(s) = self.by_va.get_mut(&va) {
+            s.users += 1;
+            return (s.slot, false);
+        }
+        while self.cooling.front().is_some_and(|(_, at)| now.duration_since(*at) >= COOL) {
+            self.free.extend(self.cooling.pop_front().map(|(s, _)| s));
+        }
+        let (slot, new_heap) = match self.free.pop() {
+            Some(s) => (s, false),
+            None => {
+                self.next += 1;
+                (self.next - 1, (self.next - 1) % SLOTS_PER_HEAP == 0)
+            }
+        };
+        self.by_va.insert(va, SmallSlot { slot, users: 1 });
+        (slot, new_heap)
+    }
+
+    /// One texture at `va` fewer: its slot cools once no texture uses it.
+    fn give_back(&mut self, va: usize, now: std::time::Instant) {
+        if let Some(s) = self.by_va.get_mut(&va) {
+            s.users -= 1;
+            if s.users == 0 {
+                let slot = s.slot;
+                self.by_va.remove(&va);
+                self.cooling.push_back((slot, now));
+            }
+        }
+    }
+}
+
+/// The small-texture heaps of a device.
+struct SmallHeaps {
+    heaps: Vec<ID3D12Heap>,
+    slots: Slots,
+    /// resource → its address
+    of: std::collections::HashMap<usize, usize>,
+}
+
+// D3D12 heaps are free-threaded
+unsafe impl Send for SmallHeaps {}
+
+static SMALL: Mutex<std::collections::BTreeMap<usize, SmallHeaps>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// A sampled texture of at most 4 KiB inside one 64 KiB page of the title's (no page boundary
+/// within it, so on the pages it is one extra tile keyed by its address) as a 4 KiB-aligned
+/// placement in a shared heap instead of that 64 KiB tile: a retail game makes ~12 000 views of
+/// 16x4 textures of 1–2.5 KB while it loads its world – 768 MiB of tiles for 20 MiB. Textures
+/// at one address share the slot as they share the tile. None: not such a texture, or the PC
+/// wants more than 4 KiB for it.
+#[allow(clippy::too_many_arguments)]
+unsafe fn place_small(
+    dev: &ID3D12Device,
+    this: *mut c_void,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    console_bytes: Option<u64>,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    let bytes = console_bytes?;
+    if bytes > SLOT as u64 || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.SampleDesc.Count > 1 || owned_pages(va, Some(bytes), usize::MAX)?.1 != 0 {
+        return None;
+    }
+    let small = D3D12_RESOURCE_DESC { Alignment: SLOT as u64, ..*desc };
+    let info = dev.GetResourceAllocationInfo(0, &[small]);
+    if info.Alignment != SLOT as u64 || info.SizeInBytes == 0 || info.SizeInBytes > SLOT as u64 {
+        return None;
+    }
+    let mut g = SMALL.lock().unwrap();
+    let h = g.entry(dev.as_raw() as usize).or_insert_with(|| SmallHeaps { heaps: Vec::new(), slots: Slots::default(), of: std::collections::HashMap::new() });
+    let now = std::time::Instant::now();
+    let (slot, new_heap) = h.slots.take(va, now);
+    if new_heap {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: SLOTS_PER_HEAP as u64 * SLOT as u64,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+        };
+        let mut made: Option<ID3D12Heap> = None;
+        if super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut made)).is_err() || made.is_none() {
+            // the slot's heap was not made: hand that slot (and so that heap) out again next time
+            h.slots.by_va.remove(&va);
+            h.slots.next -= 1;
+            return None;
+        }
+        h.heaps.push(made.unwrap());
+    }
+    let heap = &h.heaps[(slot / SLOTS_PER_HEAP) as usize];
+    let offset = (slot % SLOTS_PER_HEAP) as usize * SLOT;
+    let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, &small as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    if hr < 0 || (*ppv).is_null() {
+        h.slots.give_back(va, now);
+        return None;
+    }
+    h.of.insert(*ppv as usize, va);
+    drop(g);
+    // aliased by address like the pages' textures
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    Some(hr)
+}
+
+/// A released small texture: its slot goes back when no texture at its address is left.
+fn forget_small(resource: usize) {
+    let mut g = SMALL.lock().unwrap();
+    for h in g.values_mut() {
+        if let Some(va) = h.of.remove(&resource) {
+            h.slots.give_back(va, std::time::Instant::now());
+            return;
+        }
+    }
+}
+
+/// (bytes of small-texture slots in use, bytes of small-texture heaps)
+fn small_bytes() -> (usize, usize) {
+    let g = SMALL.lock().unwrap();
+    g.values().fold((0, 0), |(used, heaps), h| (used + h.slots.by_va.len() * SLOT, heaps + h.heaps.len() * SLOTS_PER_HEAP as usize * SLOT))
 }
 
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
@@ -735,6 +887,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// Small textures take one 4 KiB slot per address (shared there, as a page's tile is), 1024
+    /// to a heap; a slot no texture uses any more is reused after `COOL`.
+    #[test]
+    fn small_texture_slots_are_per_address_and_come_back_cooled() {
+        let mut s = Slots::default();
+        let t0 = Instant::now();
+        assert_eq!(s.take(0x1000, t0), (0, true));
+        assert_eq!(s.take(0x1000, t0), (0, false), "a second texture at an address shares its slot");
+        // 12 000 addresses: 12 heaps, not 12 000 pages
+        let new_heaps = (1..12_000).filter(|k| s.take(0x1000 + k * 0x400, t0).1).count();
+        assert_eq!((new_heaps, s.next), (11, 12_000));
+        s.give_back(0x1000, t0);
+        assert!(s.by_va.contains_key(&0x1000), "still used by the other texture there");
+        s.give_back(0x1000, t0);
+        assert_eq!(s.take(0x9_0000_0000, t0 + Duration::from_millis(100)), (12_000, false), "reused before COOL");
+        assert_eq!(s.take(0xA_0000_0000, t0 + COOL), (0, false), "reused after COOL");
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
@@ -947,6 +1117,111 @@ mod tests {
     /// On the GPU: D32S8 targets 256 MiB apart take their own size of video memory, not an arena
     /// of 256 MiB each; depth and stencil survive a clear, CopyResource and a read of both planes;
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
+    /// Sampled textures of 4 KiB or less inside one page of the title's take 4 KiB slots of shared
+    /// heaps (not a 64 KiB tile each), one per address; neighbours keep their own texels, and one
+    /// over a page boundary stays on the pages.
+    #[test]
+    fn small_sampled_textures_take_slots_not_pages() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            // a retail game's: 16x4 R16G16B16A16_FLOAT, 1 KiB on the console, 256-byte aligned
+            let tex = |w: u64, h: u32| D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w, Height: h, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R16G16B16A16_FLOAT, SampleDesc: sample, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize, d: &D3D12_RESOURCE_DESC, bytes: u64| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, d, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, std::ptr::null(), Some(bytes), riid, &mut p);
+                (hr.is_some_and(|hr| hr >= 0) && !p.is_null()).then(|| ID3D12Resource::from_raw(p))
+            };
+            let small = tex(16, 4);
+            if dev.GetResourceAllocationInfo(0, &[D3D12_RESOURCE_DESC { Alignment: SLOT as u64, ..small }]).Alignment != SLOT as u64 {
+                return crate::gpu::recomp::runner::skip_test("no 4 KiB texture placement on this adapter");
+            }
+            let key = dev.as_raw() as usize;
+            let (pages0, _) = page_bytes_for(key);
+            let used0 = SMALL.lock().unwrap().get(&key).map_or(0, |h| h.slots.by_va.len());
+            let base = 0x50_0000_0000usize;
+            let textures: Vec<ID3D12Resource> = (0..64).map(|k| place_at(base + k * PAGE + 0xa00, &small, 1024).expect("small texture")).collect();
+            assert_eq!(page_bytes_for(key).0, pages0, "small textures took pages");
+            assert_eq!(SMALL.lock().unwrap()[&key].slots.by_va.len() - used0, 64, "one slot per small texture");
+            assert!(textures.iter().all(|t| is_placed_texture(t.as_raw() as usize)), "a small texture is aliased by address like the pages' ones");
+            // a second texture at an address shares its slot
+            let again = place_at(base + 0xa00, &small, 1024).expect("small texture again");
+            assert_eq!(SMALL.lock().unwrap()[&key].slots.by_va.len() - used0, 64, "a second texture at an address took a slot");
+            // over a page boundary: still the pages
+            let across = place_at(base + 0x100 * PAGE + PAGE - 0x200, &small, 1024).expect("texture over a page boundary");
+            assert!(is_placed_texture(across.as_raw() as usize));
+
+            // two neighbours: each keeps what was copied into it
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            dev.GetCopyableFootprints(&small, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+            let buffer = |t: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
+                let d = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 2 * total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: t, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let (upload, readback) = (buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ), buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST));
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).unwrap();
+            for k in 0..2usize {
+                std::slice::from_raw_parts_mut((p as *mut u8).add(k * total as usize), total as usize).fill(0x11 * (k as u8 + 1));
+            }
+            upload.Unmap(0, None);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let loc = |r: &ID3D12Resource, offset: u64| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: offset, ..fp } } };
+            let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            for k in 0..2 {
+                list.CopyTextureRegion(&sub(&textures[k]), 0, 0, 0, &loc(&upload, k as u64 * total), None);
+            }
+            let to_src = |r: &ID3D12Resource| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: D3D12_RESOURCE_STATE_COPY_DEST, StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            list.ResourceBarrier(&[to_src(&textures[0]), to_src(&textures[1])]);
+            for k in 0..2 {
+                list.CopyTextureRegion(&loc(&readback, k as u64 * total), 0, 0, 0, &sub(&textures[k]), None);
+            }
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            let t = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(fence.GetCompletedValue(), 1, "GPU work did not finish");
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            for k in 0..2usize {
+                let row = std::slice::from_raw_parts((p as *const u8).add(k * total as usize), 16 * 8);
+                assert!(row.iter().all(|&b| b == 0x11 * (k as u8 + 1)), "texture {k} read back {:02x?}", &row[..16]);
+            }
+            readback.Unmap(0, None);
+
+            // released: the slots go back
+            for t in textures.iter().chain([&again, &across]) {
+                forget(t.as_raw() as usize);
+            }
+            assert_eq!(SMALL.lock().unwrap()[&key].slots.by_va.len(), used0);
+        }
+    }
+
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
