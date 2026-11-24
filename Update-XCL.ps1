@@ -30,6 +30,8 @@ $testPassed = 0
 $testIgnored = 0
 $testSkips = @()
 $transcribing = $false
+$updateLock = $null
+$savedCargoTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Read-Git {
@@ -63,10 +65,136 @@ function Invoke-Checked {
     }
 }
 
+function Read-CheckedOutput {
+    param([string]$Command, [string[]]$CommandArguments)
+    $ErrorActionPreference = 'Continue'
+    $output = & $Command @CommandArguments 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $Command $($CommandArguments -join ' '): $output" }
+    return ($output | ForEach-Object { "$_" }) -join [Environment]::NewLine
+}
+
+function Get-TextHash {
+    param([string]$Text)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Get-PackageStatus {
+    param([string]$Directory)
+    $revision = $null
+    try {
+        $info = Get-Content -LiteralPath (Join-Path $Directory 'BUILD-INFO.json') -Raw | ConvertFrom-Json
+        $revision = $info.revision
+        if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'Missing or invalid source revision.' }
+        $hashes = @{}
+        foreach ($line in @(Get-Content -LiteralPath (Join-Path $Directory 'SHA256SUMS.txt'))) {
+            if ($line -notmatch '^([0-9a-fA-F]{64})  (xcl\.exe|dxcompiler\.dll|dxil\.dll)$') { throw 'Invalid package checksum manifest.' }
+            $name = $Matches[2]
+            if ($hashes.ContainsKey($name)) { throw "Duplicate checksum for $name." }
+            $hashes[$name] = $Matches[1].ToLowerInvariant()
+        }
+        if ($hashes.Count -ne 3) { throw 'The package checksum manifest is incomplete.' }
+        foreach ($name in @('xcl.exe', 'dxcompiler.dll', 'dxil.dll')) {
+            $actual = (Get-FileHash -LiteralPath (Join-Path $Directory $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $hashes[$name]) { throw "Checksum mismatch: $name." }
+            if ($info.payload_sha256 -and $info.payload_sha256.$name -ne $actual) { throw "Build metadata checksum mismatch: $name." }
+        }
+        return [pscustomobject]@{ Valid = $true; Revision = $revision; Info = $info; Reason = 'payload SHA256 checks passed' }
+    }
+    catch { return [pscustomobject]@{ Valid = $false; Revision = $revision; Info = $null; Reason = $_.Exception.Message } }
+}
+
+function Assert-ArchiveMatchesPackage {
+    param([string]$Archive, [string]$Directory)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $expected = @{}
+    $prefix = $Directory.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $rootName = Split-Path -Leaf $Directory
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Recurse -File)) {
+        $relative = $file.FullName.Substring($prefix.Length).Replace('\', '/')
+        $expected["$rootName/$relative"] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $seen = @{}
+        foreach ($entry in $zip.Entries) {
+            if ($entry.FullName.EndsWith('/')) { continue }
+            $name = $entry.FullName.Replace('\', '/')
+            if (-not $expected.ContainsKey($name) -or $seen.ContainsKey($name)) { throw "Unexpected or duplicate archive entry: $name." }
+            $stream = $entry.Open()
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $actual = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+            finally { $stream.Dispose(); $sha.Dispose() }
+            if ($actual -ne $expected[$name]) { throw "Archive checksum mismatch: $name." }
+            $seen[$name] = $true
+        }
+        if ($seen.Count -ne $expected.Count) { throw 'The package archive is incomplete.' }
+    }
+    finally { $zip.Dispose() }
+}
+
+function Assert-UpdatePath {
+    param([string]$Path)
+    $root = [IO.Path]::GetFullPath($script:targetDirectory).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Update path is outside the target folder: $Path" }
+}
+
+function Publish-Package {
+    param([string]$Stage, [string]$Archive, [string]$Destination, [string]$DestinationArchive)
+    $status = Get-PackageStatus $Stage
+    if (-not $status.Valid) { throw "Staged package is invalid: $($status.Reason)" }
+    Assert-ArchiveMatchesPackage $Archive $Stage
+    $archiveHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+    $parent = Split-Path -Parent $Stage
+    $oldDirectory = Join-Path $parent 'previous-package'
+    $oldArchive = Join-Path $parent 'previous-package.zip'
+    $failedDirectory = Join-Path $parent 'failed-package'
+    $failedArchive = Join-Path $parent 'failed-package.zip'
+    foreach ($path in @($Stage, $Archive, $Destination, $DestinationArchive, $oldDirectory, $oldArchive, $failedDirectory, $failedArchive)) {
+        Assert-UpdatePath $path
+    }
+    foreach ($path in @($oldDirectory, $oldArchive, $failedDirectory, $failedArchive)) {
+        if (Test-Path -LiteralPath $path) { throw "Transaction recovery path already exists: $path" }
+    }
+    $savedDirectory = $savedArchive = $newDirectory = $newArchive = $false
+    try {
+        # Renames stay on this volume. Retain the old pair until both new artifacts verify.
+        if (Test-Path -LiteralPath $Destination) { Move-Item -LiteralPath $Destination -Destination $oldDirectory; $savedDirectory = $true }
+        if (Test-Path -LiteralPath $DestinationArchive) { Move-Item -LiteralPath $DestinationArchive -Destination $oldArchive; $savedArchive = $true }
+        Move-Item -LiteralPath $Stage -Destination $Destination
+        $newDirectory = $true
+        Move-Item -LiteralPath $Archive -Destination $DestinationArchive
+        $newArchive = $true
+        $installed = Get-PackageStatus $Destination
+        if (-not $installed.Valid -or $installed.Revision -ne $status.Revision) { throw 'Installed package failed verification.' }
+        if ((Get-FileHash -LiteralPath $DestinationArchive -Algorithm SHA256).Hash -ne $archiveHash) { throw 'Installed archive failed verification.' }
+    }
+    catch {
+        $failure = $_.Exception.Message
+        $rollbackErrors = @()
+        try { if ($newArchive) { Move-Item -LiteralPath $DestinationArchive -Destination $failedArchive } } catch { $rollbackErrors += $_.Exception.Message }
+        try { if ($newDirectory) { Move-Item -LiteralPath $Destination -Destination $failedDirectory } } catch { $rollbackErrors += $_.Exception.Message }
+        try { if ($savedDirectory) {
+            if (Test-Path -LiteralPath $Destination) { throw "Cannot restore over an occupied package path; previous package retained at $oldDirectory" }
+            Move-Item -LiteralPath $oldDirectory -Destination $Destination
+        } } catch { $rollbackErrors += $_.Exception.Message }
+        try { if ($savedArchive) {
+            if (Test-Path -LiteralPath $DestinationArchive) { throw "Cannot restore over an occupied archive path; previous archive retained at $oldArchive" }
+            Move-Item -LiteralPath $oldArchive -Destination $DestinationArchive
+        } } catch { $rollbackErrors += $_.Exception.Message }
+        if ($rollbackErrors) { throw "Promotion failed: $failure. Rollback needs attention: $($rollbackErrors -join '; '). Previous artifacts remain under $parent or the update backup." }
+        throw "Promotion failed; previous installed artifacts restored: $failure"
+    }
+}
+
 try {
     Set-Location -LiteralPath $projectDirectory
     $logDirectory = Join-Path $targetDirectory 'update-logs'
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    try { $updateLock = [IO.File]::Open((Join-Path $targetDirectory 'update.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { throw 'Another updater is using this folder. Wait for it to finish before retrying.' }
     $logPath = Join-Path $logDirectory "$stamp.log"
     Start-Transcript -LiteralPath $logPath | Out-Null
     $transcribing = $true
@@ -80,10 +208,13 @@ try {
         throw "Unexpected upstream repository: $remoteUrl"
     }
     $branch = Read-Git -GitArguments @('branch', '--show-current')
-    $patchedBuild = $branch -in @($patchBranch, $legacyPatchBranch)
+    $originUrl = Read-Git -GitArguments @('remote', 'get-url', 'origin')
+    $compatibilityOrigin = $originUrl -match '^(?:https://github\.com/|git@github\.com:)Prime1997/xcl-compat-fixes(?:\.git)?/?$'
+    $fullCompatibilityBuild = $branch -eq $patchBranch -or ($compatibilityOrigin -and $branch -in @('main', 'work-in-progress'))
+    $patchedBuild = $fullCompatibilityBuild -or $branch -eq $legacyPatchBranch
     if ($branch -ne 'main' -and -not $patchedBuild) { throw "Automatic updating supports main or the local compatibility branches (current: $branch)." }
     $changes = Read-Git -GitArguments @('status', '--porcelain', '--untracked-files=no')
-    if ($changes) { throw 'There are local source changes. Save or reconcile them before updating; nothing was discarded.' }
+    if ($changes -and -not $CheckOnly) { throw 'There are local source changes. Save or reconcile them before updating; nothing was discarded.' }
 
     if (-not $BuildCurrent) {
         Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'fetch', 'upstream', 'refs/heads/main:refs/remotes/upstream/main')
@@ -94,8 +225,17 @@ try {
     if ($BuildCurrent) {
         $upstreamRevision = Read-Git -GitArguments @('merge-base', 'HEAD', 'refs/remotes/upstream/main')
     }
-    Write-Host "Installed source: $previousRevision"
+    Write-Host "Source checkout: $previousRevision"
     Write-Host "Upstream main:   $upstreamLatestSeen"
+    $installedStatus = Get-PackageStatus $packageDirectory
+    if ($installedStatus.Revision) { Write-Host "Installed package source: $($installedStatus.Revision)" }
+    else { Write-Host 'Installed package source: unknown (no readable build metadata)' }
+    Write-Host "Installed package verification: $($installedStatus.Reason)"
+    $installedArchiveValid = $false
+    if ($installedStatus.Valid) {
+        try { Assert-ArchiveMatchesPackage $packageArchive $packageDirectory; $installedArchiveValid = $true; Write-Host 'Installed archive: verified against the package.' }
+        catch { Write-Host "Installed archive: $($_.Exception.Message)" }
+    }
     if ($BuildCurrent) { Write-Host "Building pinned HEAD without fetching or updating source (upstream base: $upstreamRevision)." }
     if ($patchedBuild) { Write-Host 'This copy includes local compatibility fixes; they will be retained.' }
     & $gitCommand -C $projectDirectory merge-base --is-ancestor refs/remotes/upstream/main HEAD
@@ -103,6 +243,14 @@ try {
     if ($CheckOnly) {
         if ($sourceUpToDate) { Write-Host 'Your source already includes the current upstream main.' }
         else { Write-Host 'An upstream update is available. Run Update-XCL.cmd to build and install it.' }
+        if ($changes) { Write-Host 'The source checkout also contains uncommitted changes; save them before rebuilding.' }
+        if (-not $installedStatus.Valid -or -not $installedArchiveValid -or $installedStatus.Revision -ne $previousRevision) {
+            Write-Host 'The installed package is missing, changed, or built from different source. Run the updater to rebuild it.'
+        }
+        elseif ($fullCompatibilityBuild -and $installedStatus.Info.validation_profile -ne 'compatibility-v2') {
+            Write-Host 'The installed package has not recorded the current compatibility checks. Run with -Rebuild.'
+        }
+        else { Write-Host 'The installed package matches this source revision and its payload checksums.' }
         exit 0
     }
 
@@ -110,10 +258,8 @@ try {
         & $gitCommand -C $projectDirectory merge-base --is-ancestor HEAD refs/remotes/upstream/main
         if ($LASTEXITCODE -ne 0) { throw 'The source history has diverged. Automatic updating stopped without changing your files.' }
     }
-    $buildInfoPath = Join-Path $packageDirectory 'BUILD-INFO.json'
-    if (-not $BuildCurrent -and -not $Rebuild -and $sourceUpToDate -and (Test-Path -LiteralPath $buildInfoPath)) {
-        $installedInfo = Get-Content -LiteralPath $buildInfoPath -Raw | ConvertFrom-Json
-        if ($installedInfo.revision -eq $previousRevision -and (Test-Path -LiteralPath (Join-Path $packageDirectory 'xcl.exe'))) {
+    if (-not $BuildCurrent -and -not $Rebuild -and $sourceUpToDate -and $installedStatus.Valid -and $installedArchiveValid) {
+        if ($installedStatus.Revision -eq $previousRevision -and (-not $fullCompatibilityBuild -or $installedStatus.Info.validation_profile -eq 'compatibility-v2')) {
             Write-Host 'XCL is already built and up to date. Use -Rebuild to build again.'
             exit 0
         }
@@ -129,6 +275,10 @@ try {
     $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
     if (Test-Path -LiteralPath $cargoBin) { $env:PATH = "$cargoBin;$env:PATH" }
     $cargoCommand = (Get-Command cargo.exe -ErrorAction Stop).Source
+    # The package always comes from this checkout's target, never an inherited target whose
+    # outputs can belong to another worktree. A source fingerprint below invalidates stale
+    # workspace artifacts while retaining the dependency cache.
+    $env:CARGO_TARGET_DIR = $targetDirectory
     $vswherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (Test-Path -LiteralPath $vswherePath) {
         $linkers = & $vswherePath -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\link.exe'
@@ -148,6 +298,13 @@ try {
     New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
     if (Test-Path -LiteralPath $packageDirectory) { Copy-Item -LiteralPath $packageDirectory -Destination $backupDirectory -Recurse }
     if (Test-Path -LiteralPath $packageArchive) { Copy-Item -LiteralPath $packageArchive -Destination $backupDirectory }
+    $compilerBackup = Join-Path $backupDirectory 'compiler'
+    New-Item -ItemType Directory -Path $compilerBackup -Force | Out-Null
+    foreach ($file in @('dxcompiler.dll', 'dxil.dll')) {
+        $saved = Join-Path $compilerBackup $file
+        Copy-Item -LiteralPath $dxcSources[$file] -Destination $saved
+        $dxcSources[$file] = $saved
+    }
     [IO.File]::WriteAllText((Join-Path $backupDirectory 'SOURCE-REVISION.txt'), "$previousRevision`r`n", $utf8)
     Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'update-ref', "refs/xcl/update-backups/$stamp", $previousRevision)
     Write-Host "Previous runnable package saved in $backupDirectory"
@@ -158,18 +315,31 @@ try {
     elseif ($patchedBuild) {
         if (-not $sourceUpToDate) {
             try {
-                Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'rebase', 'refs/remotes/upstream/main')
+                Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'merge', '--no-edit', 'refs/remotes/upstream/main')
             }
             catch {
-                $rebaseFailure = $_.Exception.Message
-                try { Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'rebase', '--abort') }
-                catch { Write-Host 'Rebase cleanup could not complete. Review the retained update log before continuing.' }
-                throw "The local compatibility fixes could not be reconciled with upstream. The previous package was retained. $rebaseFailure"
+                $mergeFailure = $_.Exception.Message
+                try { Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'merge', '--abort') }
+                catch { Write-Host 'Merge cleanup could not complete. Review the retained update log before continuing.' }
+                throw "The local compatibility fixes could not be reconciled with upstream. The previous package was retained. $mergeFailure"
             }
         }
     }
     else { Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'merge', '--ff-only', 'refs/remotes/upstream/main') }
+    $buildRevision = Read-Git -GitArguments @('rev-parse', 'HEAD')
+    $metadata = (Read-CheckedOutput $cargoCommand @('metadata', '--locked', '--no-deps', '--format-version=1')) | ConvertFrom-Json
+    $rustVersion = Read-CheckedOutput (Get-Command rustc.exe -ErrorAction Stop).Source @('--version', '--verbose')
+    $lockHash = (Get-FileHash -LiteralPath (Join-Path $projectDirectory 'Cargo.lock') -Algorithm SHA256).Hash
+    $sourceFingerprint = Get-TextHash "$projectDirectory`n$buildRevision`n$lockHash`n$rustVersion`nrelease"
+    $fingerprintPath = Join-Path $targetDirectory 'updater-build-fingerprint.txt'
+    $oldFingerprint = if (Test-Path -LiteralPath $fingerprintPath) { (Get-Content -LiteralPath $fingerprintPath -Raw).Trim() } else { '' }
+    if ($oldFingerprint -ne $sourceFingerprint) {
+        $cleanArguments = @('clean', '--release')
+        foreach ($package in $metadata.packages) { if ($package.id -in $metadata.workspace_members) { $cleanArguments += @('-p', [string]$package.name) } }
+        Invoke-Checked -Command $cargoCommand -CommandArguments $cleanArguments
+    }
     Invoke-Checked -Command $cargoCommand -CommandArguments @('build', '--locked', '--release', '--workspace')
+    [IO.File]::WriteAllText($fingerprintPath, $sourceFingerprint, $utf8)
     foreach ($file in @('dxcompiler.dll', 'dxil.dll')) {
         $destination = Join-Path $releaseDirectory $file
         if ($dxcSources[$file] -ne $destination) { Copy-Item -LiteralPath $dxcSources[$file] -Destination $destination -Force }
@@ -187,7 +357,7 @@ try {
     if ($patchedBuild) {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'insn::tests', '--', '--test-threads=1', '--nocapture') -CountTests
     }
-    if ($branch -eq $patchBranch) {
+    if ($fullCompatibilityBuild) {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'clzero_batch', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'connectivity_hint', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::netoff::tests', '--', '--test-threads=1', '--nocapture') -CountTests
@@ -213,13 +383,13 @@ try {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::xg::tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'console_mesh_streams_become_pc_ones', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'gpu_mesh_mode_two_passes', '--', '--test-threads=1', '--nocapture') -CountTests
-        foreach ($filter in @('clwb', 'real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
+        foreach ($filter in @('wait64_', 'clwb', 'real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
             Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', $filter, '--', '--test-threads=1', '--nocapture') -CountTests
         }
     }
     Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--test', 'disasm_e2e', '--test', 'e2e', '--test', 'rpf_e2e', '--test', 'gpu_compute_e2e', '--', '--test-threads=1', '--nocapture') -CountTests
-    Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--test', 'bcpack_controls', 'independent_synthetic_corpus', '--', '--nocapture') -CountTests
-    if ($branch -eq $patchBranch) {
+    if ($fullCompatibilityBuild) {
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--test', 'bcpack_controls', 'independent_synthetic_corpus', '--', '--nocapture') -CountTests
         try {
             $env:XCL_LAZY_COMPUTE = '1'
             Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--test', 'gpu_compute_e2e', 'console_wave64_compute_through_the_pso_hook_dispatch_and_read_back', '--', '--test-threads=1', '--nocapture') -CountTests
@@ -244,8 +414,20 @@ try {
     $licenses = Join-Path $packageDirectory 'licenses'
     if (Test-Path -LiteralPath $licenses) { Copy-Item -LiteralPath $licenses -Destination $stageDirectory -Recurse }
     $revision = Read-Git -GitArguments @('rev-parse', 'HEAD')
+    if ($revision -ne $buildRevision -or (Read-Git -GitArguments @('status', '--porcelain', '--untracked-files=no'))) {
+        throw 'Source changed during the build. The previous installed package was retained; rebuild the intended clean revision.'
+    }
+    $expectedVersion = ($metadata.packages | Where-Object { $_.name -eq 'xcl' } | Select-Object -First 1).version
+    $versionOutput = Read-CheckedOutput (Join-Path $stageDirectory 'xcl.exe') @('--version')
+    if ($versionOutput.Trim() -ne "xcl $expectedVersion") { throw "Unexpected staged executable version: $versionOutput (expected xcl $expectedVersion)" }
+    $payloadHashes = [ordered]@{}
+    foreach ($file in @('xcl.exe', 'dxcompiler.dll', 'dxil.dll')) { $payloadHashes[$file] = (Get-FileHash -LiteralPath (Join-Path $stageDirectory $file) -Algorithm SHA256).Hash.ToLowerInvariant() }
     $info = [ordered]@{
         revision = $revision
+        binary_version = $versionOutput.Trim()
+        source_fingerprint = $sourceFingerprint
+        payload_sha256 = $payloadHashes
+        validation_profile = $(if ($fullCompatibilityBuild) { 'compatibility-v2' } else { 'upstream-baseline-v1' })
         source_url = $sourceUrl
         upstream_url = $remoteUrl
         branch = $branch
@@ -269,7 +451,7 @@ try {
         $info.test_suites = @('insn::tests') + $info.test_suites
         $patchNote = "Includes PR #151 CPU compatibility fix ($pr151Revision).`r`nhttps://github.com/ivall/xcl/pull/151"
     }
-    if ($branch -eq $patchBranch) {
+    if ($fullCompatibilityBuild) {
         $info.local_fixes = @([ordered]@{
             name = 'clzero_loop_emulation'
             files = @('crates/xcl/src/eh.rs', 'crates/xcl/src/insn.rs', 'crates/xcl/src/gpu/shader.rs')
@@ -390,7 +572,7 @@ To update again, open Update-XCL.cmd in the source folder:
 $projectDirectory
 The updater follows upstream main, retains this branch's local fixes, and backs up the
 previous portable package before building. It does not run on a schedule.
-To rebuild the pinned source without fetching or rebasing, run Update-XCL.cmd -BuildCurrent.
+To rebuild the pinned source without fetching or merging, run Update-XCL.cmd -BuildCurrent.
 "@
     [IO.File]::WriteAllText((Join-Path $stageDirectory 'START-HERE.txt'), $startText, $utf8)
     $hashLines = foreach ($file in @('xcl.exe', 'dxcompiler.dll', 'dxil.dll')) {
@@ -398,12 +580,9 @@ To rebuild the pinned source without fetching or rebasing, run Update-XCL.cmd -B
         "$($hash.Hash.ToLower())  $file"
     }
     [IO.File]::WriteAllLines((Join-Path $stageDirectory 'SHA256SUMS.txt'), [string[]]$hashLines, $utf8)
-    Invoke-Checked -Command (Join-Path $stageDirectory 'xcl.exe') -CommandArguments @('--version')
     $stagedArchive = Join-Path $stageParent 'XCL-Windows-x64.zip'
     Compress-Archive -LiteralPath $stageDirectory -DestinationPath $stagedArchive -CompressionLevel Optimal
-    New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
-    Get-ChildItem -LiteralPath $stageDirectory -Force | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $packageDirectory -Recurse -Force }
-    Copy-Item -LiteralPath $stagedArchive -Destination $packageArchive -Force
+    Publish-Package $stageDirectory $stagedArchive $packageDirectory $packageArchive
     Write-Host "Updated XCL to $revision. $testPassed tests passed."
     Write-Host "Open: $(Join-Path $packageDirectory 'xcl.exe')"
     Write-Host "ZIP:  $packageArchive"
@@ -415,5 +594,7 @@ catch {
     exit 1
 }
 finally {
+    [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', $savedCargoTarget, 'Process')
+    if ($updateLock) { $updateLock.Dispose() }
     if ($transcribing) { Stop-Transcript | Out-Null }
 }
