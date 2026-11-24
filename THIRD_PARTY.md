@@ -14,6 +14,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 Â
 | [WinDurango](https://github.com/WinDurango/WinDurango) | LGPL-3.0 | no code; d3d12_x.dll export numbers (facts) in `crates/xcl/data/stubdb.toml` | reference only |
 | [libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | no code; XTaskQueue/XAsync contract | specification |
 | [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) and [Microsoft silicon-rans](https://github.com/microsoft/silicon-rans) | MIT alternative | BCPack entropy model and tables in `hle/bcpack.rs` | bounded Rust port, pinned sources in file header |
+| [Kalmarv's XCL BC1 rebuild (PR #273)](https://github.com/ivall/xcl/pull/273) and [bcpack-rs c51ec521](https://github.com/Ahmet-Dedeler/bcpack-rs/tree/c51ec521cbe6869136f29f5d157342374ef5cf33) | GPL-2.0-only (XCL); MIT (fitted tables) | `hle/bcpack_bc1.rs`, `bcpack_bc1_fitted.rs` and synthetic controls | attributed adaptation of commit `5f126439`; unchanged generated estimated tables, generator output path adapted, complete MIT notice retained |
 | [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) | MIT | Bounded BCPack fragment handling, synthetic test packets, standard BC7 packing/partition facts | attributed port and independent reconstruction |
 | Windows XGameRuntime (`System32\xgameruntime.dll`) | system | class GUIDs and slot order of the GDK thunk protocol in `hle/xgameruntime/api.rs` (facts, determined by analysis); APIs XCL does not implement are forwarded to it at runtime | interoperability; not distributed |
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
@@ -56,5 +57,7 @@ from GPL-3.0-only 6to5m sources. It is not linked into XCL or included in the XC
 portable archive. Its source checkout, wrapper, license and pinned revision are
 retained locally under `target/bcpack-research/external-oracle`. Numerical BC7
 configuration and field facts in the native decoder were measured using
-synthetic input/output tests; no GPL decoder implementation or fitted preset
-history is incorporated in XCL.
+synthetic input/output tests; no GPL-3.0 BC7 decoder implementation or fitted
+BC7 preset history is incorporated in XCL. The native BC1 path separately uses
+the attributed MIT fitted tables described above; they are estimated codec
+constants and do not establish hardware-exact output.

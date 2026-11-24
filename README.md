@@ -166,3 +166,8 @@ silicon-rans model. The bounded fragment handling and synthetic controls are
 from the MIT-licensed [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows)
 research. Their notices are retained in the decoder source. BC7 block
 reconstruction remains limited to explicitly validated configurations.
+The native BC1 path adapts [Kalmarv's PR #273](https://github.com/ivall/xcl/pull/273)
+with bcpack-rs's MIT fitted tables. These tables are estimates: unknown history
+entries are refused without destination writes, and hardware-exact colours are
+not established. BC1 is enabled for bounded single-stage requests; zlib + BC1
+and hardware swizzling remain refused in this integration.

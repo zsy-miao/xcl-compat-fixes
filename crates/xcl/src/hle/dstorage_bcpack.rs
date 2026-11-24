@@ -1,10 +1,18 @@
-//! Bounded BCPack adapter. Exact native BC7 subsets run first; an explicitly
+//! Bounded BCPack adapter. Native BC1 uses attributed estimated tables. Exact
+//! native BC7 subsets run first; an explicitly
 //! configured separate research executable may supply provisional BC7/BC5 decoding.
 
 #[path = "bcpack.rs"]
 mod entropy;
 #[path = "bcpack_bc7_general.rs"]
 mod bc7;
+#[path = "bcpack_bc1.rs"]
+mod bc1;
+#[path = "bcpack_bc1_fitted.rs"]
+mod bc1_fitted;
+#[cfg(test)]
+#[path = "dstorage_bc1_tests.rs"]
+mod bc1_tests;
 
 use std::io::{Read, Write};
 use std::ffi::OsStr;
@@ -29,8 +37,35 @@ pub(super) fn supported_sizes(source: usize, destination: usize) -> bool {
 }
 
 pub(super) fn supported_mode(mode: u8, source: usize, destination: usize) -> bool {
+    if mode == 1 {
+        return source > 0 && source <= entropy::MAX_INPUT_BYTES
+            && destination > 0 && destination <= MAX_DESTINATION && destination % 8 == 0;
+    }
     supported_sizes(source, destination)
         && (mode == 7 || (mode == 5 && external_executable().is_some()))
+}
+
+pub(super) fn decode_bc1(source: &[u8], destination: usize) -> Result<Vec<u8>, String> {
+    decode_bc1_with_tables(source, destination, &bc1_fitted::TABLES)
+}
+
+fn decode_bc1_with_tables(source: &[u8], destination: usize, tables: &bc1::Tables) -> Result<Vec<u8>, String> {
+    if !supported_mode(1, source.len(), destination) {
+        return Err("BC1 BCPack sizes exceed the bounded decoder or are not whole blocks".into());
+    }
+    // PR #273's widths are symbol bits; our entropy API takes symbol bits minus one.
+    let lanes = entropy::decode_entropy(source, [7,7,4,5,4,4,5,4,7,7,7,7], destination / 8)
+        .map_err(|e| e.to_string())?;
+    let symbols_len = (destination / 8).checked_mul(12).ok_or("BC1 symbol count overflow")?;
+    let mut symbols = Vec::new();
+    symbols.try_reserve_exact(symbols_len).map_err(|_| "BC1 symbol allocation failed")?;
+    for block in 0..destination / 8 {
+        for lane in &lanes { symbols.push(lane[block]); }
+    }
+    let output = bc1::assemble(&symbols, tables)?;
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| crate::xlog_warn!("DirectStorage: BCPack BC1 uses PR273's estimated bcpack-rs tables; hardware-exact output is not established"));
+    Ok(output)
 }
 
 fn external_executable() -> Option<std::ffi::OsString> {

@@ -500,7 +500,7 @@ impl Request {
                 );
                 return Err(E_DECOMPRESSION);
             }
-            // Single-stage BC7, or explicitly configured external BC5, is decoded
+            // Single-stage BC1/BC7, or explicitly configured external BC5, is decoded
             // transactionally by the worker. Zlib/swizzle combinations stay unsupported.
             (false, bc) => {
                 if self.intermediate_size != 0 {
@@ -614,11 +614,26 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || (r.bcpack() != 0 && (!matches!(r.bcpack(), 5 | 7) || r.zlib())) {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && (!matches!(r.bcpack(), 1 | 5 | 7) || r.zlib())) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.bcpack() == 5 {
+    let payload: Vec<u8> = if r.bcpack() == 1 {
+        match bcpack::decode_bc1(&src, n) {
+            Ok(bytes) => {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 8 || count.is_power_of_two() {
+                    crate::xlog_info!("DirectStorage: decoded BCPack BC1 request #{count}: {} source bytes -> {} BC1 bytes (estimated tables)", src.len(), bytes.len());
+                }
+                bytes
+            }
+            Err(error) => {
+                warn_once("BCPack BC1", format_args!("refused without destination writes (src={}, dst={n}, file offset={:#x}): {error}", src.len(), r.offset));
+                return Err(E_DECOMPRESSION);
+            }
+        }
+    } else if r.bcpack() == 5 {
         let source_len = src.len();
         match bcpack::decode_bc5(src, n) {
             Ok(bytes) => {

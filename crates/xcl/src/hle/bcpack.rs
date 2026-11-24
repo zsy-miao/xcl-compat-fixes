@@ -4,7 +4,7 @@
 // Bounded flushed-fragment extension ported from Xbox2Windows contributors:
 // https://github.com/R0Y00/Xbox2Windows/blob/64ecc8738ea447b3d9a1cb7f9fc891bbb945ee3b/tools/_bcpack_rans/__init__.py
 // Model tables/per-lane state machine originate in Microsoft's silicon-rans,
-// revision 2f6827d, mdu_minirans.v. Changes: fixed-size 16-lane API, bounded
+// revision 2f6827d, mdu_minirans.v. Changes: bounded 1..=16-lane API, bounded
 // input/output/cycles, checked symbols/counts, and no inverse-table allocations.
 // SPDX-License-Identifier: MIT
 //
@@ -205,15 +205,15 @@ pub fn decode_bc7_entropy(data: &[u8], block_count: usize) -> Result<[Vec<u8>; 1
     decode_entropy(data, BC7_ALPHABET_BITS, target)
 }
 
-/// Decode exactly `target` byte symbols from each of the 16 lanes. Lane alphabet
+/// Decode exactly `target` byte symbols from each of 1..=16 lanes. Lane alphabet
 /// entries must be 0..=7; this byte API deliberately does not accept 9-bit symbols.
-pub fn decode_entropy(data: &[u8], alphabet_bits: [u8; 16], target: usize) -> Result<[Vec<u8>; 16], DecodeError> {
-    let total = target.checked_mul(16).filter(|&n| n <= MAX_OUTPUT_SYMBOLS).ok_or(DecodeError::Bounds)?;
-    if target == 0 || data.is_empty() || data.len() > MAX_INPUT_BYTES { return Err(DecodeError::Bounds); }
+pub fn decode_entropy<const N: usize>(data: &[u8], alphabet_bits: [u8; N], target: usize) -> Result<[Vec<u8>; N], DecodeError> {
+    let total = target.checked_mul(N).filter(|&n| n <= MAX_OUTPUT_SYMBOLS).ok_or(DecodeError::Bounds)?;
+    if N == 0 || N > 16 || target == 0 || data.is_empty() || data.len() > MAX_INPUT_BYTES { return Err(DecodeError::Bounds); }
     if let Some(lane) = alphabet_bits.iter().position(|&bits| bits > 7) { return Err(DecodeError::InvalidAlphabet { lane }); }
-    let mut output: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
+    let mut output: [Vec<u8>; N] = std::array::from_fn(|_| Vec::new());
     for symbols in &mut output { symbols.try_reserve_exact(target).map_err(|_| DecodeError::Allocation)?; }
-    let mut lanes: [Lane; 16] = std::array::from_fn(|lane| Lane {
+    let mut lanes: [Lane; N] = std::array::from_fn(|lane| Lane {
         alphabet: alphabet_bits[lane], phase: Phase::Idle, input: None, symbol: None,
         input_remaining: 0, output_remaining: target, p0: 0, p1: 0, long_header: false,
         flush: false, q: 0, eab: 0, virtual_zeros: 0, done: false, start: true,
