@@ -17,12 +17,15 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, HSTRING, PCWSTR};
+use windows::core::{Interface, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -61,6 +64,55 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     0
 }
 
+const PLANE_STRIDE: usize = 0x48;
+const MAX_PLANES: usize = 8;
+
+/// Read `(resource, pSourceRect)` pairs from `PresentX`'s `D3D12XBOX_PRESENT_PLANE_PARAMETERS` array.
+unsafe fn extract_planes(plane_count: u32, planes: *const u8) -> Vec<(usize, Option<[i32; 4]>)> {
+    let mut out = Vec::new();
+    for i in 0..(plane_count as usize).min(MAX_PLANES) {
+        let plane = planes.add(i * PLANE_STRIDE);
+        if !crate::gpu::shader::readable(plane as usize, 0x18) {
+            break;
+        }
+        let count = (plane.add(8) as *const u32).read_unaligned();
+        let list = (plane.add(0x10) as *const usize).read_unaligned();
+        if count == 0 || !crate::gpu::shader::readable(list, 8) {
+            continue;
+        }
+        let res = (list as *const usize).read_unaligned();
+        if res == 0 {
+            continue;
+        }
+        let source_rect = if crate::gpu::shader::readable(plane as usize, 0x20) {
+            let rect_ptr = (plane.add(0x18) as *const usize).read_unaligned();
+            if rect_ptr != 0 && crate::gpu::shader::readable(rect_ptr, 16) {
+                Some([
+                    (rect_ptr as *const i32).read_unaligned(),
+                    ((rect_ptr + 4) as *const i32).read_unaligned(),
+                    ((rect_ptr + 8) as *const i32).read_unaligned(),
+                    ((rect_ptr + 12) as *const i32).read_unaligned(),
+                ])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        out.push((res, source_rect));
+    }
+    out
+}
+
+fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
+    if let Some([l, t, r, b]) = rect {
+        if w > 0 && h > 0 && l >= 0 && t >= 0 && r > l && b > t && r <= w as i32 && b <= h as i32 {
+            return [l as f32 / w as f32, t as f32 / h as f32, r as f32 / w as f32, b as f32 / h as f32];
+        }
+    }
+    [0.0, 0.0, 1.0, 1.0]
+}
+
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
@@ -80,26 +132,24 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         // plane over the game's): logged with the planes' raw words
         static LAST: AtomicU64 = AtomicU64::new(1);
         if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = 8 * plane_count as usize;
+            let n = (PLANE_STRIDE / 8) * plane_count as usize;
             let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
-        return;
-    }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
+    let extracted = extract_planes(plane_count, planes);
+    if extracted.is_empty() || !enabled() {
         return;
     }
     {
         let mut p = PRESENTED.lock().unwrap();
-        if !p.contains(&res) {
-            p.push(res);
+        for &(res, _) in &extracted {
+            if !p.contains(&res) {
+                p.push(res);
+            }
         }
     }
+    let res = extracted[0].0;
     if trace_frame() {
         super::list_x::dump_pending_geometry();
     }
@@ -125,7 +175,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    present_now(Duration::ZERO, Some((queue as usize, extracted)));
 }
 
 thread_local! {
@@ -518,6 +568,229 @@ fn ensure_window() -> Option<HWND> {
 // presenter
 // ---------------------------------------------------------------------------------------
 
+fn compile_fx(src: &str, target: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let t = format!("{target}\0");
+        let r = D3DCompile(
+            src.as_ptr() as *const c_void,
+            src.len(),
+            PCSTR::null(),
+            None,
+            None,
+            PCSTR(b"main\0".as_ptr()),
+            PCSTR(t.as_ptr()),
+            0,
+            0,
+            &mut blob,
+            None,
+        );
+        match (r, blob) {
+            (Ok(()), Some(b)) => Some(std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec()),
+            _ => None,
+        }
+    }
+}
+
+fn compositor_shaders() -> Option<&'static (Vec<u8>, Vec<u8>)> {
+    static S: OnceLock<Option<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
+    S.get_or_init(|| {
+        let vs = compile_fx(
+            "cbuffer Rect : register(b0) { float4 uv_rect; };\n\
+             struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n\
+             VSOut main(uint id : SV_VertexID) {\n\
+                 float2 p = float2((id & 1) ? 3.0 : -1.0, (id & 2) ? -3.0 : 1.0);\n\
+                 float2 t = float2((id & 1) ? 2.0 : 0.0, (id & 2) ? 2.0 : 0.0);\n\
+                 VSOut o;\n\
+                 o.pos = float4(p, 0.0, 1.0);\n\
+                 o.uv = lerp(uv_rect.xy, uv_rect.zw, t);\n\
+                 return o;\n\
+             }",
+            "vs_5_0",
+        )?;
+        let ps = compile_fx(
+            "Texture2D tex : register(t0);\n\
+             SamplerState smp : register(s0);\n\
+             float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n\
+                 return tex.Sample(smp, uv);\n\
+             }",
+            "ps_5_0",
+        )?;
+        Some((vs, ps))
+    })
+    .as_ref()
+}
+
+struct Compositor {
+    root_sig: ID3D12RootSignature,
+    psos: HashMap<i32, (ID3D12PipelineState, ID3D12PipelineState)>,
+    rtv_heap: ID3D12DescriptorHeap,
+    srv_heap: ID3D12DescriptorHeap,
+    srv_inc: u32,
+}
+
+impl Compositor {
+    unsafe fn new(dev: &ID3D12Device) -> Option<Self> {
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
+        ];
+        let sampler = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ..Default::default()
+        };
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            NumStaticSamplers: 1,
+            pStaticSamplers: &sampler,
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut ser: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).ok()?;
+        let ser = ser?;
+        let root_sig: ID3D12RootSignature = dev
+            .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+            .ok()?;
+        let rtv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .ok()?;
+        let srv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: MAX_PLANES as u32,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .ok()?;
+        let srv_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        Some(Self { root_sig, psos: HashMap::new(), rtv_heap, srv_heap, srv_inc })
+    }
+
+    unsafe fn psos_for(&mut self, dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<(ID3D12PipelineState, ID3D12PipelineState)> {
+        if let Some(pair) = self.psos.get(&fmt.0) {
+            return Some(pair.clone());
+        }
+        let (vs, ps) = compositor_shaders()?;
+        let make_pso = |blend: bool| -> Option<ID3D12PipelineState> {
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: ManuallyDrop::new(Some(self.root_sig.clone())),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = false.into();
+            pd.DepthStencilState.DepthEnable = false.into();
+            pd.DepthStencilState.StencilEnable = false.into();
+            pd.RTVFormats[0] = fmt;
+            let rt = &mut pd.BlendState.RenderTarget[0];
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            if blend {
+                rt.BlendEnable = true.into();
+                rt.SrcBlend = D3D12_BLEND_ONE;
+                rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                rt.BlendOp = D3D12_BLEND_OP_ADD;
+                rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+                rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            } else {
+                rt.BlendEnable = false.into();
+            }
+            dev.CreateGraphicsPipelineState(&pd).ok()
+        };
+        let pair = (make_pso(false)?, make_pso(true)?);
+        self.psos.insert(fmt.0, pair.clone());
+        Some(pair)
+    }
+
+    unsafe fn record(
+        &mut self,
+        dev: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        dst_w: u32,
+        dst_h: u32,
+        dst_fmt: DXGI_FORMAT,
+        planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])],
+    ) -> bool {
+        let Some((opaque_pso, blend_pso)) = self.psos_for(dev, dst_fmt) else { return false };
+        let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: dst_fmt,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        dev.CreateRenderTargetView(dst, Some(&rtv_desc), rtv_cpu);
+        let srv_cpu_base = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        for (i, (res, desc, _)) in planes.iter().take(MAX_PLANES).enumerate() {
+            let mut srv_cpu = srv_cpu_base;
+            srv_cpu.ptr += i * self.srv_inc as usize;
+            let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: swap_format(desc.Format).unwrap_or(desc.Format),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            srv_desc.Anonymous.Texture2D.MipLevels = 1;
+            dev.CreateShaderResourceView(res, Some(&srv_desc), srv_cpu);
+        }
+        list.OMSetRenderTargets(1, Some(&rtv_cpu), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: dst_w as f32,
+            Height: dst_h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: dst_w as i32, bottom: dst_h as i32 }]);
+        list.SetGraphicsRootSignature(&self.root_sig);
+        list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        let srv_gpu_base = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
+        for (i, (_, _, uv_rect)) in planes.iter().take(MAX_PLANES).enumerate() {
+            list.SetPipelineState(if i == 0 { &opaque_pso } else { &blend_pso });
+            list.SetGraphicsRoot32BitConstants(0, 4, uv_rect.as_ptr() as *const c_void, 0);
+            let mut gpu = srv_gpu_base;
+            gpu.ptr += (i as u64) * (self.srv_inc as u64);
+            list.SetGraphicsRootDescriptorTable(1, gpu);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        true
+    }
+}
+
 struct Presenter {
     queue: usize,
     dev: ID3D12Device,
@@ -528,7 +801,8 @@ struct Presenter {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
-    copy_source: Option<ID3D12Resource>,
+    copy_sources: Vec<ID3D12Resource>,
+    compositor: Option<Compositor>,
     dumps: Vec<FrameDump>,
     disabled: bool,
     value: u64,
@@ -573,7 +847,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_sources: Vec::new(), compositor: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
@@ -624,7 +898,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -635,10 +909,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let _reset = Reset;
-    let (queue, src, mut guard) = if let Some((queue, res)) = frame {
-        let raw = res as *mut c_void;
-        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), PRESENTER.lock().unwrap())
+    let is_frame = frame.is_some();
+    let (queue, raw_planes, mut guard) = if let Some((queue, planes)) = frame {
+        (queue, planes, PRESENTER.lock().unwrap())
     } else {
         let Ok(guard) = PRESENTER.try_lock() else { return };
         if PRESENTX.load(Ordering::Relaxed) {
@@ -646,14 +919,25 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
         let candidate = CANDIDATE.lock().unwrap();
         let Some((queue, res)) = *candidate else { return };
-        let raw = res as *mut c_void;
-        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), guard)
+        (queue, vec![(res, None)], guard)
     };
+    let resolved: Vec<(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])> = raw_planes
+        .into_iter()
+        .filter_map(|(res, rect)| {
+            let desc = backbuffer_like(res)?;
+            let raw = res as *mut c_void;
+            let r = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
+            let uv = source_uv_rect(rect, desc.Width as u32, desc.Height);
+            Some((r, desc, uv))
+        })
+        .collect();
+    if resolved.is_empty() {
+        return;
+    }
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
     // a new presenter for the title's present queue, after the old one's copy is done
-    if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
+    if is_frame && guard.as_ref().is_some_and(|p| p.queue != queue) {
         if let Some(old) = guard.as_ref() {
             let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
         }
@@ -667,8 +951,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.disabled || p.last.elapsed() < min_interval {
         return;
     }
-    let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
-    let Some(fmt) = swap_format(desc.Format) else { return };
+    let (w, h) = if resolved.len() == 1 {
+        (resolved[0].1.Width as u32, resolved[0].1.Height)
+    } else {
+        let mw = resolved.iter().map(|(_, d, _)| d.Width as u32).max().unwrap_or(0);
+        let mh = resolved.iter().map(|(_, d, _)| d.Height).max().unwrap_or(0);
+        (mw, mh)
+    };
+    let Some(fmt) = swap_format(resolved[0].1.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
@@ -681,9 +971,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
         return;
     }
-    p.copy_source = None;
+    p.copy_sources.clear();
     p.dumps.clear();
-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
+    if !ensure_swapchain(p, hwnd, w, h, fmt) {
         return;
     }
     let Some(sc) = p.sc.clone() else { return };
@@ -691,15 +981,58 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
     let mut dumps = Vec::new();
-    if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+    let mut composited = false;
+    if resolved.len() > 1 {
+        if p.compositor.is_none() {
+            p.compositor = Compositor::new(&p.dev);
         }
+        if let Some(comp) = p.compositor.as_mut() {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let info: Vec<String> = resolved
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, d, uv))| format!("plane {i}: {}x{} {:?} uv {uv:?}", d.Width, d.Height, d.Format))
+                    .collect();
+                crate::xlog_info!("present: compositing {} planes into {w}x{h} {:?} ({})", resolved.len(), fmt, info.join(", "));
+            }
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved) {
+                if due {
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let bb_desc = bb.GetDesc();
+                    if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
+                        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
+                    }
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                } else {
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+                }
+                composited = true;
+            } else {
+                p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+            }
+        } else {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("present: compositor unavailable – falling back to plane 0");
+            }
+        }
+    }
+    if !composited {
+        let (src, desc, _) = &resolved[0];
+        let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+        p.list.ResourceBarrier(&b1);
+        p.list.CopyResource(&bb, src);
+        if due {
+            if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
+                dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+            }
+        }
+        let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+        p.list.ResourceBarrier(&b2);
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
@@ -724,8 +1057,6 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-    p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
     }
@@ -733,7 +1064,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_source = Some(src);
+    p.copy_sources = resolved.into_iter().map(|(r, _, _)| r).collect();
     p.dumps = dumps;
     p.value += 1;
     if let Err(e) = q.Signal(&p.fence, p.value) {
@@ -768,7 +1099,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+        crate::xlog_info!("present: first game frame shown ({w}x{h})");
     }
 }
 
@@ -1070,6 +1401,27 @@ mod tests {
             std::env::remove_var("XCL_WINDOW_POS");
         }
     }
+
+    #[test]
+    fn parse_present_planes_and_uv_rects() {
+        let mut rect0 = [160i32, 90, 800, 450];
+        let mut res0: usize = 0x1111_0000;
+        let mut res1: usize = 0x2222_0000;
+        let mut buf = [0u8; 2 * PLANE_STRIDE];
+        let write_u64 = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        write_u64(&mut buf, 0x08, 1);
+        write_u64(&mut buf, 0x10, (&mut res0 as *mut usize) as u64);
+        write_u64(&mut buf, 0x18, rect0.as_mut_ptr() as u64);
+        write_u64(&mut buf, PLANE_STRIDE + 0x08, 1);
+        write_u64(&mut buf, PLANE_STRIDE + 0x10, (&mut res1 as *mut usize) as u64);
+        write_u64(&mut buf, PLANE_STRIDE + 0x18, 0);
+
+        let got = unsafe { extract_planes(2, buf.as_ptr()) };
+        assert_eq!(got, vec![(res0, Some(rect0)), (res1, None)]);
+        assert_eq!(source_uv_rect(got[0].1, 1600, 900), [0.1, 0.1, 0.5, 0.5]);
+        assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
+    }
 }
 
 #[cfg(test)]
@@ -1150,6 +1502,149 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    #[test]
+    fn compositor_blends_ui_plane_over_scene_plane() {
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut comp = Compositor::new(&dev).unwrap();
+
+            let make_tex = |w: u32, h: u32, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: w as u64,
+                        Height: h,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                r.unwrap()
+            };
+            let upload_tex = |tex: &ID3D12Resource, w: u32, h: u32, fill: &dyn Fn(u32, u32) -> [u8; 4]| -> ID3D12Resource {
+                let pitch = (w * 4).div_ceil(256) * 256;
+                let mut up: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: (pitch * h) as u64,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut up,
+                )
+                .unwrap();
+                let up = up.unwrap();
+                let mut p: *mut c_void = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, (pitch * h) as usize);
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = (y * pitch + x * 4) as usize;
+                        bytes[off..off + 4].copy_from_slice(&fill(x, y));
+                    }
+                }
+                up.Unmap(0, None);
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(tex),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&up),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: w,
+                                Height: h,
+                                Depth: 1,
+                                RowPitch: pitch,
+                            },
+                        },
+                    },
+                };
+                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+                up
+            };
+
+            let scene = make_tex(4, 4, D3D12_RESOURCE_FLAG_NONE);
+            let ui = make_tex(8, 8, D3D12_RESOURCE_FLAG_NONE);
+            let out = make_tex(8, 8, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let _up0 = upload_tex(&scene, 4, 4, &|_, _| [0, 0, 255, 255]);
+            let _up1 = upload_tex(&ui, 8, 8, &|x, y| {
+                if y == 2 && x < 4 {
+                    [0, 128, 0, 128]
+                } else if x < 4 {
+                    [0, 0, 0, 0]
+                } else {
+                    [255, 0, 0, 255]
+                }
+            });
+
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            let planes = [
+                (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+                (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+            ];
+            assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes));
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let out_desc = out.GetDesc();
+            let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
+            list.Close().unwrap();
+
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut p: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let px = |x: usize, y: usize| -> [u8; 4] {
+                let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
+                let s = std::slice::from_raw_parts((p as *const u8).add(off), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            assert_eq!(px(1, 1), [0, 0, 255, 255], "transparent UI exposes scene plane");
+            assert_eq!(px(6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
+            let blend = px(1, 2);
+            assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
+            rb.Unmap(0, None);
         }
     }
 }
