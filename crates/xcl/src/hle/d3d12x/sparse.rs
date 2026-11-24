@@ -403,6 +403,24 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+/// The state's `fence` and `rb_fence` once more: `fence_status` reads their completed values while a
+/// submit holds `STATE` (it can sleep there for 5 s in `wait_for`).
+static STATUS_FENCES: Mutex<Option<(ID3D12Fence, ID3D12Fence)>> = Mutex::new(None);
+/// The fence value a submit sleeps on in `wait_for` right now (0: none does).
+static WAIT_FOR_TARGET: AtomicU64 = AtomicU64::new(0);
+
+/// For the GPU-wait watchdog's line (`list_x`), as completed value / last value asked for (decimal,
+/// as in `wait_for`'s line): the queue's fence (title queues wait on it) and the readback fence
+/// (title queues signal it, the queue waits on it). While a submit holds the state the values asked
+/// for are `?`, with the value it sleeps on in `wait_for`.
+pub fn fence_status() -> String {
+    let Some((fence, rb)) = STATUS_FENCES.lock().unwrap().clone() else { return "none".into() };
+    let (done, rb_done) = unsafe { (fence.GetCompletedValue(), rb.GetCompletedValue()) };
+    match STATE.try_lock().as_deref() {
+        Ok(Some(s)) => format!("fence={done}/{} rb={rb_done}/{}", s.value, s.rb_value),
+        _ => format!("fence={done}/? rb={rb_done}/? (state busy, wait_for={})", WAIT_FOR_TARGET.load(Ordering::Relaxed)),
+    }
+}
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
@@ -567,6 +585,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
+            *STATUS_FENCES.lock().unwrap() = Some((s.fence.clone(), s.rb_fence.clone()));
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             let old = STATE.lock().unwrap().replace(s);
@@ -818,7 +837,9 @@ impl State {
             return;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
+        WAIT_FOR_TARGET.store(target, Ordering::Relaxed);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        WAIT_FOR_TARGET.store(0, Ordering::Relaxed);
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }
