@@ -3447,17 +3447,46 @@ impl Drop for SlotGuard {
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
 
-/// Before a big driver compile in the background: until 3 GB of commit are free (each takes
-/// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
-fn wait_for_commit() {
+/// Free commit target before starting a big background driver compile (`BIG_COMPILES`, most: 1).
+const BIG_COMMIT_RESERVE: u64 = 3 << 30;
+/// Maximum time `wait_for_commit` waits below `BIG_COMMIT_RESERVE`: on Windows with a
+/// system-managed dynamic pagefile, `ullAvailPageFile` does not expand while threads only poll
+/// `GlobalMemoryStatusEx`, so an unbounded loop deadlocks `BIG_COMPILES` once the title commits
+/// near the initial pagefile limit.
+const BIG_COMMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn avail_pagefile_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+fn wait_for_commit_with(mut avail: impl FnMut() -> Option<u64>, reserve: u64, grace: std::time::Duration, poll: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
     loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 3 << 30 {
-            return;
+        match avail() {
+            None => return true,
+            Some(free) if free >= reserve => return true,
+            Some(_) if start.elapsed() >= grace => return false,
+            Some(_) => std::thread::sleep(poll),
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Before a big driver compile in the background: wait up to `BIG_COMMIT_GRACE` for 3 GB of
+/// free commit (each big compile takes ~1.5 GB), then proceed one at a time (`BIG_COMPILES`)
+/// rather than deadlocking against an unexpanded Windows dynamic pagefile.
+fn wait_for_commit() {
+    if !wait_for_commit_with(avail_pagefile_bytes, BIG_COMMIT_RESERVE, BIG_COMMIT_GRACE, std::time::Duration::from_millis(200)) {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            let free_mb = avail_pagefile_bytes().unwrap_or(0) >> 20;
+            crate::xlog_warn!(
+                "D3D12.X: proceeding with serialized big compute PSO compile after {} s with {free_mb} MB free commit",
+                BIG_COMMIT_GRACE.as_secs()
+            );
+        });
     }
 }
 
@@ -5822,5 +5851,29 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+
+    #[test]
+    fn wait_for_commit_returns_when_headroom_appears() {
+        let mut calls = 0u32;
+        let met = wait_for_commit_with(
+            || {
+                calls += 1;
+                Some(if calls < 3 { 1 << 30 } else { 3 << 30 })
+            },
+            3 << 30,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(5),
+        );
+        assert!(met);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn wait_for_commit_does_not_hang_forever_below_reserve() {
+        let start = std::time::Instant::now();
+        let met = wait_for_commit_with(|| Some(2 << 30), 3 << 30, std::time::Duration::from_millis(30), std::time::Duration::from_millis(5));
+        assert!(!met);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 }
