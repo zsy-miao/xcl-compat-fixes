@@ -6,7 +6,7 @@ It combines attributed community fixes with our original compatibility work.
 experimental limits. Ongoing commits are published on `work-in-progress`;
 `main` holds the latest validated snapshot.
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/VJm64WpZQ5)
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/xcl)
 **Discord: <https://discord.gg/xcl>**
 
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
