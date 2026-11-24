@@ -1026,6 +1026,11 @@ pub unsafe fn probe_gpu_content(res: usize) {
     }
 }
 
+/// XCL's upload queues made so far.
+pub(super) fn upload_queues() -> Vec<ID3D12CommandQueue> {
+    QUEUES.lock().unwrap().values().cloned().collect()
+}
+
 /// XCL's queue for uploads on `dev`.
 unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12CommandQueue, String> {
     let mut q = QUEUES.lock().unwrap();

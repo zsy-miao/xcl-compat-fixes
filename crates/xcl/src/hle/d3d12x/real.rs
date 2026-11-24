@@ -1584,7 +1584,23 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    // The last reference: kept until the queues are past the work in flight (`late_release`).
+    // (Two last-but-one releases at once can miss each other here; the object then goes at
+    // once, as before.)
+    let mut held = false;
+    let n = if super::late_release::enabled() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            held = true;
+            0
+        } else {
+            f(this);
+            f(this)
+        }
+    } else {
+        f(this)
+    };
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1613,6 +1629,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
                 u.free(p);
             }
         }
+    }
+    if held {
+        super::late_release::hold(this as usize);
     }
     n
 }
