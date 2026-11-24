@@ -26,9 +26,10 @@ COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
 
 
 def smoke_blocks(body):
-    """The `xcl-smoke v1` blocks of `body`: each a dict of its `key: value` lines."""
+    """The `xcl-smoke v1` blocks of `body`: each a dict of its `key: value` lines. A block ends at
+    a code fence or at the next block's header (both blocks pasted in one fence)."""
     out = []
-    for m in re.finditer(r"xcl-smoke v1\s*\n(.*?)(?:```|\Z)", body, re.S):
+    for m in re.finditer(r"xcl-smoke v1\s*\n(.*?)(?=xcl-smoke v1|```|\Z)", body, re.S):
         block = {}
         for line in m.group(1).splitlines():
             k, sep, v = line.partition(":")
