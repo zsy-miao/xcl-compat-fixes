@@ -1693,7 +1693,8 @@ mod tests {
             let old_res = place_tex(base, &old_desc);
             write_tiled(base, &old_desc, 0xAA);
             refresh(queue.as_raw());
-            assert_eq!(read_sub(&old_res, 0), subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data);
+            let original_pixels = read_sub(&old_res, 0);
+            assert_eq!(original_pixels, subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data);
             // Place B at base + 256 KiB (overlaps old_res tail); writing into old_res's first
             // 256 KiB must NOT re-upload old_res over B (row 5).
             let new_res = place_tex(base + 0x4_0000, &new_desc);
@@ -1703,8 +1704,16 @@ mod tests {
             *(base as *mut u8) ^= 0xFF; // dirty page outside B, inside old_res
             refresh(queue.as_raw());
             assert_eq!(read_sub(&new_res, 0), want_b, "row 5: stale shadowed texture corrupted B");
-            // Releasing B remaps previously-unmapped old_res cleanly and restores its pixels.
+            // Restore A's original CPU bytes while B still owns the overlapping GPU tiles.
+            // Releasing B must repopulate A even when its CPU content matches its previous upload.
+            write_tiled(base, &old_desc, 0xAA);
             drop(new_res);
+            refresh(queue.as_raw());
+            let restored = read_sub(&old_res, 0);
+            assert_eq!(restored.len(), original_pixels.len());
+            assert_eq!(restored.iter().zip(&original_pixels).position(|(a, b)| a != b), None,
+                       "remapped texture must recover its last uploaded pixels");
+
             write_tiled(base, &old_desc, 0xD4);
             refresh(queue.as_raw());
             assert_eq!(read_sub(&old_res, 0), subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data, "reactivated unmapped texture remapped cleanly");
