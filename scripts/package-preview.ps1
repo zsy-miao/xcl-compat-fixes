@@ -1,11 +1,12 @@
 param(
     [Parameter(Mandatory)][string]$Executable,
     [Parameter(Mandatory)][string]$DxcArchive,
-    [Parameter(Mandatory)][string]$OutputDirectory
+    [Parameter(Mandatory)][string]$OutputDirectory,
+    [string]$SourceDirectory = (Split-Path $PSScriptRoot -Parent)
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path $PSScriptRoot -Parent
+$root = (Resolve-Path -LiteralPath $SourceDirectory).Path
 $revision = git -C $root rev-parse --verify HEAD
 if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the source revision.' }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
