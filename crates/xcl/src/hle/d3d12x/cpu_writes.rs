@@ -28,8 +28,6 @@ pub(super) enum Write {
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
-    /// An upload buffer kept alive until the queue's fence completes.
-    KeepAlive(#[allow(dead_code)] ID3D12Resource),
 }
 
 struct Job {
@@ -79,7 +77,6 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                             let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
                             write_u64_now(*va, value);
                         }
-                        Write::KeepAlive(_) => {}
                     }
                 }
             }
@@ -160,10 +157,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         Job { fence: entry.fence.clone(), value: entry.value, writes }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
-    let cpu_count = job.writes.iter().filter(|w| !matches!(w, Write::KeepAlive(_))).count();
-    if cpu_count > 0 {
-        FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({cpu_count} in the first submission)"));
-    }
+    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
     let _ = worker().lock().unwrap().send(job);
 }
 
