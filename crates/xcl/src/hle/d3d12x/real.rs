@@ -2453,10 +2453,12 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // not placed in unified memory (e.g. its coherent window kept for readback heaps): a PC
     // resource of the PC's description – the console's flag bits (0x1000000, 0x300000 …) and
     // alignments made the PC refuse Fortnite's 3264x1836 scene targets (E_INVALIDARG, a crash)
-    let pc_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| super::device_x::pc_resource_desc(&(console_desc as *const [u8; 0x38]).read_unaligned()));
+    let console_x = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| (console_desc as *const [u8; 0x38]).read_unaligned());
+    let pc_full = console_x.as_ref().map(|x| super::device_x::pc_resource_desc(x));
+    let resource_formats = console_x.as_ref().zip(pc_full.as_ref()).map(|(x, d)| (super::device_x::desc_format(x), super::device_x::desc_format(d)));
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
-    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, resource_formats) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
     let hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
     if hr < 0 {
