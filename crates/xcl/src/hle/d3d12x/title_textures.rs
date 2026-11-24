@@ -1042,9 +1042,12 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
     Ok(made)
 }
 
-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
-/// thousands of them – a lot)
-const WATCH_GAP: usize = 1 << 20;
+/// Ranges closer than this are scanned as one. A write-watch call costs ~3.5 µs however little it
+/// covers, while one call over 2 GiB of committed pages takes ~1.3 ms (measured on Windows 11): a
+/// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
+/// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
+/// reported as written too; the uploads keep to what they track.
+const WATCH_GAP: usize = 64 << 20;
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -1058,10 +1061,14 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
             _ => merged.push((a, b)),
         }
     }
+    // each region against the merged ranges it meets (sorted and disjoint: a binary search, not
+    // a pass over all of them – both lists run to thousands while a game streams)
     let mut out = Vec::new();
-    for (a, b) in merged {
-        for &(base, size) in regions {
-            let (lo, hi) = (a.max(base), b.min(base + size));
+    for &(base, size) in regions {
+        let end = base + size;
+        let first = merged.partition_point(|&(_, b)| b <= base);
+        for &(a, b) in merged[first..].iter().take_while(|&&(a, _)| a < end) {
+            let (lo, hi) = (a.max(base), b.min(end));
             if lo < hi {
                 out.push((lo, hi - lo));
             }
@@ -1572,9 +1579,15 @@ mod tests {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of under 1 MiB apart: one scan; further apart: two
-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+        // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        // a merged range over two regions: a piece in each, whatever order the regions come in
+        let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
+        assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
+        // a region between two merged ranges, and one past them all
+        let regions = [(0x2000_0000, 0x10_0000), (0x9000_0000, 0x1000)];
+        assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
     }
 
     /// The textures of a batch detiled on several threads come back as on one: complete and in

@@ -3071,7 +3071,16 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         return t;
     }
     // in a window by number: a PC resource's GPU address
-    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) {
+        return t;
+    }
+    // a buffer bound before has its mirror: no `readable` (a `VirtualQuery` walk of the title's
+    // memory when it is not resident – most of a retail title's render thread at a bind per
+    // draw); `sync_title_buffers` checks what it reads
+    if let Some(p) = mirror.then(|| mirrored(va, bytes)).flatten() {
+        return pc_va(p as u64);
+    }
+    if !crate::gpu::shader::readable(va as usize, bytes) {
         return t;
     }
     if mirror {
@@ -5898,6 +5907,37 @@ mod tests {
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
             }
+        }
+    }
+
+    /// A buffer outside unified memory that has a mirror is bound at its mirror again without
+    /// asking whether the title's memory is readable: the source made unreadable after the first
+    /// bind still binds the same mirror (before, the bind asked `readable` first and gave the
+    /// title's address back, which the PC's GPU has no address for).
+    #[test]
+    fn a_mirrored_buffer_binds_its_mirror_without_asking_readable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let len = 0x1_0000usize;
+            let src = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!src.is_null());
+            for k in 0..len {
+                *src.add(k) = k as u8;
+            }
+            let (va, bytes) = (src as u64 + 0x100, 0x400usize);
+            let first = gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true);
+            assert_ne!(first, va, "the first bind makes a mirror");
+            assert!(mirrored(va, bytes).is_some());
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(src as *const _, len, PAGE_NOACCESS, &mut old), 0);
+            assert!(!crate::gpu::shader::readable(va as usize, bytes));
+            assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
+            // the range stays reserved (and unreadable): the mirror table is never emptied, so its
+            // address must not come back for another test's memory
         }
     }
 }
