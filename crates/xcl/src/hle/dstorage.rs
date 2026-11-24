@@ -890,11 +890,19 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
         // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
+        // (titles also pass arrays on the stack). The title keeps an array with such an entry
+        // until the request is done: one it has freed or reused meanwhile cannot be told from
+        // a late fill. Read like the snapshot (`read_own`): an array unmapped since then fails
+        // the request instead of faulting in this worker (#476).
         let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
+        let pages = if pages.contains(&0) {
+            let mut now = vec![0usize; pages.len()];
+            if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+                late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
+                &late[..]
+            } else {
+                pages
+            }
         } else {
             pages
         };
@@ -2012,6 +2020,77 @@ mod tests {
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A destination page array with a deferred (0) entry whose memory is decommitted while
+    /// requests are on the queue (#476): the worker's reread fails the request
+    /// (E_ACCESS_VIOLATION) and never faults, whatever the array's state at that moment.
+    #[test]
+    fn a_deferred_page_array_unmapped_under_the_worker_fails_the_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const REQUESTS: u32 = 20_000;
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // the title's page table: one entry, still 0 (the page comes later), on a page of its own
+            let table = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(table, 0);
+            let data = [0x5Au8; 16];
+
+            // the title frees and reuses that memory while the requests wait for their turn
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let toggler = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        VirtualFree(table as *mut c_void, 0x1000, MEM_DECOMMIT);
+                        VirtualAlloc(table as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+                    }
+                })
+            };
+            for i in 0..REQUESTS {
+                enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table as u64, 0, 16, data.as_ptr() as u64, 0, 16, 0, 0).as_ptr());
+                if i % 16 == 15 {
+                    submit(q);
+                }
+            }
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 60 {
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+            toggler.join().unwrap();
+            assert!(complete(s, 0), "the queue did not get through its requests");
+            // refused at enqueue (array unreadable then) or failed at the reread: never a page
+            assert_eq!(hresult(s, 0), E_ACCESS_VIOLATION);
+
+            VirtualFree(table as *mut c_void, 0, MEM_RELEASE);
             queue_close(q);
             queue_release(q);
             status_release(s);
