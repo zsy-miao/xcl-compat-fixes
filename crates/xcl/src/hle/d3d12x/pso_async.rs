@@ -138,9 +138,9 @@ mod diagnostic_tests {
     #[test]
     fn stall_snapshot_distinguishes_queued_building_complete_and_busy_jobs() {
         let p = Arc::new(Pending {
-            job: Mutex::new(Some(Box::new(|| 0))), sent: Default::default(), real: AtomicUsize::new(0),
+            job: Mutex::new(Some(Box::new(|| 0))), queued: Default::default(), real: AtomicUsize::new(0),
             done: Mutex::new(false), cv: Condvar::new(), compute: true, key: 123,
-            used: Default::default(), orphan: Default::default(), late: Default::default(),
+            used: Default::default(), orphan: Default::default(), late: Default::default(), demand: Default::default(),
         });
         let pending = Mutex::new(Some(HashMap::from([(42, p.clone())])));
         assert_eq!(diagnostic_builds_in(&pending), Some((vec![], 0)), "queued is not building");
