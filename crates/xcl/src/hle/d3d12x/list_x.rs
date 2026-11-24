@@ -400,6 +400,13 @@ fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
+#[cfg(test)]
+pub(super) fn bound_heaps_for_test(list: *mut c_void) -> Vec<usize> {
+    let mut heaps = Vec::new();
+    with_bindings(list, |b| heaps.clone_from(&b.heaps));
+    heaps
+}
+
 const PC_IA_SET_PRIMITIVE_TOPOLOGY: usize = 20;
 const PC_RS_SET_VIEWPORTS: usize = 21;
 const PC_RS_SET_SCISSOR_RECTS: usize = 22;

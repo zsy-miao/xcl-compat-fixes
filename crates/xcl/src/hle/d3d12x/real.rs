@@ -1535,6 +1535,10 @@ static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static TEXTURE_MEMORY: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 #[cfg(test)]
+#[path = "real_heap_window_tests.rs"]
+mod heap_window_runtime_tests;
+
+#[cfg(test)]
 #[path = "real_texture_tests.rs"]
 mod texture_regression_tests;
 #[cfg(test)]

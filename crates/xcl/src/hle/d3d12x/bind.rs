@@ -1017,6 +1017,8 @@ mod tests {
         (*(this as *const FakeAdoptedList)).set_compute_uav_calls.fetch_add(1, Ordering::Relaxed);
     }
 
+    unsafe extern "system" fn fake_set_heaps(_this: *mut c_void, _n: u32, _heaps: *const usize) {}
+
     unsafe extern "system" fn fake_execute_indirect(
         this: *mut c_void,
         _sig: usize,
@@ -1036,6 +1038,7 @@ mod tests {
         orig_vt[2] = fake_release as usize;
         orig_vt[14] = fake_dispatch as usize;
         orig_vt[25] = fake_set_pso as usize;
+        orig_vt[28] = fake_set_heaps as usize;
         orig_vt[29] = fake_set_compute_rs as usize;
         orig_vt[41] = fake_set_compute_uav as usize;
         orig_vt[59] = fake_execute_indirect as usize;
