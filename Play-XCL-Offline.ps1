@@ -10,7 +10,7 @@ try {
     $game = (Get-Content -LiteralPath $selection -Raw).Trim()
     if (-not (Test-Path -LiteralPath $game)) { throw 'The previously selected game could not be found.' }
     foreach ($setting in @('XCL_RUN_SECONDS', 'XCL_FRAME_DUMP', 'XCL_FRAME_DUMP_FULL', 'XCL_PRESS_AT', 'XCL_PRESS_A_AT', 'XCL_THREAD_DUMP_AT', 'XCL_TRACE_MEM', 'XCL_ACTIVITY', 'XCL_VRAM_ARENAS')) {
-        [Environment]::SetEnvironmentVariable($setting, $null, 'Process')
+        Remove-Item -LiteralPath "Env:$setting" -ErrorAction SilentlyContinue
     }
     $env:XCL_NETWORK = '0'
     $env:XCL_DXC_THREADS = '2'
