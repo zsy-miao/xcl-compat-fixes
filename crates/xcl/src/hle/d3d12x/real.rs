@@ -5308,15 +5308,25 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
     n
 }
 
-unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+/// Reset the (adopted) PC allocator `raw` itself.
+pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
-    let hr = f(this);
+    let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
+    f(raw)
+}
+
+unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
+    let hr = match super::alloc_pool::title_reset(this) {
+        Some(hr) => hr,
+        None => reset_pc_allocator(this),
+    };
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
@@ -5537,6 +5547,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);

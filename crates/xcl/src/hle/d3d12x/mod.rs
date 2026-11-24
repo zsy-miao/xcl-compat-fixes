@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+mod alloc_pool;
 pub mod bind;
 mod bvh_source;
 pub mod console_heap;
