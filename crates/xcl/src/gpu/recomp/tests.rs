@@ -2897,6 +2897,136 @@ fn gpu_mesh_mode_two_passes() {
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
     let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
+
+    // #304's wide-output boundary, including one compact group: run the same actual NGG
+    // compute program, compare every pixel and every record word to the narrow control.
+    let wide_inputs: Vec<crate::gpu::dxbc::SigElement> = (0..21).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
+    let fields: String = (0..21).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
+    let wide_ps = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t20; }}\n"), "main", "ps_6_6", &[]).unwrap();
+    for (shape, expected_groups, declaration) in [
+        (ms.clone(), 7, "verts[57]"),
+        (MsInterface { max_vertices: 80, max_primitives: 1, ..ms.clone() }, 1, "verts[3]"),
+    ] {
+        let groups = super::emit::passthrough_split(&shape, super::emit::passthrough_elements(&shape, Some(&wide_inputs)));
+        assert_eq!(groups, expected_groups);
+        let pass = super::emit::mesh_passthrough_for(&shape, Some(&wide_inputs));
+        assert!(pass.contains(declaration), "wide compact declaration: {pass}");
+        let mesh = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap();
+        let tr = translate(&code, &on_gpu(Options { mode: Mode::Mesh(shape.clone()), wave64: true, ..Default::default() })).unwrap();
+        assert!(tr.complete(), "{:?}", tr.unsupported_why);
+        let compute = dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let (pixels, records) = runner::mesh_draw_split(&compute, &mesh, &wide_ps, 2, groups, shape.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+        assert_eq!(pixels, px, "all 1024 pixels match, including both triangles and background");
+        let mut expected = Vec::new();
+        for g in 0..2 {
+            let old = &rec[g * rd..(g + 1) * rd];
+            expected.extend_from_slice(&old[..MESH_HEADER + shape.max_vertices as usize * vd]);
+            let prim = MESH_HEADER + ms.max_vertices as usize * vd;
+            expected.extend_from_slice(&old[prim..prim + shape.max_primitives as usize]);
+        }
+        assert_eq!(records, expected, "all compute record words survive the wide mesh pass");
+    }
+}
+
+/// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
+/// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
+/// 32768) and the record must go out in split groups. A retail title's NGG transform programs
+/// have this shape (128 vertices / 128 primitives, 21 params + SV_ClipDistance0); the previous
+/// budget (32768 / stride) emitted verts[78] and DXC refused every one of them.
+#[test]
+fn mesh_split_accounts_vertex_chunks() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    if super::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..20u32 {
+        outputs.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let elems = passthrough_elements(&ms, None);
+    assert_eq!(elems, 21);
+    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
+    // most 21 triangles' worth of copies per group, ceil(128/21) = 7 groups of 19
+    let split = passthrough_split(&ms, elems);
+    assert_eq!(split, 7, "chunks of 32: 78 verts are accounted as 96 and refused");
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("verts[57]"), "19 triangles per group:\n{pass}");
+    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    // 20 rows * 16 B = 320 B/vertex: 96 accounted vertices fit (30720 B), but a whole record
+    // is 128 vertices (40960 B) – 4 groups of 32 triangles, 96 vertices each
+    let mut ms20 = ms.clone();
+    ms20.outputs.pop();
+    assert_eq!(passthrough_split(&ms20, passthrough_elements(&ms20, None)), 4);
+    let pass20 = mesh_passthrough(&ms20);
+    assert!(pass20.contains("verts[96]"), "96 vertices per group:\n{pass20}");
+    super::dxc::compile(&pass20, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass20}"));
+    // 8 rows * 16 B = 128 B/vertex: 128 vertices are 16384 B – the record stays whole
+    let mut ms8 = ms.clone();
+    ms8.outputs.truncate(8);
+    assert_eq!(passthrough_split(&ms8, passthrough_elements(&ms8, None)), 1);
+    let pass8 = mesh_passthrough(&ms8);
+    assert!(pass8.contains("verts[128]"), "whole record:\n{pass8}");
+    super::dxc::compile(&pass8, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass8}"));
+}
+
+/// The layout and the dispatch count are chosen separately: a record of 80 vertices with 22
+/// float4 rows does not fit the mesh output budget as a whole (DXC accounts 96 vertices:
+/// 33792 B > 32768 B), but its single triangle's copies fit one compact group. The pass-
+/// through must then declare the compact layout while `passthrough_split` returns 1, and DXC
+/// accepts it (the whole-record declaration is refused).
+#[test]
+fn mesh_layout_independent_of_group_count() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    if super::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..20u32 {
+        outputs.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
+    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let elems = passthrough_elements(&ms, None);
+    assert_eq!(elems, 21);
+    // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
+    assert_eq!(passthrough_split(&ms, elems), 1, "one triangle fits one compact group");
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("verts[3]"), "the compact layout is chosen, not verts[80]:\n{pass}");
+    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    // the whole-record form is what DXC refuses at this width: the same record declared whole
+    // (verts[80], accounted as 96: 33792 B) does not validate
+    let whole = pass.replace("verts[3]", "verts[80]");
+    assert!(whole.contains("verts[80]"), "the whole-record declaration for the refusal check:\n{whole}");
+    assert!(super::dxc::compile(&whole, "main", "ms_6_6", &[]).is_err(), "DXC refuses 96 accounted vertices of 352 B");
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
