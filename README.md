@@ -9,17 +9,11 @@ experimental limits. Ongoing commits are published on `work-in-progress`;
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/xcl)
 **Discord: <https://discord.gg/xcl>**
 
-XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
-x64 code runs natively and XCL stands in for the console libraries the PC does not have
-(`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
-GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
+**PRIMES TEMP DISCORD: <https://discord.gg/gK3y7WRRY>**
 
-**Project state:** retail games run – Minecraft Preview and Unicorn Overlord are fully
-playable, Fortnite and XDefiant work as far as each game goes without its online services;
-see [Games](#games). The foundation is tested against real data from retail games
-(shader packs, texture archives, movies and the console DLLs they ship). Details, measurements and
-next steps:
-[`HANDOFF.md`](HANDOFF.md); design: [`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md).
+XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a Windows PC - in the spirit of Wine/Proton. There is no CPU emulation: the game's x64 code runs natively, and XCL provides its own, independently written implementations of the console system libraries the PC does not have (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …). The console's GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
+
+XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
 
 ## Games
 
@@ -52,7 +46,7 @@ next steps:
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **PE loader** | ✅ | relocations, imports by name / ordinal / delay-load, TLS callbacks, exception tables, game DLLs, data-driven import routing (HLE / Windows / stub) | the game's 16 console DLLs load with 0 unresolved imports |
-| **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
+| **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages retain explicitly committed data across unmap), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
 | **DirectStorage memory inputs** | ✅ | deferred zero-filled mappings are readable as memory sources and physical-page arrays; read preparation leaves other reservations and existing protections unchanged | CPU regressions for deferred sources, owned page snapshots and protected ranges |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
