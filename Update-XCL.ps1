@@ -223,7 +223,11 @@ try {
         throw 'This folder has not been connected to the upstream XCL repository.'
     }
     $remoteUrl = Read-Git -GitArguments @('remote', 'get-url', 'upstream')
-    if ($remoteUrl -notmatch '^https://github\.com/ivall/xcl(?:\.git)?/?$') {
+    # Older checkouts can retain the pre-transfer remote name.
+    if ($remoteUrl -match '^https://github\.com/ivall/xcl(?:\.git)?/?$') {
+        $remoteUrl = 'https://github.com/xcl-dev/xcl.git'
+    }
+    if ($remoteUrl -notmatch '^https://github\.com/xcl-dev/xcl(?:\.git)?/?$') {
         throw "Unexpected upstream repository: $remoteUrl"
     }
     $branch = Read-Git -GitArguments @('branch', '--show-current')
@@ -236,7 +240,7 @@ try {
     if ($changes -and -not $CheckOnly) { throw 'There are local source changes. Save or reconcile them before updating; nothing was discarded.' }
 
     if (-not $BuildCurrent) {
-        Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'fetch', 'upstream', 'refs/heads/main:refs/remotes/upstream/main')
+        Invoke-Checked -Command $gitCommand -CommandArguments @('-C', $projectDirectory, 'fetch', $remoteUrl, 'refs/heads/main:refs/remotes/upstream/main')
     }
     $previousRevision = Read-Git -GitArguments @('rev-parse', 'HEAD')
     $upstreamLatestSeen = Read-Git -GitArguments @('rev-parse', 'refs/remotes/upstream/main')
@@ -466,9 +470,9 @@ try {
     }
     $patchNote = ''
     if ($patchedBuild) {
-        $info.applied_patches = @([ordered]@{ pull_request = 151; url = 'https://github.com/ivall/xcl/pull/151'; source_revision = $pr151Revision })
+        $info.applied_patches = @([ordered]@{ pull_request = 151; url = 'https://github.com/xcl-dev/xcl/pull/151'; source_revision = $pr151Revision })
         $info.test_suites = @('insn::tests') + $info.test_suites
-        $patchNote = "Includes PR #151 CPU compatibility fix ($pr151Revision).`r`nhttps://github.com/ivall/xcl/pull/151"
+        $patchNote = "Includes PR #151 CPU compatibility fix ($pr151Revision).`r`nhttps://github.com/xcl-dev/xcl/pull/151"
     }
     if ($fullCompatibilityBuild) {
         $info.local_fixes = @([ordered]@{
@@ -485,39 +489,39 @@ try {
             scope = 'MIT entropy and independently reconstructed BC7 modes; unsupported initial/cross-mode prediction refuses atomically. XCL_BCPACK_EXTERNAL_DECODER enables a separate bounded research process for fitted history, with strict diagnostics, exact block sizes and a deadline covering inherited pipes. Fitted output is provisional; the external program is not included in the portable archive.'
         })
         $info.applied_patches += @(
-            [ordered]@{ pull_request = 162; url = 'https://github.com/ivall/xcl/pull/162'; source_revision = $pr162Revision; scope = 'Graphics pipelines compile at first use with urgent compilation; compute first-use compilation is opt-in per title via lazy_compute_pipelines or XCL_LAZY_COMPUTE.' },
-            [ordered]@{ pull_request = 163; url = 'https://github.com/ivall/xcl/pull/163'; source_revision = $pr163Revision },
-            [ordered]@{ pull_request = 164; url = 'https://github.com/ivall/xcl/pull/164'; source_revision = $pr164Revision; scope = 'Crash and allocation diagnostics; existing PR #195 debug-message handling retained.' },
-            [ordered]@{ pull_request = 168; url = 'https://github.com/ivall/xcl/pull/168'; source_revision = $pr168Revision; scope = 'Texture-address functionality included through PR #195 and local placed/committed texture-address and lifetime fixes.' },
-            [ordered]@{ pull_request = 170; url = 'https://github.com/ivall/xcl/pull/170'; source_revision = $pr170Revision },
-            [ordered]@{ pull_request = 187; url = 'https://github.com/ivall/xcl/pull/187'; source_revision = $pr187Revision },
-            [ordered]@{ pull_request = 192; url = 'https://github.com/ivall/xcl/pull/192'; source_revision = $pr192Revision },
-            [ordered]@{ pull_request = 195; url = 'https://github.com/ivall/xcl/pull/195'; source_revision = $pr195Revision; scope = 'Four graphics files; PR #192 replaces its XG implementation; local allocation and address regressions are recorded by the source revision.' },
-            [ordered]@{ pull_request = 203; url = 'https://github.com/ivall/xcl/pull/203'; source_revision = $pr203Revision; scope = 'Memory-window and sparse-page integration from the user-specified source combination; compute first-use remains a per-title opt-in.' }
+            [ordered]@{ pull_request = 162; url = 'https://github.com/xcl-dev/xcl/pull/162'; source_revision = $pr162Revision; scope = 'Graphics pipelines compile at first use with urgent compilation; compute first-use compilation is opt-in per title via lazy_compute_pipelines or XCL_LAZY_COMPUTE.' },
+            [ordered]@{ pull_request = 163; url = 'https://github.com/xcl-dev/xcl/pull/163'; source_revision = $pr163Revision },
+            [ordered]@{ pull_request = 164; url = 'https://github.com/xcl-dev/xcl/pull/164'; source_revision = $pr164Revision; scope = 'Crash and allocation diagnostics; existing PR #195 debug-message handling retained.' },
+            [ordered]@{ pull_request = 168; url = 'https://github.com/xcl-dev/xcl/pull/168'; source_revision = $pr168Revision; scope = 'Texture-address functionality included through PR #195 and local placed/committed texture-address and lifetime fixes.' },
+            [ordered]@{ pull_request = 170; url = 'https://github.com/xcl-dev/xcl/pull/170'; source_revision = $pr170Revision },
+            [ordered]@{ pull_request = 187; url = 'https://github.com/xcl-dev/xcl/pull/187'; source_revision = $pr187Revision },
+            [ordered]@{ pull_request = 192; url = 'https://github.com/xcl-dev/xcl/pull/192'; source_revision = $pr192Revision },
+            [ordered]@{ pull_request = 195; url = 'https://github.com/xcl-dev/xcl/pull/195'; source_revision = $pr195Revision; scope = 'Four graphics files; PR #192 replaces its XG implementation; local allocation and address regressions are recorded by the source revision.' },
+            [ordered]@{ pull_request = 203; url = 'https://github.com/xcl-dev/xcl/pull/203'; source_revision = $pr203Revision; scope = 'Memory-window and sparse-page integration from the user-specified source combination; compute first-use remains a per-title opt-in.' }
         )
         $info.applied_patches += @(
-            [ordered]@{ pull_request = 225; url = 'https://github.com/ivall/xcl/pull/225'; source_revision = '327c24c98ea883f9fa586d647b5898e073ca6d34'; scope = 'Fallback texture arenas use aligned resource sizes and retire unused backing; existing shared target pages are retained.' },
-            [ordered]@{ pull_request = 230; url = 'https://github.com/ivall/xcl/pull/230'; source_revision = 'b85602215a2f616f734187504d30279e4c249df4'; scope = 'Aligned sparse tile hash distribution and its bucket regression only; PR #203 sparse-page behavior retained.' },
-            [ordered]@{ pull_request = 252; url = 'https://github.com/ivall/xcl/pull/252'; source_revision = '862a0d488d6ba1e7b3ffcfb10f8419251df2648b'; scope = 'Write-watch GPU-visible Windows fallback reservations; forced-fallback regression covers all three flag combinations.' },
-            [ordered]@{ pull_request = 283; url = 'https://github.com/ivall/xcl/pull/283'; source_revision = 'a2bfbed181159950526ba4377fbe2873e87fc672'; initial_revision = '94bfcf00332e3270611067cc242bf186074d3e3b'; scope = 'Pair GPU-only reservations with CPU views and retarget existing textures after lazy physical-page map/unmap changes; preserve GPU title addresses, local Entry.state and lazy mappings. Actual GPU readback checks CPU rewrites and later mappings before first touch.' }
+            [ordered]@{ pull_request = 225; url = 'https://github.com/xcl-dev/xcl/pull/225'; source_revision = '327c24c98ea883f9fa586d647b5898e073ca6d34'; scope = 'Fallback texture arenas use aligned resource sizes and retire unused backing; existing shared target pages are retained.' },
+            [ordered]@{ pull_request = 230; url = 'https://github.com/xcl-dev/xcl/pull/230'; source_revision = 'b85602215a2f616f734187504d30279e4c249df4'; scope = 'Aligned sparse tile hash distribution and its bucket regression only; PR #203 sparse-page behavior retained.' },
+            [ordered]@{ pull_request = 252; url = 'https://github.com/xcl-dev/xcl/pull/252'; source_revision = '862a0d488d6ba1e7b3ffcfb10f8419251df2648b'; scope = 'Write-watch GPU-visible Windows fallback reservations; forced-fallback regression covers all three flag combinations.' },
+            [ordered]@{ pull_request = 283; url = 'https://github.com/xcl-dev/xcl/pull/283'; source_revision = 'a2bfbed181159950526ba4377fbe2873e87fc672'; initial_revision = '94bfcf00332e3270611067cc242bf186074d3e3b'; scope = 'Pair GPU-only reservations with CPU views and retarget existing textures after lazy physical-page map/unmap changes; preserve GPU title addresses, local Entry.state and lazy mappings. Actual GPU readback checks CPU rewrites and later mappings before first touch.' }
         )
         $info.upstream_integrations = @([ordered]@{
             source_commit = $textureAllocatorRevision
-            url = "https://github.com/ivall/xcl/commit/$textureAllocatorRevision"
+            url = "https://github.com/xcl-dev/xcl/commit/$textureAllocatorRevision"
             files = @('crates/xcl/src/hle/d3d12x/vram.rs', 'crates/xcl/src/hle/d3d12x/device_x.rs', 'crates/xcl/src/hle/d3d12x/title_textures.rs', 'crates/xcl/src/hle/d3d12x/real.rs', 'crates/xcl/src/hle/kernelx.rs', 'crates/xcl/src/hle/kernelx/lazy.rs', 'crates/xcl/src/hle/dstorage.rs', 'crates/xcl/src/vfs_hooks.rs', 'crates/xcl/src/hle/d3d12x/cpu_writes.rs')
             scope = 'Complete VRAM texture-page allocator and console texture-size argument; per-frame refresh upload wait; unsupported mesh-layout refusal; typeless depth resource families with typed pipeline/clear/depth/stencil views; compatible lazy physical-page reservations and deferred-page handling for DirectStorage, file reads, and CPU completion writes. Local first-touch concurrency/failure/cleanup regressions and PR #187/#203 UMA/sparse changes retained.'
         })
         $info.upstream_integrations += [ordered]@{
             source_commit = '0cd0a53b584a8be0fd779d16e5826d97a0e66344'
             related_commit = 'af20b4b38e5a8003234f28091fb45e03aca68167'
-            url = 'https://github.com/ivall/xcl/commit/af20b4b38e5a8003234f28091fb45e03aca68167'
+            url = 'https://github.com/xcl-dev/xcl/commit/af20b4b38e5a8003234f28091fb45e03aca68167'
             files = @('crates/xcl/src/insn.rs', 'crates/xcl/src/eh.rs')
             scope = 'SSE4a immediate/register INSERTQ and EXTRQ, including hardware-verified prefix behavior and upper-quadword results. Local floating-point context validation and the prior CLZERO batching remain; unrelated CPU hot-patching is not imported.'
         }
         $info.upstream_integrations += [ordered]@{
             source_commit = '7a033c8cd13194900cd49c01ed60a59c6c9559c7'
             regression_commit = '2f5979ecdf686436c90c479727f2dcc16973072d'
-            url = 'https://github.com/ivall/xcl/pull/263'
+            url = 'https://github.com/xcl-dev/xcl/pull/263'
             scope = 'Disambiguate the hidden return buffer from the device when both arguments contain an adopted vtable pointer.'
         }
         $info.local_fixes += [ordered]@{
@@ -528,27 +532,27 @@ try {
         }
         $info.upstream_integrations += [ordered]@{
             contributor = 'gw1337x'
-            url = 'https://github.com/ivall/xcl/pull/283#issuecomment-7116115692'
+            url = 'https://github.com/xcl-dev/xcl/pull/283#issuecomment-7116115692'
             files = @('crates/xcl/src/gpu/tiling.rs')
             scope = 'Copy contiguous texture rows and reuse per-block offsets for tiled data. Differential tests cover partial elements, uncommon base swizzles, mip tails and array slices.'
         }
         $info.upstream_integrations += [ordered]@{
             contributor = 'notdxbi'
-            url = 'https://github.com/ivall/xcl/issues/175#issuecomment-7118129089'
+            url = 'https://github.com/xcl-dev/xcl/issues/175#issuecomment-7118129089'
             scope = 'Report no title connectivity in offline mode, even on a connected Windows host.'
         }
         $info.upstream_integrations += [ordered]@{
             source_commit = 'db1ddb25f3ff0c1686eed8200d238ad35f895926'; prerequisite_commit = '38b05b7b6954cfa5bd21cec72f68823603ca2227'
-            url = 'https://github.com/ivall/xcl/issues/305'
+            url = 'https://github.com/xcl-dev/xcl/issues/305'
             scope = 'Apply offline mode to the process-wide Windows network entry points used by the title and its libraries.'
         }
         $info.applied_patches += [ordered]@{
-            pull_request = 462; url = 'https://github.com/ivall/xcl/pull/462'
+            pull_request = 462; url = 'https://github.com/xcl-dev/xcl/pull/462'
             source_revision = '17172b593ae1324591d43ace8192458934cca70e'
             scope = 'Apply offline mode to the Winsock ConnectEx extension.'
         }
         $info.applied_patches += [ordered]@{
-            pull_request = 273; url = 'https://github.com/ivall/xcl/pull/273'
+            pull_request = 273; url = 'https://github.com/xcl-dev/xcl/pull/273'
             source_revision = '5f12643999939d07a234081dbc835c0d8a0497c2'
             scope = 'Single-stage BC1 reconstruction using the existing bounded entropy decoder and estimated BC1 tables. Tests cover virtual and scattered physical destinations.'
         }
@@ -556,10 +560,10 @@ try {
         $info.test_suites = @('wait64_ (recording and submission controls)', 'bvh_source::tests', 'clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start', 'a_page_away_at_another_home_goes_home_with_it', 'clwb (includes eh::clwb_batch_tests)', 'real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
         $info.test_suites = @('console_depth_buffers_and_their_views_are_the_pcs', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'untranslated_stream_rect_lists_get_the_pcs_topology_type', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
         $info.applied_patches += @(
-            [ordered]@{ pull_request = 218; url = 'https://github.com/ivall/xcl/pull/218'; upstream_commit = 'd4f17ca3246b6013bfa39ea2bed543cbe52309a6'; scope = 'Upstream scalar Wait64 comparison with the local wait-flag and command-submission regressions.' },
-            [ordered]@{ pull_request = 447; url = 'https://github.com/ivall/xcl/pull/447'; source_revision = '48e7434f5fa51934c3cd225eed4336a0bf9b0747'; scope = 'Verify cubemap reuse by per-resource tile identity.' },
-            [ordered]@{ pull_request = 508; url = 'https://github.com/ivall/xcl/pull/508'; source_revision = '61ee2a280184ba22995ef306609dc18aa975e981'; scope = 'Refresh remapped title textures and remember only successful uploads. Includes local GPU readback coverage.' },
-            [ordered]@{ pull_request = 509; url = 'https://github.com/ivall/xcl/pull/509'; source_revision = '3724b07170bd2ad3f689cbcfa2006a718b4443ea'; scope = 'Guard late physical-page array reads and test decommit races.' }
+            [ordered]@{ pull_request = 218; url = 'https://github.com/xcl-dev/xcl/pull/218'; upstream_commit = 'd4f17ca3246b6013bfa39ea2bed543cbe52309a6'; scope = 'Upstream scalar Wait64 comparison with the local wait-flag and command-submission regressions.' },
+            [ordered]@{ pull_request = 447; url = 'https://github.com/xcl-dev/xcl/pull/447'; source_revision = '48e7434f5fa51934c3cd225eed4336a0bf9b0747'; scope = 'Verify cubemap reuse by per-resource tile identity.' },
+            [ordered]@{ pull_request = 508; url = 'https://github.com/xcl-dev/xcl/pull/508'; source_revision = '61ee2a280184ba22995ef306609dc18aa975e981'; scope = 'Refresh remapped title textures and remember only successful uploads. Includes local GPU readback coverage.' },
+            [ordered]@{ pull_request = 509; url = 'https://github.com/xcl-dev/xcl/pull/509'; source_revision = '3724b07170bd2ad3f689cbcfa2006a718b4443ea'; scope = 'Guard late physical-page array reads and test decommit races.' }
         )
         $info.test_suites = $syncRegressionFilters + $info.test_suites
         $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
@@ -580,7 +584,7 @@ try {
 XCL - Windows x64 release build
 Source revision: $revision
 Source: https://github.com/Prime1997/xcl-compat-fixes/commit/$revision
-Upstream project: https://github.com/ivall/xcl
+Upstream project: https://github.com/xcl-dev/xcl
 $patchNote
 
 Extract the whole ZIP, then double-click xcl.exe. Choose your unpacked game's
