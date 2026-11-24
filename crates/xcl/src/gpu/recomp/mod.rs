@@ -1332,7 +1332,7 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
 /// set by s_mov / s_movk with constants earlier in its block, those words.
-fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
     let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
     for d in insts {
