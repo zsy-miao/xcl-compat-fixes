@@ -1071,14 +1071,56 @@ unsafe fn unmap_away_preserving(away: &mut Away, at: usize, restored: &std::ops:
         let home = if away.gone.len() < pending || own.is_some_and(|h| restored.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
         if let Some(home) = home {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
+            #[cfg(test)]
+            tests::HOME_COPIES.with(|c| c.set(c.get() + 1));
         }
-        if !restored.contains(&at) && !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
-            if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-                crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
-            }
-            mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
+        // (an address among the homes the caller maps back is one of them: it stays)
+        if !restored.contains(&at) {
+            release_at(at);
         }
     }
+}
+
+/// The memory at `at`, which a page mapped away from home left, decommitted (UMA memory that is
+/// committed as a whole stays).
+unsafe fn release_at(at: usize) {
+    if crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
+        return;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+        crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
+    }
+    mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
+}
+
+/// A page mapped away from home (at `old`) that the title maps at `at`: what `old` holds copied
+/// to `at`, and `old` given up – its home is not used. By way of its home a move was four
+/// commits and decommits, each a tile mapping in a sparse window: a retail game moving pages one
+/// at a time after its first movie spent 20 s in them and its watchdog ended it. False: the page
+/// was never used at `old` (its home holds it, zeros) and is not mapped anywhere now.
+unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma: bool) -> Result<bool, ()> {
+    if lazy::unmark(old) {
+        away.at.remove(&old);
+        away.page.remove(&page);
+        note_mapping_at(old);
+        return Ok(false);
+    }
+    // (a destination that cannot be committed leaves the page where it was, mapped as before)
+    if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+        return Err(());
+    }
+    away.at.remove(&old);
+    away.page.remove(&page);
+    std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+        crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+    }
+    release_at(old);
+    away.at.insert(at, page);
+    away.page.insert(page, at);
+    note_mapping_at(old);
+    note_mapping_at(at);
+    Ok(true)
 }
 
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
@@ -1237,7 +1279,14 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
-            unmap_away(away, old);
+            match move_away(away, old, at, p, in_uma(at)) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(()) => {
+                    fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+                    return std::ptr::null_mut();
+                }
+            }
         }
         let fresh = !in_uma(at) && !committed_page(at);
         let home = page_home(p).unwrap();
@@ -2348,6 +2397,61 @@ mod tests {
             assert_eq!(XMemMapPhysicalPagesScatter(both.as_ptr(), 2, none.as_mut_ptr()), 1);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    thread_local! {
+        /// pages `unmap_away` copied back home on this thread
+        pub(super) static HOME_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A page mapped away that the title maps somewhere else goes there straight, with what it
+    /// holds, and not by way of its home; the address it left is given up.
+    #[test]
+    fn a_page_away_moves_on_without_going_home() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let (a, b) = (r as *mut c_void, (r + PHYS_PAGE) as *mut c_void);
+            let mut one = [pages[0] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(&a, 1, one.as_mut_ptr()), 1);
+            *(a as *mut u32) = 7;
+            *((r + PHYS_PAGE - 4) as *mut u32) = 8;
+            let before = HOME_COPIES.with(|c| c.get());
+            assert_eq!(XMemMapPhysicalPagesScatter(&b, 1, one.as_mut_ptr()), 1);
+            assert_eq!(HOME_COPIES.with(|c| c.get()), before, "the page went by way of its home");
+            assert_eq!(*(b as *const u32), 7);
+            assert_eq!(*((r + 2 * PHYS_PAGE - 4) as *const u32), 8);
+            assert!(!committed_page(r), "the address the page left stays committed");
+            let mut zero = [0u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(&b, 1, zero.as_mut_ptr()), 1);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A move whose destination cannot be committed fails with the page still mapped away where
+    /// it was: its bytes and both lookups are kept.
+    #[test]
+    fn a_page_whose_move_fails_stays_mapped_where_it_was() {
+        unsafe {
+            let old = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            *(old as *mut u32) = 7;
+            // an address with nothing reserved: committing there fails
+            let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
+            let page = 0x7E57_0000usize;
+            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
+            away.at.insert(old, page);
+            away.page.insert(page, old);
+            assert!(move_away(&mut away, old, at, page, false).is_err());
+            assert_eq!(away.page.get(&page), Some(&old), "the page lost where it is");
+            assert_eq!(away.at.get(&old), Some(&page));
+            assert_eq!(*(old as *const u32), 7);
+            mem::VirtualFree(old as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 

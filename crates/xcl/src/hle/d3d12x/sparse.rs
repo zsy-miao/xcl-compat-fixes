@@ -582,6 +582,14 @@ impl State {
         if let Some(t) = self.free.pop() {
             return Some((t, true));
         }
+        // a pool retired a moment ago (its last tile came free) is taken back before a new
+        // 64 MB heap is made: freeing and allocating a tile in turn made a new pool each time,
+        // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
+        // (zeroed), so this is no less safe than reusing a tile of a pool in use.
+        if let Some((heap, _, _)) = self.retired.pop() {
+            let h = self.add_pool(heap);
+            return Some(((h, 0), true));
+        }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -594,6 +602,13 @@ impl State {
             return None;
         }
         let heap = heap?;
+        let h = self.add_pool(heap);
+        Some(((h, 0), false))
+    }
+
+    /// `heap` becomes a pool (in a given-back pool's index if there is one); its tiles but the
+    /// first, which the caller takes, go to the free list.
+    fn add_pool(&mut self, heap: ID3D12Heap) -> u32 {
         let h = match self.pools.iter().position(|p| p.is_none()) {
             Some(i) => {
                 self.pools[i] = Some(heap);
@@ -605,7 +620,7 @@ impl State {
             }
         };
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
-        Some(((h, 0), false))
+        h
     }
 
     /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
@@ -1536,6 +1551,77 @@ mod tests {
             .collect();
         for t in threads {
             t.join().unwrap();
+        }
+    }
+
+    /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
+    /// back, not a new 64 MB heap each time (#913: 288 pools, 18 GB asked of a 12 GB card).
+    #[test]
+    fn a_pool_retired_a_moment_ago_is_taken_back() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let (first, reused) = s.take_tile().expect("a tile from a new pool");
+            assert!(!reused, "a new pool's tile needs no clearing");
+            s.free.push(first);
+            s.retire_free_pools();
+            assert_eq!(s.retired.len(), 1, "an all-free pool is retired");
+            for round in 0..8 {
+                let (tile, reused) = s.take_tile().expect("a tile");
+                assert!(reused, "round {round}: a tile of a retired pool is cleared before use");
+                s.free.push(tile);
+                s.retire_free_pools();
+                assert_eq!(s.retired.len(), 1, "round {round}: the retired pool was taken back, not a new one made");
+                assert_eq!(s.pools.iter().filter(|p| p.is_some()).count(), 0, "round {round}");
+            }
         }
     }
 
