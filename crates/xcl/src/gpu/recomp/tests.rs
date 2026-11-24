@@ -1883,6 +1883,76 @@ fn draw_vsi() -> super::VsInterface {
     }
 }
 
+fn draw_passthrough_vs() -> Vec<u8> {
+    prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+    ])
+}
+
+#[test]
+fn gpu_ps_p0_reads_flat_integer_selectors() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32_FLOAT,
+    };
+
+    let vs_code = draw_passthrough_vs();
+    // Match the parameter word against 1, 2, and all ones, one output channel per match.
+    let ps_code = prog(&[
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 242)], None), // alpha and matching channel: 1.0
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 129), ("VSRC1", 4)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 128), ("VSRC1", 8)], None),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 130), ("VSRC1", 4)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128), ("VSRC1", 8)], None),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 193), ("VSRC1", 4)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 128), ("VSRC1", 8)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 5), ("VSRC1", 6), ("VSRC2", 7), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let compile = |code: &[u8], mode: Mode, profile: &str| {
+        let t = translate(code, &runner::options(mode)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+    };
+    let cases = [
+        (0, [0.0, 0.0, 0.0, 1.0]),
+        (1, [1.0, 0.0, 0.0, 1.0]),
+        (2, [0.0, 1.0, 0.0, 1.0]),
+        (u32::MAX, [0.0, 0.0, 1.0, 1.0]),
+    ];
+    for (component_type, format) in [(1, DXGI_FORMAT_R32G32B32A32_UINT), (2, DXGI_FORMAT_R32G32B32A32_SINT)] {
+        let mut vsi = draw_vsi();
+        vsi.inputs[1].component_type = component_type;
+        vsi.outputs[1].component_type = component_type;
+        let mut psi = draw_psi();
+        psi.inputs[1].component_type = component_type;
+        let vs = compile(&vs_code, Mode::Vertex(vsi), "vs_6_6");
+        let ps = compile(&ps_code, Mode::Pixel(psi), "ps_6_6");
+        let layout = [
+            runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+            runner::VertexElement { semantic: "COLOR", index: 0, format, offset: 8 },
+        ];
+        for (selector, expected) in cases {
+            // The runner uploads these vertex bytes directly. The input format reads the word as an integer.
+            let vertices: Vec<f32> = [[-1.0, -1.0], [-1.0, 3.0], [3.0, -1.0]]
+                .into_iter()
+                .flat_map(|[x, y]| [x, y, f32::from_bits(selector), 0.0, 0.0, 0.0])
+                .collect();
+            let pixels = runner::draw(&vs, &ps, &layout, &vertices, 24, &[], &[], 16, [-1.0; 4]).unwrap();
+            for (i, pixel) in pixels.iter().enumerate() {
+                assert_eq!(*pixel, expected, "{format:?} selector {selector:#010x}, pixel {i}");
+            }
+        }
+    }
+}
+
 /// Draw console wave64 VS + PS (`vs` None: position and COLOR passed through; `ps` None:
 /// COLOR interpolated) with triangles given in pixels of a 16 × 16 target, cleared to -1.
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the
@@ -1901,14 +1971,7 @@ fn draw_console_views(
     samplers: &[windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC],
 ) -> Vec<[f32; 4]> {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
-    let pass_vs = prog(&[
-        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
-        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
-        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
-        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
-        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
-        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
-    ]);
+    let pass_vs = draw_passthrough_vs();
     let pass_ps = prog(&[
         ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
         ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
@@ -6723,9 +6786,7 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
 }
 
 #[test]
-/// int / uint PS inputs read through v_interp_mov / p2 give their value converted to float (#107
-/// made it a bit copy; XDefiant's UI text vanished with it – see `v_interp_mov_f32` in emit.rs).
-fn ps_interp_converts_integer_inputs_and_compiles() {
+fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
     use super::PsInterface;
     let ps_code = prog(&[
         ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
@@ -6733,6 +6794,7 @@ fn ps_interp_converts_integer_inputs_and_compiles() {
         ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 2), ("ATTR", 1), ("ATTRCHAN", 0)], None),
         ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 1)], None),
         ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 2), ("ATTR", 2), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 8), ("VSRC", 2), ("ATTR", 3), ("ATTRCHAN", 0)], None),
         ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
     ]);
     let psi = PsInterface {
@@ -6741,6 +6803,7 @@ fn ps_interp_converts_integer_inputs_and_compiles() {
             el("TEXCOORD", 0, 0, 3, 1, 0xF), // float4
             el("TEXCOORD", 1, 0, 1, 2, 0xF), // uint4
             el("TEXCOORD", 2, 0, 2, 3, 0xF), // int4
+            el("TEXCOORD", 3, 0, 3, 4, 0xF), // flat float4
         ],
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
@@ -6748,7 +6811,7 @@ fn ps_interp_converts_integer_inputs_and_compiles() {
     };
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
-    for read in ["asuint((float)xi.a0[0])", "asuint((float)xi.a1[0])", "asuint((float)xi.a1[1])", "asuint((float)xi.a2[0])"] {
+    for read in ["asuint((float)xi.a0[0])", "asuint(xi.a1[0])", "asuint((float)xi.a1[1])", "asuint(xi.a2[0])", "asuint(xi.a3[0])"] {
         assert!(pt.hlsl.contains(read), "{read}:\n{}", pt.hlsl);
     }
     if super::dxc::location().is_ok() {

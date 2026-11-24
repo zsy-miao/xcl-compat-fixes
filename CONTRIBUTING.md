@@ -26,6 +26,11 @@ checked before anything else; a PR that does not meet them waits (or is closed a
    frames and at most 125 % of its peak commit. A run on a title that does not reach the code the PR
    changes still counts as a regression check; say what it does not cover under **Not tested**.
    `scripts/pr_check.py` checks all of this (and the rest of this list it can see) on every PR.
+   If a test-only diff touches a runtime file, a maintainer can apply the `test-only` label after
+   reviewing the diff. The label event waives only the smoke check for that revision. Adding or
+   removing other labels preserves the description check result. After a push or another event
+   that reruns the description check, review the updated PR, then remove and reapply the label
+   if the diff is still test-only.
 4. **No regression on the maintainer's run.** The maintainer merges in batches: the whole suite and a
    retail title run again on the merged tree, on an AMD RDNA4 GPU. A PR that breaks either is taken
    out of the batch and gets a comment with what failed.

@@ -3496,13 +3496,31 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // A program built again gets the driver's own result of its first build: a retail title
+    // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
+    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
+    let cached = compute_blob(key);
+    if let Some(b) = &cached {
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
+    let started = std::time::Instant::now();
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
+    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
         let slot = BIG_COMPILES.acquire();
         wait_for_commit();
         slot
     });
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    if hr < 0 && cached.is_some() {
+        // a blob the driver does not take (another root signature at the same address…): compiled
+        forget_compute_blob(key);
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    }
+    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+    if hr >= 0 && !reused {
+        keep_compute_blob(key, *ppv, dxil.len());
+    }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
@@ -3513,8 +3531,87 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
-    crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
+    crate::xlog_info!(
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        dxil.len(),
+        started.elapsed().as_millis(),
+        if reused { ", the driver's blob of an earlier build" } else { "" }
+    );
     Some(Ok(hr))
+}
+
+/// The driver's compiled form of translated compute programs (`GetCachedBlob`),
+/// by (DXIL hash, root signature, flags), up to `COMPUTE_BLOBS_MAX` bytes in all.
+static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+const COMPUTE_BLOBS_MAX: usize = 512 << 20;
+/// smaller programs compile in milliseconds: not kept
+const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
+
+fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dxil.hash(&mut h);
+    (h.finish(), rs, flags)
+}
+
+fn compute_blob(key: (u64, usize, i32)) -> Option<std::sync::Arc<Vec<u8>>> {
+    COMPUTE_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
+}
+
+fn forget_compute_blob(key: (u64, usize, i32)) {
+    if let Some((m, total)) = COMPUTE_BLOBS.lock().unwrap().as_mut() {
+        if let Some(b) = m.remove(&key) {
+            *total -= b.len();
+        }
+    }
+}
+
+#[cfg(test)]
+mod compute_blob_tests {
+    #[test]
+    fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
+        let dxil = vec![7u8; 1000];
+        let key = super::compute_blob_key(&dxil, 0x1000, 0);
+        assert_eq!(key, super::compute_blob_key(&dxil.clone(), 0x1000, 0));
+        assert_ne!(key, super::compute_blob_key(&dxil, 0x2000, 0));
+        assert_ne!(key, super::compute_blob_key(&dxil, 0x1000, 1));
+        let mut other = dxil.clone();
+        other[999] = 8;
+        assert_ne!(key, super::compute_blob_key(&other, 0x1000, 0));
+        {
+            let mut g = super::COMPUTE_BLOBS.lock().unwrap();
+            let (m, total) = g.get_or_insert_with(|| (super::HashMap::new(), 0));
+            m.insert(key, std::sync::Arc::new(vec![1, 2, 3]));
+            *total += 3;
+        }
+        assert_eq!(super::compute_blob(key).as_deref().map(|v| v.len()), Some(3));
+        let before = super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1;
+        super::forget_compute_blob(key);
+        assert!(super::compute_blob(key).is_none());
+        assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+    }
+}
+
+/// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
+        return;
+    }
+    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+    let mut raw = std::ptr::null_mut();
+    if get(pso, &mut raw) < 0 || raw.is_null() {
+        return;
+    }
+    let blob = ID3DBlob::from_raw(raw);
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+    let mut g = COMPUTE_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
+        return;
+    }
+    *total += bytes.len();
+    m.insert(key, std::sync::Arc::new(bytes));
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
