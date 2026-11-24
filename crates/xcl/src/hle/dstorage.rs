@@ -107,6 +107,9 @@ const FENCE_SIGNAL: usize = 10;
 mod bcpack_capture;
 #[path = "dstorage_bcpack.rs"]
 mod bcpack;
+#[path = "dstorage_diagnostics.rs"]
+mod diagnostics;
+use diagnostics::{Counts, Diagnostics, Event as DiagnosticEvent, Origin, Reread, Stage, Trace};
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![DStorageGetFactory]
@@ -868,6 +871,15 @@ pub fn counters() -> (u64, u64, u64) {
 
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+    execute_traced(r, file, dest_pages, src_pages, None)
+}
+
+fn access_failure(trace: &mut Option<&mut Trace>, stage: Stage) -> HRESULT {
+    if let Some(t) = trace.as_deref_mut() { t.stage = stage; }
+    E_ACCESS_VIOLATION
+}
+
+unsafe fn execute_traced(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>, mut trace: Option<&mut Trace>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -890,18 +902,18 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         }
     }
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
-        return Err(E_ACCESS_VIOLATION);
+        return Err(access_failure(&mut trace, Stage::DestinationWritable));
     }
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
-            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            let pages = src_pages.ok_or_else(|| access_failure(&mut trace, Stage::SourcePages))?;
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
-                return Err(E_ACCESS_VIOLATION);
+                return Err(access_failure(&mut trace, Stage::SourcePages));
             }
         } else {
             if !readable_source(r.source as usize, r.source_size as usize) {
-                return Err(E_ACCESS_VIOLATION);
+                return Err(access_failure(&mut trace, Stage::SourceReadable));
             }
             if !b.is_empty() {
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
@@ -942,7 +954,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        let pages = dest_pages.ok_or_else(|| access_failure(&mut trace, Stage::DestinationPages))?;
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
@@ -956,15 +968,18 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             let mut now = vec![0usize; pages.len()];
             if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
                 late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
+                if let Some(t) = trace.as_deref_mut() { t.reread = Reread::Read; }
                 &late[..]
             } else {
+                if let Some(t) = trace.as_deref_mut() { t.reread = Reread::Unreadable; }
                 pages
             }
         } else {
             pages
         };
+        if let Some(t) = trace.as_deref_mut() { t.used = Some(Counts::of(pages)); }
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
-            return Err(E_ACCESS_VIOLATION);
+            return Err(access_failure(&mut trace, Stage::DestinationPages));
         }
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
@@ -1013,6 +1028,7 @@ enum Entry {
         file: Option<Arc<FileInner>>,
         /// a refused BCPack request under `XCL_DSTORAGE_BCPACK_FILL`: where its solid blocks go
         fill: Option<FillTarget>,
+        trace: Option<Box<Trace>>,
     },
     Status(Arc<StatusInner>, u32),
     /// a fence (one reference held) and the value it gets
@@ -1046,17 +1062,24 @@ struct QueueInner {
     capacity: usize,
     pending: Mutex<Pending>,
     cancels: Mutex<Vec<CancelRule>>,
-    worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
+    worker: Mutex<Option<mpsc::Sender<(Origin, Vec<Entry>)>>>,
     worker_active: (Mutex<bool>, Condvar),
     closed: AtomicBool,
     error_event: usize,
     errors: Mutex<(u32, Option<FirstError>)>,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    diagnostics: OnceLock<Diagnostics>,
 }
 
 impl QueueInner {
-    fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
+    fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>, origin: Origin, trace: Option<Trace>) {
+        if hr == E_ACCESS_VIOLATION {
+            if let (Some(d), Some(trace)) = (self.diagnostics.get(), trace) {
+                let event = DiagnosticEvent { queue: d.id, origin, trace, source_memory: request.memory_source(), source_pages: request.source_physical_pages(), destination_pages: request.dest_physical_pages(), bytes: request.destination_size, bcpack: request.bcpack(), zlib: request.zlib() };
+                if d.admit(event) { crate::xlog_warn!("DirectStorage access failure ({hr:#x}): {event}"); }
+            }
+        }
         FAILED.fetch_add(1, Ordering::Relaxed);
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
@@ -1075,7 +1098,7 @@ impl QueueInner {
         rules.iter().any(|r| tag & r.mask == r.value)
     }
 
-    fn submit(self: &Arc<Self>) {
+    fn submit(self: &Arc<Self>, origin: Origin) {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
         let mut w = self.worker.lock().unwrap();
@@ -1087,7 +1110,7 @@ impl QueueInner {
             return;
         }
         if w.is_none() {
-            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+            let (tx, rx) = mpsc::channel::<(Origin, Vec<Entry>)>();
             let q = Arc::clone(self);
             *self.worker_active.0.lock().unwrap() = true;
             let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
@@ -1101,13 +1124,13 @@ impl QueueInner {
             }
             *w = Some(tx);
         }
-        let sent = w.as_ref().unwrap().send(batch);
+        let sent = w.as_ref().unwrap().send((origin, batch));
         // Release `worker` before dropping any unsent `batch` returned in `Err`.
         drop(w);
         drop(sent);
     }
 
-    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
+    fn run(&self, rx: mpsc::Receiver<(Origin, Vec<Entry>)>) {
         struct ActiveGuard<'a>(&'a QueueInner);
         impl Drop for ActiveGuard<'_> {
             fn drop(&mut self) {
@@ -1118,7 +1141,7 @@ impl QueueInner {
         let _active = ActiveGuard(self);
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
-        for batch in rx {
+        for (origin, batch) in rx {
             for e in batch {
                 if self.closed.load(Ordering::Acquire) {
                     if let Entry::Status(s, i) = e {
@@ -1134,19 +1157,26 @@ impl QueueInner {
                             // Cancelled requests are skipped without affecting status or error record.
                             continue;
                         }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
+                        let mut trace = self.diagnostics.get().map(|_| Trace::new(dest_pages.as_deref(), src_pages.as_deref()));
+                        let result = unsafe {
+                            match trace.as_mut() {
+                                Some(t) => execute_traced(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref(), Some(t)),
+                                None => execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()),
+                            }
+                        };
+                        if let Err(hr) = result {
+                            self.fail(hr, req, file.as_deref(), origin, trace);
                             if since_status >= 0 {
                                 since_status = hr;
                             }
                         }
                     }
-                    Entry::Refused { hr, req, file, fill } => {
+                    Entry::Refused { hr, req, file, fill, trace } => {
                         if let Some(t) = &fill {
                             // the destination gets solid blocks; the request still fails
                             unsafe { bcpack_fill(&req, t) };
                         }
-                        self.fail(hr, req, file.as_deref());
+                        self.fail(hr, req, file.as_deref(), origin, trace.map(|t| *t));
                         if since_status >= 0 {
                             since_status = hr;
                         }
@@ -1185,7 +1215,7 @@ impl QueueInner {
         };
         // as on PC: a half-full queue submits by itself
         if n >= (self.capacity / 2).max(1) {
-            self.submit();
+            self.submit(Origin::HalfFull);
         }
     }
 
@@ -1201,8 +1231,15 @@ impl QueueInner {
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
-            self.submit();
+            self.submit(Origin::HalfFull);
         }
+    }
+
+    fn refuse(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>, stage: Stage, dest_pages: Option<&[usize]>) {
+        let trace = if hr == E_ACCESS_VIOLATION {
+            self.diagnostics.get().map(|_| Box::new(Trace { stage, ..Trace::new(dest_pages, None) }))
+        } else { None };
+        self.enqueue(Entry::Refused { hr, req, file, fill, trace });
     }
 }
 
@@ -1273,7 +1310,11 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        diagnostics: OnceLock::new(),
     });
+    if std::env::var("XCL_DSTORAGE_FAILURE_DETAILS").is_ok_and(|v| v == "1") {
+        let _ = inner.diagnostics.set(Diagnostics::new());
+    }
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
     queue_release(o);
@@ -1330,7 +1371,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 };
             }
         }
-        return q.enqueue(Entry::Refused { hr, req: r, file: None, fill });
+        return q.refuse(hr, r, None, fill, Stage::EnqueueValidation, None);
     }
     let file = if r.memory_source() {
         None
@@ -1339,7 +1380,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         let f = r.source as *mut c_void;
         let mut vt = 0usize;
         if !read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) || vt != file_vtbl().as_ptr() as usize {
-            return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None, fill: None });
+            return q.refuse(E_FILE_HANDLE, r, None, None, Stage::EnqueueValidation, None);
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
@@ -1347,7 +1388,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.refuse(hr, r, file, None, Stage::DestinationSnapshot, None);
             }
         }
     } else {
@@ -1357,7 +1398,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.refuse(hr, r, file, None, Stage::SourceSnapshot, dest_pages.as_deref());
             }
         }
     } else {
@@ -1396,7 +1437,7 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
     let q = queue(p);
     if !q.closed.load(Ordering::Acquire) {
-        q.submit();
+        q.submit(Origin::TitleSubmit);
     }
 }
 
@@ -1516,6 +1557,9 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
 #[cfg(test)]
 #[path = "dstorage_lazy_input_tests.rs"]
 mod lazy_input_tests;
+#[cfg(test)]
+#[path = "dstorage_failure_tests.rs"]
+mod failure_tests;
 
 #[cfg(test)]
 mod tests {
