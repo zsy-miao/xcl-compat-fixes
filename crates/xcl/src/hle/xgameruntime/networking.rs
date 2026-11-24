@@ -616,7 +616,12 @@ pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworki
     if out.is_null() {
         return E_INVALIDARG;
     }
-    *out = connectivity_hint(crate::hle::netoff::enabled(), host_connectivity_hint);
+    let offline = crate::hle::netoff::enabled();
+    *out = connectivity_hint(offline, host_connectivity_hint);
+    if offline {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| crate::xlog_info!("XNetworking: reported no connectivity to the title (XCL_NETWORK=0)"));
+    }
     S_OK
 }
 
