@@ -344,15 +344,49 @@ fn window_name() -> String {
 /// the XCL window's timer for `show_compiling`
 const COMPILE_TIMER: usize = 0x5C0;
 
+struct FrameRate {
+    sampled_at: Instant,
+    presented: u64,
+    fps: f64,
+}
+
+impl FrameRate {
+    fn new(now: Instant, presented: u64) -> Self {
+        Self {
+            sampled_at: now,
+            presented,
+            fps: 0.0,
+        }
+    }
+
+    fn sample(&mut self, now: Instant, presented: u64) -> f64 {
+        let elapsed = now.duration_since(self.sampled_at);
+        if elapsed >= Duration::from_secs(1) {
+            self.fps = presented.saturating_sub(self.presented) as f64 / elapsed.as_secs_f64();
+            self.sampled_at = now;
+            self.presented = presented;
+        }
+        self.fps
+    }
+}
+
 /// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
 /// thousands recompile), the window's title says so:
-/// "XCL – <game> | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
+/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
 /// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
-/// then the plain title comes back.
+/// then only the game name and presented frame rate remain.
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
+    static FRAME_RATE: Mutex<Option<FrameRate>> = Mutex::new(None);
+    let now = Instant::now();
+    let presented = PRESENTS.load(Ordering::Relaxed);
+    let fps = FRAME_RATE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| FrameRate::new(now, presented))
+        .sample(now, presented);
     let (_, failed, queued) = super::pso_async::counts();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
     let active = running > 0 || queued > 0;
@@ -363,13 +397,13 @@ unsafe fn show_compiling(hwnd: HWND) {
         }
         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
     };
-    let title = window_name();
+    let title = format!("XCL – {} | {fps:.1} FPS", window_name());
     let text = if recent {
         let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("XCL – {title} | compiling shaders: {running} running, {done} done{queued}{failed}")
+        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
     } else {
-        format!("XCL – {title}")
+        title
     };
     let mut shown = SHOWN.lock().unwrap();
     if shown.as_deref() != Some(text.as_str()) {
@@ -967,6 +1001,40 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rate_uses_frame_and_time_deltas() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 1_000);
+        assert_eq!(
+            rate.sample(start + Duration::from_millis(1_500), 1_030),
+            20.0
+        );
+        assert_eq!(
+            rate.sample(start + Duration::from_millis(2_750), 1_080),
+            40.0
+        );
+    }
+
+    #[test]
+    fn frame_rate_waits_for_a_full_sample() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 0);
+        assert_eq!(rate.sample(start, 0), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_millis(500), 15), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(1), 30), 30.0);
+        assert_eq!(rate.sample(start + Duration::from_millis(1_500), 35), 30.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(2), 40), 10.0);
+    }
+
+    #[test]
+    fn frame_rate_reports_stalls_and_recovery() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 0);
+        assert_eq!(rate.sample(start + Duration::from_secs(1), 60), 60.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(2), 60), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(4), 70), 5.0);
+    }
 
     // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
     #[test]
