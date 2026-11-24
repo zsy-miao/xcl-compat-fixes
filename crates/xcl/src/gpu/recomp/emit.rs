@@ -4724,10 +4724,9 @@ fn passthrough_max_vertices(vbytes: u32) -> u32 {
 
 /// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
 /// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
-/// triangle) fit – whichever costs fewer groups. The layout choice in `mesh_passthrough_for`
-/// is by the vertex budget alone; this count is the dispatch's, and one compact group can
-/// carry a record whose whole declaration would be refused. `elements`: output elements
-/// besides SV_Position.
+/// triangle) fit. The layout choice in `mesh_passthrough_for` is by the vertex budget alone;
+/// this count is the dispatch's, and one compact group can carry a record whose whole
+/// declaration would be refused. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
     let cap = passthrough_max_vertices(vbytes);

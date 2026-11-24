@@ -2993,9 +2993,11 @@ fn mesh_layout_independent_of_group_count() {
     let pass = mesh_passthrough(&ms);
     assert!(pass.contains("verts[3]"), "the compact layout is chosen, not verts[80]:\n{pass}");
     super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
-    // the whole-record form is what DXC refuses at this width (80 accounted as 96)
-    let refused = mesh_passthrough(&MsInterface { max_vertices: 80, max_primitives: 1, ..ms.clone() });
-    assert!(refused.contains("verts[3]"), "the compact form stays:\n{refused}");
+    // the whole-record form is what DXC refuses at this width: the same record declared whole
+    // (verts[80], accounted as 96: 33792 B) does not validate
+    let whole = pass.replace("verts[3]", "verts[80]");
+    assert!(whole.contains("verts[80]"), "the whole-record declaration for the refusal check:\n{whole}");
+    assert!(super::dxc::compile(&whole, "main", "ms_6_6", &[]).is_err(), "DXC refuses 96 accounted vertices of 352 B");
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
