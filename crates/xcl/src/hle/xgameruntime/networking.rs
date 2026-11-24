@@ -589,12 +589,10 @@ fn host_connectivity_hint() -> Option<NlNetworkConnectivityHint> {
     if unsafe { f(&mut hint) } == 0 { Some(hint) } else { None }
 }
 
-pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworkingConnectivityHint) -> HRESULT {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
-    let host = host_connectivity_hint();
+fn connectivity_hint(offline: bool, query_host: impl FnOnce() -> Option<NlNetworkConnectivityHint>) -> XNetworkingConnectivityHint {
+    let host = if offline { None } else { query_host() };
     let level = match host.map(|h| h.connectivity_level) {
+        None if offline => 1, // XNetworkingConnectivityLevelHint::None
         Some(l @ 1..=4) => l,
         Some(5) => 2, // LocalAccess
         _ => 3,       // InternetAccess
@@ -603,7 +601,7 @@ pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworki
         Some(c @ 1..=3) => c,
         _ => 1, // Unrestricted
     };
-    *out = XNetworkingConnectivityHint {
+    XNetworkingConnectivityHint {
         connectivity_level: level,
         connectivity_cost: cost,
         iana_interface_type: 6, // IF_TYPE_ETHERNET_CSMACD
@@ -611,7 +609,14 @@ pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworki
         approaching_data_limit: host.is_some_and(|h| h.approaching_data_limit != 0),
         over_data_limit: host.is_some_and(|h| h.over_data_limit != 0),
         roaming: host.is_some_and(|h| h.roaming != 0),
-    };
+    }
+}
+
+pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworkingConnectivityHint) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = connectivity_hint(crate::hle::netoff::enabled(), host_connectivity_hint);
     S_OK
 }
 
@@ -760,11 +765,33 @@ mod tests {
     }
 
     #[test]
+    fn offline_connectivity_hint_reports_none_without_querying_windows() {
+        let hint = connectivity_hint(true, || panic!("offline titles must not query host connectivity"));
+        assert_eq!(hint.connectivity_level, 1);
+        assert!(hint.network_initialized);
+        assert!(!hint.approaching_data_limit && !hint.over_data_limit && !hint.roaming);
+    }
+
+    #[test]
+    fn online_connectivity_hint_preserves_host_and_fallback() {
+        let host = NlNetworkConnectivityHint { connectivity_level: 4, connectivity_cost: 2, roaming: 1, ..Default::default() };
+        let hint = connectivity_hint(false, || Some(host));
+        assert_eq!(hint.connectivity_level, 4);
+        assert_eq!(hint.connectivity_cost, 2);
+        assert!(hint.roaming);
+        assert_eq!(connectivity_hint(false, || None).connectivity_level, 3);
+    }
+
+    #[test]
     fn connectivity_hint_and_pin_verification() {
         unsafe {
+            assert_eq!(XNetworkingGetConnectivityHint(std::ptr::null_mut()), E_INVALIDARG);
             let mut hint: XNetworkingConnectivityHint = std::mem::zeroed();
             assert_eq!(XNetworkingGetConnectivityHint(&mut hint), S_OK);
             assert!((1..=4).contains(&hint.connectivity_level));
+            if crate::hle::netoff::enabled() {
+                assert_eq!(hint.connectivity_level, 1);
+            }
             assert!((1..=3).contains(&hint.connectivity_cost));
             assert_eq!(hint.iana_interface_type, 6);
             assert!(hint.network_initialized);
