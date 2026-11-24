@@ -2565,7 +2565,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("Wait", q_wait as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -5373,8 +5373,19 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::sparse::forget_queue(this as usize);
     }
     n
+}
+
+/// Wait: as on the PC; a title's wait is noted (`sparse::note_queue_wait`)
+unsafe extern "system" fn q_wait(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, 15));
+    let hr = f(this, fence, value);
+    if hr >= 0 && !super::title_textures::is_own_work() {
+        super::sparse::note_queue_wait(this as usize, fence, value);
+    }
+    hr
 }
 
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
@@ -5496,6 +5507,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
                 }
+            }
+            if older == 15 && hr >= 0 {
+                super::sparse::note_queue_wait(this as usize, a1 as *mut c_void, a2 as u64);
             }
             hr as u32 as usize
         }
