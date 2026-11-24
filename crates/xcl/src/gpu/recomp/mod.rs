@@ -627,6 +627,12 @@ impl Conts {
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
 
+/// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
+/// Each guard of the structured form lists every pending skip flag, so it grows with the
+/// square of the flags: one retail program made 455 B per byte (148 MB, 14 MB as `pc` blocks),
+/// the next largest 61 (#1307).
+const STRUCTURED_BYTES_PER_CODE_BYTE: usize = 128;
+
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
 /// exits through `LOOP_GUARD`.
@@ -1373,6 +1379,7 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
         normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
@@ -1476,6 +1483,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            if code.len() > STRUCTURED_BYTES_PER_CODE_BYTE * program.len() {
+                return translate(program, &Options { structured: false, ..opt.clone() });
+            }
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
