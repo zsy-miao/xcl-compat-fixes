@@ -4491,8 +4491,71 @@ fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -
 
 #[cfg(test)]
 mod mesh_slot_tests {
-    use super::mesh_shader_slots;
+    use super::{console_ms_in_as_slot, fallback_stream, mesh_shader_slots};
     use crate::gpu::xbox::tests::{sample, fssm, CODE};
+
+    /// A stream subobject: its type, then the payload at 4 (align 4) or 8 (align 8).
+    fn sub(ty: u32, payload: &[u8]) -> Vec<u8> {
+        let (_, palign) = super::super::null::subobject_payload(ty).unwrap();
+        let poff = if palign == 8 { 8 } else { 4 };
+        let mut b = vec![0u8; (poff + payload.len() + 7) & !7];
+        b[..4].copy_from_slice(&ty.to_le_bytes());
+        b[poff..poff + payload.len()].copy_from_slice(payload);
+        b
+    }
+
+    fn bytecode(s: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(s.as_ptr() as u64).to_le_bytes());
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b
+    }
+
+    /// The stream the retail title's AS-slot MS pipelines have: a console MS container in the
+    /// AS subobject, no MS subobject, a PS and the graphics state (`mesh_shader_slots` moves it).
+    fn as_slot_ms_stream(ms: &[u8], ps: &[u8]) -> Vec<u8> {
+        let mut s = sub(0, &0u64.to_le_bytes()); // ROOT_SIGNATURE: null
+        s.extend_from_slice(&sub(24, &bytecode(ms)));
+        s.extend_from_slice(&sub(2, &bytecode(ps)));
+        s.extend_from_slice(&sub(8, &vec![0u8; 328])); // BLEND
+        s.extend_from_slice(&sub(9, &u32::MAX.to_le_bytes())); // SAMPLE_MASK
+        s.extend_from_slice(&sub(10, &vec![0u8; 44])); // RASTERIZER
+        s.extend_from_slice(&sub(11, &vec![0u8; 52])); // DEPTH_STENCIL
+        s.extend_from_slice(&sub(15, &vec![0u8; 36])); // RENDER_TARGET_FORMATS
+        s.extend_from_slice(&sub(17, &[1, 0, 0, 0, 0, 0, 0, 0])); // SAMPLE_DESC
+        s
+    }
+
+    /// The stand-in for a console MS alone in the AS slot is a mesh pipeline: the subobject is
+    /// retyped to MS with the dummy MS (as `translated_mesh_stream` reads the title's stream),
+    /// the PS is the dummy PS. Left an empty AS and a PS, the stream had neither an MS nor a VS
+    /// and the driver refused it (E_INVALIDARG, NishantParajuli's and Chrysana's runs).
+    #[test]
+    fn the_stand_in_of_a_moved_ms_is_a_mesh_pipeline() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let ps = b"DXBC-a-pixel-shader".to_vec();
+        let stream = as_slot_ms_stream(&ms, &ps);
+        let desc = [stream.len(), stream.as_ptr() as usize];
+        let subs = super::stream_subobjects(&stream).unwrap();
+        assert!(unsafe { console_ms_in_as_slot(&subs) });
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+        let out = super::stream_subobjects(&buf).unwrap();
+        assert!(!out.iter().any(|s| s.0 == 24), "no AS subobject left");
+        let m = out.iter().find(|s| s.0 == 25).expect("an MS subobject");
+        let dm = super::dummy_mesh().expect("DXC for the stand-in shaders");
+        let got = unsafe { super::payload_shader(m.1) }.unwrap();
+        assert_eq!(got, dm.0.as_slice(), "the dummy MS");
+        let p = out.iter().find(|s| s.0 == 2).unwrap();
+        assert_eq!(unsafe { super::payload_shader(p.1) }.unwrap(), dm.1.as_slice(), "the dummy PS");
+        // a real AS with no MS is not moved, and its stand-in keeps the AS slot empty
+        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
+        let stream = as_slot_ms_stream(&as_, &ps);
+        let desc = [stream.len(), stream.as_ptr() as usize];
+        assert!(!unsafe { console_ms_in_as_slot(&super::stream_subobjects(&stream).unwrap()) });
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.unwrap();
+        let out = super::stream_subobjects(&buf).unwrap();
+        assert!(out.iter().any(|s| s.0 == 24) && !out.iter().any(|s| s.0 == 25));
+    }
 
     /// A console MS container alone in the AS slot becomes the MS; a real AS (console or PC),
     /// an MS already present, or a PC shader in the AS slot are left as they are.
@@ -4690,6 +4753,13 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
 }
 
+/// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).
+unsafe fn console_ms_in_as_slot(subs: &[(u32, &[u8])]) -> bool {
+    let shader = |ty: i32| subs.iter().find(|s| s.0 == ty as u32).and_then(|s| payload_shader(s.1));
+    shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0).is_none()
+        && shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0).is_some_and(|a| crate::gpu::recomp::pso::is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS"))
+}
+
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
@@ -4699,7 +4769,12 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    // A console MS alone in the AS slot is the stream's mesh shader (`mesh_shader_slots`), so its
+    // stand-in is a mesh pipeline too, with the dummy MS in that subobject as an MS. Left an AS
+    // without a shader, the stream had a PS and neither an MS nor a VS: the driver refused it
+    // (E_INVALIDARG) and every such pipeline was built in the title's call (NishantParajuli).
+    let ms_in_as = stream_subobjects(&buf).is_some_and(|subs| console_ms_in_as_slot(&subs));
+    let mesh = ms_in_as || stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -4718,6 +4793,10 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
+            24 if ms_in_as => {
+                buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                put(&mut buf, &dm?.0)
+            }
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
