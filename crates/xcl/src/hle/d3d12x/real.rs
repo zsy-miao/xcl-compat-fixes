@@ -2458,7 +2458,8 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let resource_formats = console_x.as_ref().zip(pc_full.as_ref()).map(|(x, d)| (super::device_x::desc_format(x), super::device_x::desc_format(d)));
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
-    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, resource_formats) as usize;
+    let pc_flags = pc_full.as_ref().map_or(0, |d| u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()));
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, resource_formats, pc_flags) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
     let hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
     if hr < 0 {
