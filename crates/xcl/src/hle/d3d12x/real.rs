@@ -3483,17 +3483,6 @@ struct Slots {
 
 struct SlotGuard(&'static Slots);
 
-impl Slots {
-    fn acquire(&'static self) -> SlotGuard {
-        let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
-            n = self.cv.wait(n).unwrap();
-        }
-        *n += 1;
-        SlotGuard(self)
-    }
-}
-
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         *self.0.n.lock().unwrap() -= 1;
@@ -3505,7 +3494,7 @@ static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::n
 
 /// Free commit target before starting a big background driver compile (`BIG_COMPILES`, most: 1).
 const BIG_COMMIT_RESERVE: u64 = 3 << 30;
-/// Maximum time `wait_for_commit` waits below `BIG_COMMIT_RESERVE`: on Windows with a
+/// Maximum time commit admission waits below `BIG_COMMIT_RESERVE`: on Windows with a
 /// system-managed dynamic pagefile, `ullAvailPageFile` does not expand while threads only poll
 /// `GlobalMemoryStatusEx`, so an unbounded loop deadlocks `BIG_COMPILES` once the title commits
 /// near the initial pagefile limit.
@@ -3530,19 +3519,106 @@ fn wait_for_commit_with(mut avail: impl FnMut() -> Option<u64>, reserve: u64, gr
     }
 }
 
-/// Before a big driver compile in the background: wait up to `BIG_COMMIT_GRACE` for 3 GB of
-/// free commit (each big compile takes ~1.5 GB), then proceed one at a time (`BIG_COMPILES`)
-/// rather than deadlocking against an unexpanded Windows dynamic pagefile.
-fn wait_for_commit() {
-    if !wait_for_commit_with(avail_pagefile_bytes, BIG_COMMIT_RESERVE, BIG_COMMIT_GRACE, std::time::Duration::from_millis(200)) {
+/// Before a big driver compile in the background: its turn – one at a time, and 3 GB of commit
+/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
+/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
+/// when that thread builds it itself. Holding such a build back holds the title back: on a
+/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
+/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+    big_compile_turn_with(slots, commit_free, wanted, BIG_COMMIT_GRACE)
+}
+
+// Retain the fork's finite background commit grace, alongside upstream wanted-build bypass.
+fn big_compile_turn_with(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool, grace: std::time::Duration) -> Option<SlotGuard> {
+    const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+    let slot = {
+        let mut n = slots.n.lock().unwrap();
+        loop {
+            if wanted() {
+                return None;
+            }
+            if *n < slots.most {
+                break;
+            }
+            n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
+        }
+        *n += 1;
+        SlotGuard(slots)
+    };
+    // A wanted build cancels this admission wait immediately (None); otherwise keep the
+    // existing bounded grace so an unexpanded dynamic pagefile cannot hold the slot forever.
+    let met = wait_for_commit_with(
+        || (!wanted()).then(|| if commit_free() { BIG_COMMIT_RESERVE } else { 0 }),
+        BIG_COMMIT_RESERVE, grace, LOOK,
+    );
+    if wanted() {
+        return None;
+    }
+    if !met {
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            let free_mb = avail_pagefile_bytes().unwrap_or(0) >> 20;
-            crate::xlog_warn!(
-                "D3D12.X: proceeding with serialized big compute PSO compile after {} s with {free_mb} MB free commit",
-                BIG_COMMIT_GRACE.as_secs()
-            );
-        });
+        LOGGED.call_once(|| crate::xlog_warn!("D3D12.X: proceeding with serialized big compute PSO compile after {} s below the free-commit reserve", grace.as_secs()));
+    }
+    Some(slot)
+}
+
+/// 3 GB of commit are free (true when that is not known).
+fn big_compile_commit_free() -> bool {
+    avail_pagefile_bytes().map_or(true, |free| free >= BIG_COMMIT_RESERVE)
+}
+
+#[cfg(test)]
+mod big_compile_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        // the slot is taken: a wanted build goes on without one, at once
+        assert!(big_compile_turn(&S, || true, || true).is_none());
+        // … and one that becomes wanted while it waits for the slot goes on then
+        static WANTED: AtomicBool = AtomicBool::new(false);
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "not wanted yet: it waits for its turn");
+        WANTED.store(true, Ordering::Release);
+        assert!(t.join().unwrap());
+        drop(held);
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        // without the commit: not wanted, it waits; wanted, it goes on and gives the slot back
+        static WANTED2: AtomicBool = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "no commit free: it waits");
+        WANTED2.store(true, Ordering::Release);
+        assert!(t.join().unwrap() && t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(*S.n.lock().unwrap(), 0, "the slot went back");
+    }
+
+    #[test]
+    fn unwanted_low_commit_grace_is_bounded_and_retains_its_slot() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let held = big_compile_turn_with(&S, || false, || false, Duration::ZERO).expect("bounded background admission retains serialization");
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        drop(held);
+        assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let first = big_compile_turn(&S, || true, || false).expect("its turn");
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false).is_some());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "one at a time");
+        drop(first);
+        assert!(t.join().unwrap(), "the next one's turn");
+        assert_eq!(*S.n.lock().unwrap(), 0);
     }
 }
 
@@ -3594,13 +3670,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    let started = std::time::Instant::now();
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
+    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
+        .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted));
+    let started = std::time::Instant::now();
     let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
@@ -3649,7 +3722,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
-mod driver_cache {
+pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -737,14 +737,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
-/// ABI root signature with its static samplers): the driver keeps what it compiled in its own
-/// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
-/// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
+/// ABI root signature with its static samplers). Save the driver's compiled blob in the same
+/// cache the runtime reads at startup. Nothing runs on the GPU.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
+    reused: AtomicUsize,
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
@@ -764,7 +764,7 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
         }
     }
 
@@ -788,7 +788,7 @@ impl Pipelines {
                 },
             }
         };
-        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
@@ -800,7 +800,30 @@ impl Pipelines {
             }
             *n += 1;
         }
-        let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
+        use crate::hle::d3d12x::real::driver_cache;
+        let path = driver_cache::path(&c.dxil, desc.Flags.0);
+        let cached = path.as_deref().and_then(driver_cache::load);
+        let from_cache = cached.as_ref().and_then(|bytes| {
+            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
+            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
+        });
+        let r = if let Some(pso) = from_cache {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            Ok(pso)
+        } else {
+            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
+                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                    let len = unsafe { blob.GetBufferSize() };
+                    if !bytes.is_null() && len != 0 {
+                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+                    }
+                }
+            }
+            pso
+        };
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -939,6 +962,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     );
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");

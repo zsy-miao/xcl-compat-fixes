@@ -7613,3 +7613,140 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+/// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
+/// inner loops, loops whose end is an inner loop's – give the same state as structured code and as
+/// the block dispatcher (`structured: false`).
+#[test]
+fn jumps_to_outer_loop_heads_are_structured() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = move |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 11) % n
+    };
+    /// (loop head, jumps to its end and into its middle to be filled in)
+    struct Open {
+        head: usize,
+        ends: Vec<usize>,
+        entries: Vec<usize>,
+    }
+    let (mut structured, mut ran, mut entered) = (0, 0, 0);
+    for round in 0..120 {
+        let mut code: Vec<u8> = Vec::new();
+        let mut open: Vec<Open> = Vec::new();
+        // s20: steps left – every backward jump is taken only while there are some; s0 - s3: state
+        let work = |code: &mut Vec<u8>, k: u64| {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", k % 4), ("SSRC0", k % 4), ("SSRC1", 129 + k % 7)]));
+            code.extend(i("S_XOR_B32", "ENC_SOP2", &[("SDST", (k + 1) % 4), ("SSRC0", (k + 1) % 4), ("SSRC1", k % 4)]));
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1 + k % 3), ("SRC0", k % 4), ("VSRC1", 1 + k % 3)]));
+        };
+        // a step used up; SCC = some left and a bit of the state
+        let test = |code: &mut Vec<u8>, bit: u64| {
+            code.extend(i("S_SUB_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 129)]));
+            code.extend(i("S_LSHR_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", bit % 4), ("SSRC1", 128 + bit % 3)]));
+            code.extend(i("S_AND_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 21), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_GT_I32", "ENC_SOPC", &[("SSRC0", 20), ("SSRC1", 128)]));
+            code.extend(i("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 21), ("SSRC1", 128)]));
+            code.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 21), ("SSRC1", 128)]));
+        };
+        let branch = |code: &mut Vec<u8>, name: &str, to: Option<usize>| -> usize {
+            let at = code.len();
+            let d = to.map_or(0, |t| (t as i64 - at as i64) / 4 - 1);
+            code.extend(i(name, "ENC_SOPP", &[("SIMM16", d as u64 & 0xFFFF)]));
+            at
+        };
+        let patch = |code: &mut Vec<u8>, at: usize| {
+            let d = ((code.len() - at) / 4 - 1) as u16;
+            code[at..at + 2].copy_from_slice(&d.to_le_bytes());
+        };
+        for _ in 0..(8 + rnd(14)) {
+            let k = rnd(1000);
+            work(&mut code, k);
+            match rnd(10) {
+                0..=2 if open.len() < 4 => {
+                    // half of them entered in their middle by a jump from before
+                    let mut entries = vec![];
+                    if rnd(2) == 0 {
+                        test(&mut code, k + 1);
+                        entries.push(branch(&mut code, "S_CBRANCH_SCC1", None));
+                        work(&mut code, k + 2);
+                    }
+                    open.push(Open { head: code.len(), ends: vec![], entries });
+                }
+                8 | 9 if open.last().is_some_and(|o| !o.entries.is_empty()) => {
+                    for at in std::mem::take(&mut open.last_mut().unwrap().entries) {
+                        patch(&mut code, at);
+                        entered += 1;
+                    }
+                    work(&mut code, k + 3);
+                }
+                3 | 4 if !open.is_empty() => {
+                    // conditional `continue` of any loop around
+                    let l = rnd(open.len() as u64) as usize;
+                    test(&mut code, k);
+                    let head = open[l].head;
+                    branch(&mut code, "S_CBRANCH_SCC1", Some(head));
+                }
+                5 if !open.is_empty() => {
+                    // conditional `break` of any loop around
+                    let l = rnd(open.len() as u64) as usize;
+                    test(&mut code, k);
+                    let at = branch(&mut code, "S_CBRANCH_SCC1", None);
+                    open[l].ends.push(at);
+                }
+                6 | 7 if !open.is_empty() => {
+                    // the innermost loop ends, with a back edge of its own or without
+                    let o = open.pop().unwrap();
+                    for at in o.entries {
+                        patch(&mut code, at);
+                        work(&mut code, k + 4);
+                    }
+                    if rnd(3) > 0 {
+                        test(&mut code, k);
+                        branch(&mut code, "S_CBRANCH_SCC1", Some(o.head));
+                    }
+                    for at in o.ends {
+                        patch(&mut code, at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        while let Some(o) = open.pop() {
+            for at in o.entries {
+                patch(&mut code, at);
+                work(&mut code, 4);
+            }
+            test(&mut code, 3);
+            branch(&mut code, "S_CBRANCH_SCC1", Some(o.head));
+            for at in o.ends {
+                patch(&mut code, at);
+            }
+        }
+        work(&mut code, 5);
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
+        let (a, b) = (t(true), t(false));
+        assert!(a.complete() && b.complete(), "{:?}", a.unsupported_why);
+        structured += !a.hlsl.contains("if (pc ==") as usize;
+        if !gpu_waves().contains(&true) {
+            continue;
+        }
+        ran += 1;
+        let mut st = KernelState::default();
+        for k in 0..4 {
+            st.sgpr[k] = rnd(1 << 16) as u32;
+        }
+        st.sgpr[20] = 60;
+        let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let run = |h: &str| runner::run(&super::dxc::compile(h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}")), &st, &mem).unwrap();
+        let (u, w) = (run(&a.hlsl), run(&b.hlsl));
+        assert_eq!((&u.sgpr[..24], u.scc), (&w.sgpr[..24], w.scc), "round {round}\n{}", a.hlsl);
+        assert_eq!(u.vgpr, w.vgpr, "round {round}");
+    }
+    println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
+    assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}

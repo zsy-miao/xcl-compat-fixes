@@ -123,6 +123,7 @@ xcl inspect D:\Game\game.exe               # the game's imports and what XCL has
 xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
