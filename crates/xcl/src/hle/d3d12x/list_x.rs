@@ -1509,6 +1509,7 @@ fn wake_sync_watchdog() {
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
                 crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
+                super::culprit::on_watchdog_release();
             }
         });
     });

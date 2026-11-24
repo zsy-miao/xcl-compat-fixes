@@ -300,7 +300,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            // an indirect dispatch: its groups are in the argument buffer (`max` of them)
+            let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
+            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+            super::culprit::after_dispatch(list, mark)
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -935,7 +938,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     list.Dispatch(x, y, z);
+    super::culprit::after_dispatch(list, mark);
     Ok(())
 }
 
