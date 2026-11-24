@@ -6,8 +6,8 @@ It combines attributed community fixes with our original compatibility work.
 experimental limits. Ongoing commits are published on `work-in-progress`;
 `main` holds the latest validated snapshot.
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/Tb4UbPUzRH)
-**Discord: <https://discord.gg/Tb4UbPUzRH>**
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/VJm64WpZQ5)
+**Discord: <https://discord.gg/xcl>**
 
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
 x64 code runs natively and XCL stands in for the console libraries the PC does not have
@@ -137,6 +137,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- Translated shaders are reused across XCL rebuilds when the translator sources and DXC
+  toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
