@@ -3357,7 +3357,16 @@ fn memory_windows_above_4_gib(heap: bool) {
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + (xcl_w"), heap);
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    if heap {
+        let accessors: Vec<_> = t.hlsl.lines().filter(|line| line.contains(" XCL_MW;")).collect();
+        assert!(!accessors.is_empty(), "heap accesses use the direct descriptor lookup");
+        for accessor in accessors {
+            let bounds = accessor.find("if (xcl_w >= 2u)").expect("reject an invalid window");
+            let lookup = accessor.find(" XCL_MW;").unwrap();
+            assert!(bounds < lookup, "reject before accessing the descriptor heap: {accessor}");
+        }
+    }
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
