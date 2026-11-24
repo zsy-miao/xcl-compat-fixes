@@ -229,7 +229,10 @@ mod tests {
             let request = Request { options: 5 << BCPACK_SHIFT, source: object as u64,
                 offset: 6, source_size: 7, destination: destination.as_mut_ptr() as u64,
                 destination_size: destination.len() as u32, ..Default::default() };
-            assert_eq!(request.check(false), Err(E_DECOMPRESSION));
+            // Native BC5 support admits the request; this deliberately truncated
+            // seven-byte stream must still fail during decoding, not validation.
+            assert_eq!(request.check(false), Ok(()));
+            assert!(crate::hle::bcpack::decode(5, b"PAYLOAD", destination.len()).is_err());
             let binary = capture_to(&directory.0, &mut Captures::default(), &request).unwrap().unwrap();
             assert!(binary.file_name().unwrap().to_string_lossy().starts_with("bcpack5-"));
             assert_eq!(std::fs::read(&binary).unwrap(), b"PAYLOAD");
