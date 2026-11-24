@@ -113,6 +113,19 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
     [0.0, 0.0, 1.0, 1.0]
 }
 
+/// A direct CopyResource must retain plane 0's dimensions. Only choose the larger output
+/// after both the compositor and its pipelines are ready (PR #615 review, upipibi).
+fn prepare_present_output<T>(
+    mut dimensions: impl Iterator<Item = (u32, u32)>,
+    prepare: impl FnOnce() -> Option<T>,
+) -> Option<((u32, u32), Option<T>)> {
+    let first = dimensions.next()?;
+    let Some(second) = dimensions.next() else { return Some((first, None)) };
+    let Some(prepared) = prepare() else { return Some((first, None)) };
+    let largest = std::iter::once(second).chain(dimensions).fold(first, |(w, h), (nw, nh)| (w.max(nw), h.max(nh)));
+    Some((largest, Some(prepared)))
+}
+
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
@@ -727,14 +740,18 @@ impl Compositor {
             } else {
                 rt.BlendEnable = false.into();
             }
-            dev.CreateGraphicsPipelineState(&pd).ok()
+            let result = dev.CreateGraphicsPipelineState(&pd);
+            // The descriptor's ManuallyDrop does not own automatic cleanup. Release our
+            // temporary clone on both success and failure; the compositor keeps its own.
+            ManuallyDrop::drop(&mut pd.pRootSignature);
+            result.ok()
         };
         let pair = (make_pso(false)?, make_pso(true)?);
         self.psos.insert(fmt.0, pair.clone());
         Some(pair)
     }
 
-    unsafe fn record(
+    unsafe fn record_prepared(
         &mut self,
         dev: &ID3D12Device,
         list: &ID3D12GraphicsCommandList,
@@ -743,8 +760,9 @@ impl Compositor {
         dst_h: u32,
         dst_fmt: DXGI_FORMAT,
         planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])],
-    ) -> bool {
-        let Some((opaque_pso, blend_pso)) = self.psos_for(dev, dst_fmt) else { return false };
+        psos: &(ID3D12PipelineState, ID3D12PipelineState),
+    ) {
+        let (opaque_pso, blend_pso) = psos;
         let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
         let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
             Format: dst_fmt,
@@ -780,14 +798,13 @@ impl Compositor {
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         let srv_gpu_base = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
         for (i, (_, _, uv_rect)) in planes.iter().take(MAX_PLANES).enumerate() {
-            list.SetPipelineState(if i == 0 { &opaque_pso } else { &blend_pso });
+            list.SetPipelineState(if i == 0 { opaque_pso } else { blend_pso });
             list.SetGraphicsRoot32BitConstants(0, 4, uv_rect.as_ptr() as *const c_void, 0);
             let mut gpu = srv_gpu_base;
             gpu.ptr += (i as u64) * (self.srv_inc as u64);
             list.SetGraphicsRootDescriptorTable(1, gpu);
             list.DrawInstanced(3, 1, 0, 0);
         }
-        true
     }
 }
 
@@ -951,13 +968,6 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if p.disabled || p.last.elapsed() < min_interval {
         return;
     }
-    let (w, h) = if resolved.len() == 1 {
-        (resolved[0].1.Width as u32, resolved[0].1.Height)
-    } else {
-        let mw = resolved.iter().map(|(_, d, _)| d.Width as u32).max().unwrap_or(0);
-        let mh = resolved.iter().map(|(_, d, _)| d.Height).max().unwrap_or(0);
-        (mw, mh)
-    };
     let Some(fmt) = swap_format(resolved[0].1.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
@@ -973,6 +983,21 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     p.copy_sources.clear();
     p.dumps.clear();
+    let Some(((w, h), composite_psos)) = prepare_present_output(
+        resolved.iter().map(|(_, d, _)| (d.Width as u32, d.Height)),
+        || {
+            if p.compositor.is_none() {
+                p.compositor = Compositor::new(&p.dev);
+            }
+            p.compositor.as_mut()?.psos_for(&p.dev, fmt)
+        },
+    ) else { return };
+    if resolved.len() > 1 && composite_psos.is_none() {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("present: compositor unavailable – falling back to plane 0");
+        }
+    }
     if !ensure_swapchain(p, hwnd, w, h, fmt) {
         return;
     }
@@ -983,45 +1008,31 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     let due = frame_dump_due();
     let mut dumps = Vec::new();
-    let mut composited = false;
-    if resolved.len() > 1 {
-        if p.compositor.is_none() {
-            p.compositor = Compositor::new(&p.dev);
+    if let Some(psos) = composite_psos.as_ref() {
+        // A prepared pair came from this compositor; ensure_swapchain does not replace it.
+        let comp = p.compositor.as_mut().expect("preflight prepared the compositor");
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            let info: Vec<String> = resolved
+                .iter()
+                .enumerate()
+                .map(|(i, (_, d, uv))| format!("plane {i}: {}x{} {:?} uv {uv:?}", d.Width, d.Height, d.Format))
+                .collect();
+            crate::xlog_info!("present: compositing {} planes into {w}x{h} {:?} ({})", resolved.len(), fmt, info.join(", "));
         }
-        if let Some(comp) = p.compositor.as_mut() {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                let info: Vec<String> = resolved
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, d, uv))| format!("plane {i}: {}x{} {:?} uv {uv:?}", d.Width, d.Height, d.Format))
-                    .collect();
-                crate::xlog_info!("present: compositing {} planes into {w}x{h} {:?} ({})", resolved.len(), fmt, info.join(", "));
+        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+        comp.record_prepared(&p.dev, &p.list, &bb, w, h, fmt, &resolved, psos);
+        if due {
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let bb_desc = bb.GetDesc();
+            if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
+                dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
             }
-            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
-            if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved) {
-                if due {
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    let bb_desc = bb.GetDesc();
-                    if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
-                        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
-                    }
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
-                } else {
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
-                }
-                composited = true;
-            } else {
-                p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
-            }
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
         } else {
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                crate::xlog_warn!("present: compositor unavailable – falling back to plane 0");
-            }
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
         }
-    }
-    if !composited {
+    } else {
         let (src, desc, _) = &resolved[0];
         let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
         p.list.ResourceBarrier(&b1);
@@ -1422,6 +1433,29 @@ mod tests {
         assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
     }
+
+    #[test]
+    fn compositor_output_size_requires_both_prepared_pipelines() {
+        let planes = [(1920, 1080), (3840, 2160)];
+        let select = |compositor: Option<()>, opaque: Option<()>, blend: Option<()>| {
+            prepare_present_output(planes.iter().copied(), || {
+                compositor?;
+                Some((opaque?, blend?))
+            })
+        };
+        assert_eq!(select(None, Some(()), Some(())), Some(((1920, 1080), None)), "compositor unavailable");
+        assert_eq!(select(Some(()), None, Some(())), Some(((1920, 1080), None)), "opaque PSO failed");
+        assert_eq!(select(Some(()), Some(()), None), Some(((1920, 1080), None)), "blend PSO failed");
+        assert_eq!(select(Some(()), Some(()), Some(())), Some(((3840, 2160), Some(((), ())))));
+        assert_eq!(
+            prepare_present_output([(1920, 1080)].into_iter(), || -> Option<()> { panic!("single plane must keep the direct path") }),
+            Some(((1920, 1080), None)),
+        );
+        assert_eq!(
+            prepare_present_output(std::iter::empty(), || -> Option<()> { panic!("no plane to prepare") }),
+            None,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1622,7 +1656,8 @@ mod frame_dump_tests {
                 (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
                 (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
             ];
-            assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes));
+            let psos = comp.psos_for(&dev, DXGI_FORMAT_R8G8B8A8_UNORM).expect("compositor pipelines");
+            comp.record_prepared(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, &psos);
             list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             let out_desc = out.GetDesc();
             let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
