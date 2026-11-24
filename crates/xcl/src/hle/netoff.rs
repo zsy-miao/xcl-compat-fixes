@@ -1,6 +1,7 @@
 //! `XCL_NETWORK=0`: the title runs as on a console without a network. Its WinHTTP requests and
 //! its sockets fail as they do there (name not resolved / network unreachable); nothing is
-//! answered in a server's place. Loopback connections stay (titles make socket pairs). Only
+//! answered in a server's place. Loopback connections stay (titles make socket pairs), and so
+//! do lookups of the local names (none, this machine's, localhost). Only
 //! the title's own imports are concerned (the game's exe and DLLs); off by default.
 //!
 //! For titles under bring-up: a crash reporter otherwise uploads a memory dump of the process
@@ -23,6 +24,27 @@ extern "system" {
     #[link_name = "sendto"]
     fn real_sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
     fn WSASetLastError(e: i32);
+    #[link_name = "getaddrinfo"]
+    fn real_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32;
+    #[link_name = "GetAddrInfoW"]
+    fn real_getaddrinfo_w(node: *const u16, service: *const u16, hints: *const c_void, out: *mut *mut c_void) -> i32;
+    #[link_name = "gethostname"]
+    fn real_gethostname(name: *mut u8, len: i32) -> i32;
+}
+
+/// A name that resolves without a network: none (the local addresses), this machine's own
+/// name, localhost – a console without a network still answers these (a retail game asks for
+/// its own name and none at start).
+fn local_name(name: &str) -> bool {
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with("127.") || name == "::1" {
+        return true;
+    }
+    let mut buf = [0u8; 256];
+    let own = unsafe { real_gethostname(buf.as_mut_ptr(), buf.len() as i32) } == 0;
+    own && {
+        let n = buf.iter().position(|&b| b == 0).unwrap_or(0);
+        std::str::from_utf8(&buf[..n]).is_ok_and(|h| h.eq_ignore_ascii_case(name))
+    }
 }
 
 pub fn enabled() -> bool {
@@ -39,7 +61,7 @@ fn table() -> Vec<(&'static str, usize, u16)> {
         ("WSAConnect", wsa_connect as *const () as usize, 0),
         ("WSASendTo", wsa_send_to as *const () as usize, 0),
         ("getaddrinfo", getaddrinfo as *const () as usize, 0),
-        ("GetAddrInfoW", getaddrinfo as *const () as usize, 0),
+        ("GetAddrInfoW", getaddrinfo_w as *const () as usize, 0),
         ("GetAddrInfoExW", getaddrinfo_ex as *const () as usize, 0),
     ]
 }
@@ -115,8 +137,24 @@ unsafe extern "system" fn gethostbyname(_name: *const u8) -> *mut c_void {
     std::ptr::null_mut()
 }
 
-unsafe extern "system" fn getaddrinfo(_node: *const c_void, _service: *const c_void, _hints: *const c_void, out: *mut *mut c_void) -> i32 {
-    note("getaddrinfo");
+unsafe extern "system" fn getaddrinfo(node: *const c_void, _service: *const c_void, _hints: *const c_void, out: *mut *mut c_void) -> i32 {
+    let name = if node.is_null() { String::new() } else { crate::util::from_ansi_ptr(node as *const u8).unwrap_or_default() };
+    if local_name(&name) {
+        return real_getaddrinfo(node as *const u8, _service as *const u8, _hints, out);
+    }
+    note(&format!("getaddrinfo({name})"));
+    if !out.is_null() {
+        *out = std::ptr::null_mut();
+    }
+    WSAHOST_NOT_FOUND
+}
+
+unsafe extern "system" fn getaddrinfo_w(node: *const u16, _service: *const u16, _hints: *const c_void, out: *mut *mut c_void) -> i32 {
+    let name = if node.is_null() { String::new() } else { crate::util::from_wide_ptr(node).unwrap_or_default() };
+    if local_name(&name) {
+        return real_getaddrinfo_w(node, _service, _hints, out);
+    }
+    note(&format!("GetAddrInfoW({name})"));
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
