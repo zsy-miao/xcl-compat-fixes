@@ -1545,6 +1545,7 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 }
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+    let pins = super::sparse::buffer_pins(this as usize);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     // The last reference: kept until the queues are past the work in flight (`late_release`).
     // (Two last-but-one releases at once can miss each other here; the object then goes at
@@ -1576,13 +1577,15 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        if let Some(pins) = pins {
+            super::sparse::forget_buffer(this as usize, pins);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::release_owned_block(p);
             } else {
                 u.free(p);
             }
@@ -3011,7 +3014,7 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::release_owned_block(p);
             } else {
                 u.free(p);
             }
