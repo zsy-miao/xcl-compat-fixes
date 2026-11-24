@@ -141,7 +141,7 @@ pub fn lazy_compute() -> bool {
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
     let p = pending(standin, compute, job, key);
     if used::known(key) {
-        if let Some(q) = preload() {
+        if let Some(q) = preload(compute) {
             q.list.lock().unwrap().push_back(p);
             q.cv.notify_one();
         }
@@ -252,25 +252,35 @@ mod used {
 }
 
 /// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
-/// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
+/// (`XCL_PSO_PRELOAD=0`: off; `graphics`: graphics only). Apart from the ones a bind sends to
+/// (`queue`) and at the lowest priority: a pipeline that is bound is not held up by the ones
+/// made ahead (whoever takes `job` first builds it), and the title's own threads are not either.
 struct Preload {
     list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
     cv: Condvar,
 }
 
-fn preload() -> Option<&'static Preload> {
-    static Q: OnceLock<Option<Preload>> = OnceLock::new();
+#[derive(Clone, Copy)]
+enum PreloadMode {
+    All,
+    Graphics,
+    Off,
+}
+
+fn preload(compute: bool) -> Option<&'static Preload> {
+    static MODE: OnceLock<PreloadMode> = OnceLock::new();
+    let mode = MODE.get_or_init(|| match std::env::var("XCL_PSO_PRELOAD").ok().as_deref().map(str::trim) {
+        Some("0") => PreloadMode::Off,
+        Some("graphics") => PreloadMode::Graphics,
+        _ => PreloadMode::All,
+    });
+    if matches!(mode, PreloadMode::Off) || (compute && matches!(mode, PreloadMode::Graphics)) {
+        return None;
+    }
+    static Q: OnceLock<Preload> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let q = Q
-        .get_or_init(|| {
-            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
-                return None;
-            }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
-        })
-        .as_ref()?;
+        .get_or_init(|| Preload { list: Mutex::new(Default::default()), cv: Condvar::new() });
     STARTED.call_once(|| {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
@@ -314,6 +324,63 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    /// Each policy gets a fresh process: the production queue reads its environment once.
+    /// Jobs return distinct sentinels, as in the other scheduling test. Only completed entries
+    /// are removed, and their returned pointers are never passed to native COM Release.
+    #[test]
+    fn preload_policy_preserves_required_first_use() {
+        const CHILD: &str = "XCL_TEST_PRELOAD_POLICY";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let (graphics, compute) = match expected.as_str() {
+                "all" => (true, true),
+                "graphics" => (true, false),
+                "off" => (false, false),
+                other => panic!("unknown test policy {other}"),
+            };
+            assert_eq!(preload(false).is_some(), graphics);
+            assert_eq!(preload(true).is_some(), compute);
+            for (standin, key, is_compute, ahead) in [(0x7E57_7101, 0x5EED_0101, false, graphics), (0x7E57_7102, 0x5EED_0102, true, compute)] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let count = calls.clone();
+                let real = standin + 0x100;
+                used::earlier_run_used(key);
+                submit_lazy(standin, is_compute, Box::new(move || { count.fetch_add(1, Ordering::SeqCst); real }), key);
+                let p = entry(standin).unwrap();
+                if ahead {
+                    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), std::time::Duration::from_secs(10), |done| !*done).unwrap();
+                    assert!(*done, "a remembered pipeline admitted by the policy builds before binding");
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                } else {
+                    assert!(is_pending(standin));
+                    assert!(p.job.lock().unwrap().is_some(), "the first bind still owns the build");
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                }
+                let first = resolve_for_bind(standin);
+                if is_compute || ahead {
+                    assert_eq!(first, real, "compute binds and completed graphics binds select the real pipeline");
+                } else {
+                    assert!(first == standin || first == real, "a graphics bind may race its worker");
+                }
+                // A graphics bind schedules rather than waits. A compute bind completes here.
+                let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), std::time::Duration::from_secs(10), |done| !*done).unwrap();
+                assert!(*done, "first use completes even when preloading is disabled for this type");
+                drop(done);
+                assert_eq!(resolve_for_bind(standin), real);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "never build the same job twice");
+                assert_eq!(released(standin), real);
+            }
+            return;
+        }
+        for (value, expected) in [(None, "all"), (Some("1"), "all"), (Some(" 0 "), "off"), (Some(" graphics "), "graphics"), (Some("legacy-value"), "all")] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "hle::d3d12x::pso_async::used_tests::preload_policy_preserves_required_first_use", "--nocapture"]);
+            child.env(CHILD, expected);
+            if let Some(value) = value { child.env("XCL_PSO_PRELOAD", value); } else { child.env_remove("XCL_PSO_PRELOAD"); }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "policy {value:?}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+    }
 
     #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
