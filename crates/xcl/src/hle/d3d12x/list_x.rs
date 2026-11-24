@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -690,6 +690,10 @@ pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE)
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
 pub(super) fn on_queue_release(queue: usize) {
+    let mut scratch = COPY_SCRATCH.lock().unwrap();
+    scratch.fences.remove(&queue);
+    scratch.collect_released();
+    drop(scratch);
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
         for s in m.values_mut() {
@@ -737,6 +741,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         return;
     }
     let key = list as usize;
+    // (of a list that was here before and whose release was not seen: the GPU may still use it)
+    release_copy_scratch(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -774,6 +780,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
+    release_copy_scratch(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -1983,13 +1990,195 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     }
     note_write(this as usize, dst, size);
     if d == s {
-        // one window: the buffer is the source and the destination (the ranges do not overlap)
-        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+        // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the
+        // bytes go through a scratch buffer of the list
+        let Some((t, capacity)) = copy_scratch(this, size) else {
+            // none to be had: within the buffer, as D3D12 does not define it (the ranges do not overlap)
+            as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+            return;
+        };
+        // Later copies in this recording may need more than its first allocation. The ranges
+        // are disjoint, so each chunk can reuse the same scratch after writing its destination.
+        for offset in (0..size).step_by(capacity as usize) {
+            let bytes = (size - offset).min(capacity);
+            transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            as_copy_dest(this, t, || copy_buffer_region(this, t, 0, s, soff + offset, bytes));
+            transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            transition(this, t, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            as_copy_dest(this, d, || copy_buffer_region(this, d, doff + offset, t, 0, bytes));
+            transition(this, t, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        }
+        static SCRATCH_COPIES: AtomicU64 = AtomicU64::new(0);
+        let count = SCRATCH_COPIES.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: CopyMemoryToMemoryX same-window scratch copies recorded: {count}");
+        }
         return;
     }
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// Process-wide committed scratch budget, including buffers awaiting GPU completion.
+const MAX_COPY_SCRATCH: u64 = 64 << 20;
+
+struct CopyScratch {
+    buffer: ID3D12Resource,
+    bytes: u64,
+    recorded: bool,
+    untracked_submission: bool,
+    marks: HashMap<usize, (ID3D12Fence, u64)>,
+}
+
+impl CopyScratch {
+    fn idle(&mut self) -> bool {
+        self.marks.retain(|_, (fence, value)| unsafe { fence.GetCompletedValue() < *value });
+        !self.untracked_submission && self.marks.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct CopyScratchCache {
+    active: HashMap<usize, CopyScratch>,
+    released: Vec<CopyScratch>,
+    fences: HashMap<usize, (ID3D12Fence, u64)>,
+    bytes: u64,
+    reaping: bool,
+}
+
+impl CopyScratchCache {
+    fn collect_released(&mut self) {
+        self.released.retain_mut(|scratch| {
+            if !scratch.idle() {
+                return true;
+            }
+            self.bytes -= scratch.bytes;
+            false
+        });
+    }
+
+    fn release(&mut self, list: usize) {
+        if let Some(scratch) = self.active.remove(&list) {
+            self.released.push(scratch);
+        }
+        self.collect_released();
+    }
+
+    unsafe fn acquire(&mut self, list: *mut c_void, bytes: u64) -> Option<(usize, u64)> {
+        self.collect_released();
+        let key = list as usize;
+        if let Some(scratch) = self.active.get_mut(&key) {
+            // Reset can happen while the previous recording is executing on another queue.
+            if !scratch.recorded && !scratch.idle() {
+                return None;
+            }
+            if scratch.recorded || scratch.bytes >= bytes || bytes > MAX_COPY_SCRATCH - self.bytes + scratch.bytes {
+                scratch.recorded = true;
+                return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
+            }
+            // Drop the old allocation before growing so the peak stays within the budget.
+            self.bytes -= self.active.remove(&key).unwrap().bytes;
+        }
+        if bytes > MAX_COPY_SCRATCH - self.bytes {
+            return None;
+        }
+        let buffer = make_copy_scratch(list, bytes)?;
+        let raw = buffer.as_raw() as usize;
+        self.active.insert(key, CopyScratch {
+            buffer, bytes, recorded: true, untracked_submission: false, marks: HashMap::new(),
+        });
+        self.bytes += bytes;
+        Some((raw, bytes))
+    }
+}
+
+static COPY_SCRATCH: LazyLock<Mutex<CopyScratchCache>> = LazyLock::new(|| Mutex::new(CopyScratchCache::default()));
+
+fn release_copy_scratch(list: usize) {
+    let mut cache = COPY_SCRATCH.lock().unwrap();
+    cache.release(list);
+    if cache.reaping || !cache.released.iter().any(|s| !s.untracked_submission) {
+        return;
+    }
+    // A title can stop submitting work after releasing the list. Reclaim its scratch when
+    // the GPU finishes even if no call touches the cache again.
+    cache.reaping = std::thread::Builder::new().name("xcl-copy-scratch".into()).spawn(|| loop {
+        {
+            let mut cache = COPY_SCRATCH.lock().unwrap();
+            cache.collect_released();
+            if !cache.released.iter().any(|s| !s.untracked_submission) {
+                cache.reaping = false;
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }).is_ok();
+}
+
+unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
+    if n > MAX_COPY_SCRATCH || list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return None;
+    }
+    let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
+    COPY_SCRATCH.lock().unwrap().acquire(list, bytes)
+}
+
+fn reset_copy_scratch(list: *mut c_void) {
+    if let Some(scratch) = COPY_SCRATCH.lock().unwrap().active.get_mut(&(list as usize)) {
+        scratch.recorded = false;
+    }
+}
+
+/// Mark GPU ownership on the queue that actually submitted each PC list or split segment.
+pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_void]) {
+    let mut cache = COPY_SCRATCH.lock().unwrap();
+    cache.collect_released();
+    if !lists.iter().any(|l| cache.active.get(&(*l as usize)).is_some_and(|s| s.recorded)) {
+        return;
+    }
+    let mark = (|| {
+        let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+        let key = queue as usize;
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.fences.entry(key) {
+            let mut dev: Option<ID3D12Device> = None;
+            q.GetDevice(&mut dev).ok()?;
+            entry.insert((dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?, 0));
+        }
+        let (fence, value) = cache.fences.get_mut(&key)?;
+        let next = *value + 1;
+        q.Signal(&*fence, next).ok()?;
+        *value = next;
+        Some((fence.clone(), next))
+    })();
+    for list in lists {
+        if let Some(scratch) = cache.active.get_mut(&(*list as usize)).filter(|s| s.recorded) {
+            if let Some((fence, value)) = &mark {
+                scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), *value));
+            } else {
+                // Without a completion mark the GPU could still access this buffer.
+                scratch.untracked_submission = true;
+            }
+        }
+    }
+}
+
+unsafe fn make_copy_scratch(list: *mut c_void, bytes: u64) -> Option<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut b: Option<ID3D12Resource> = None;
+    device_of(list)?
+        .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b)
+        .ok()?;
+    b
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
@@ -2316,6 +2505,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         });
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
+            reset_copy_scratch(spare);
             next_pc = Some(spare);
         }
     }
@@ -2613,6 +2803,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
+    reset_copy_scratch(list);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -2784,6 +2975,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
@@ -2802,6 +2994,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -2859,6 +3052,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -3431,6 +3625,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
 
+    reset_copy_scratch(this);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -3924,6 +4119,90 @@ mod tests {
         assert_eq!(cell.recorded_max, 10);
         assert_eq!(cell.recorded_list_type, Some(D3D12_COMMAND_LIST_TYPE_COMPUTE));
         assert_eq!(cell.recorded_last_queue, Some(2));
+    }
+
+
+    #[test]
+    fn copy_scratch_budget_counts_resources_until_gpu_completion() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let first: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            first.Close().unwrap();
+            let second: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut cache = CopyScratchCache::default();
+            let small = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            let first_raw = first.as_raw();
+            let second_raw = second.as_raw();
+
+            let initial = cache.acquire(first_raw, small).unwrap();
+            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH), Some(initial));
+            let scratch = cache.active.get_mut(&(first_raw as usize)).unwrap();
+            scratch.recorded = false;
+            scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
+            assert!(cache.acquire(first_raw, MAX_COPY_SCRATCH).is_none());
+            fence.Signal(1).unwrap();
+            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH).unwrap().1, MAX_COPY_SCRATCH);
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH);
+            assert!(cache.acquire(second_raw, small).is_none());
+
+            let scratch = cache.active.get_mut(&(first_raw as usize)).unwrap();
+            scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 2));
+            cache.release(first_raw as usize);
+            assert!(!cache.active.contains_key(&(first_raw as usize)));
+            assert!(cache.acquire(second_raw, small).is_none());
+            fence.Signal(2).unwrap();
+            assert!(cache.acquire(second_raw, small).is_some());
+            assert_eq!(cache.bytes, small);
+            cache.release(second_raw as usize);
+            assert_eq!(cache.bytes, 0);
+        }
+    }
+
+    /// A new list at the address of one whose release was not seen does not go on with that one's
+    /// scratch buffer, which the GPU may still use.
+    #[test]
+    fn a_new_list_takes_no_copy_scratch_of_an_earlier_one() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (raw, key) = (list.as_raw(), list.as_raw() as usize);
+            let small = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            {
+                let mut cache = COPY_SCRATCH.lock().unwrap();
+                cache.acquire(raw, small).unwrap();
+                let scratch = cache.active.get_mut(&key).unwrap();
+                scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
+            }
+            on_create(raw, alloc.as_raw() as usize, 0, ty);
+            {
+                let cache = COPY_SCRATCH.lock().unwrap();
+                assert!(!cache.active.contains_key(&key), "the new list starts without one");
+                assert!(!cache.released.is_empty(), "the GPU may still use it: it stays until the fence");
+            }
+            fence.Signal(1).unwrap();
+            on_release(key);
+            super::super::alloc_pool::forget(alloc.as_raw() as usize);
+        }
     }
 
 
