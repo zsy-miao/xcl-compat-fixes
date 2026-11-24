@@ -1484,6 +1484,8 @@ struct OsVersionInfoW {
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
     fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    fn NtQueryTimerResolution(coarsest: *mut u32, finest: *mut u32, current: *mut u32) -> i32;
+    fn NtSetTimerResolution(desired: u32, set: u8, current: *mut u32) -> i32;
 }
 
 pub fn host_os_version() -> (u32, u32, u32) {
@@ -1493,6 +1495,38 @@ pub fn host_os_version() -> (u32, u32, u32) {
         RtlGetVersion(&mut v);
         (v.major, v.minor, v.build)
     }
+}
+
+/// The finest timer Windows offers (0.5 ms) for the title: with the default 15.6 ms tick every
+/// sleep rounds up (a retail game's audio mixer ran at a third of real time). Windows 11 keeps
+/// it while the window is hidden only when told to.
+pub fn fine_timer() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    let kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state as *const _ as *const c_void, size) } != 0;
+    // in 100 ns units; "finest" is the smallest period the system supports
+    let (mut coarsest, mut finest, mut was) = (0u32, 0u32, 0u32);
+    if unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut was) } < 0 || finest == 0 {
+        crate::xlog_warn!("timer: NtQueryTimerResolution failed – Windows' default resolution");
+        return;
+    }
+    let mut now = 0u32;
+    let status = unsafe { NtSetTimerResolution(finest, 1, &mut now) };
+    crate::xlog_info!(
+        "timer: {} (was {:.2} ms, now {:.2} ms; kept while the window is hidden: {})",
+        if status >= 0 { "finest resolution for the title" } else { "raising the resolution failed" },
+        was as f64 / 10_000.0,
+        now as f64 / 10_000.0,
+        if kept { "yes" } else { "no" }
+    );
 }
 
 pub unsafe extern "system" fn GetSystemOSVersion(out: *mut SystemOsVersionInfo) {
@@ -1835,6 +1869,18 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fine_timer_makes_short_sleeps_short() {
+        // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
+        fine_timer();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        }
+        let per = t.elapsed() / 20;
+        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+    }
 
     #[test]
     fn commitment_probe_preserves_resident_cold_reserved_and_guarded_states() {
