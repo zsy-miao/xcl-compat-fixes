@@ -1027,6 +1027,14 @@ unsafe fn home_again(home: usize) -> Option<usize> {
 }
 
 fn committed_page(a: usize) -> bool {
+    // Upstream 2c5fe3f (Kalmarv): a resident page is committed. Query one working-set
+    // entry first, instead of repeatedly walking a large homogeneous VirtualQuery region.
+    let mut ws = windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION { VirtualAddress: a as *mut c_void, ..Default::default() };
+    if unsafe { windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(thr::GetCurrentProcess(), &mut ws as *mut _ as *mut c_void, std::mem::size_of_val(&ws) as u32) } != 0
+        && unsafe { ws.VirtualAttributes.Flags } & 1 != 0
+    {
+        return true;
+    }
     let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
 }
@@ -1827,6 +1835,49 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commitment_probe_preserves_resident_cold_reserved_and_guarded_states() {
+        unsafe {
+            struct Reservation(*mut c_void);
+            impl Drop for Reservation {
+                fn drop(&mut self) { unsafe { mem::VirtualFree(self.0, 0, mem::MEM_RELEASE); } }
+            }
+            let allocation = Reservation(mem::VirtualAlloc(std::ptr::null(), 6 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE));
+            assert!(!allocation.0.is_null());
+            let r = allocation.0 as usize;
+            let commit = |at: usize, protection| {
+                assert_eq!(mem::VirtualAlloc(at as *const c_void, 4096, mem::MEM_COMMIT, protection) as usize, at);
+            };
+            let working_set = |at: usize| {
+                let mut ws = windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION { VirtualAddress: at as *mut c_void, ..Default::default() };
+                assert_ne!(windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(thr::GetCurrentProcess(), &mut ws as *mut _ as *mut c_void, std::mem::size_of_val(&ws) as u32), 0);
+                ws.VirtualAttributes.Flags & 1 != 0
+            };
+            commit(r, mem::PAGE_READWRITE);
+            (r as *mut u32).write_volatile(0x12345678);
+            assert!(working_set(r), "the touched page exercises the resident fast-positive");
+            assert!(committed_page(r));
+            assert_eq!((r as *const u32).read_volatile(), 0x12345678);
+            let cold = r + PHYS_PAGE;
+            commit(cold, mem::PAGE_READWRITE);
+            assert!(!working_set(cold), "untouched commitment exercises the VirtualQuery fallback");
+            assert!(committed_page(cold));
+            let reserved = r + 2 * PHYS_PAGE;
+            assert!(!committed_page(reserved));
+            for (index, protection) in [(3, mem::PAGE_READWRITE | mem::PAGE_GUARD), (4, mem::PAGE_NOACCESS), (5, mem::PAGE_READONLY)] {
+                let at = r + index * PHYS_PAGE;
+                commit(at, protection);
+                assert!(committed_page(at), "commitment does not imply readable/writable memory");
+                let mut region: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(mem::VirtualQuery(at as *const c_void, &mut region, std::mem::size_of_val(&region)), 0);
+                assert_eq!(region.State, mem::MEM_COMMIT);
+                assert_eq!(region.Protect, protection, "metadata probe preserves protections and guard state");
+            }
+            drop(allocation);
+            assert!(!committed_page(r), "a released page is not a positive working-set entry");
+        }
+    }
 
     #[test]
     fn physical_pages_reject_an_unreserved_plain_destination() {
