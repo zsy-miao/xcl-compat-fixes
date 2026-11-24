@@ -100,6 +100,27 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
+/// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
+/// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
+/// `from` retains its previously allocated blocks until `allocator` resets).
+pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    });
+    let (old, blocks) = with(to, |s| {
+        let old = std::mem::replace(&mut s.allocator, allocator);
+        s.arena = Default::default();
+        s.layout = layout;
+        s.args = args;
+        s.layout_gfx = layout_gfx;
+        s.args_gfx = args_gfx;
+        s.rs_gfx = rs_gfx;
+        s.pso = pso;
+        (old, std::mem::take(&mut s.uma))
+    });
+    console_list::hold_until_reset(old, blocks);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -856,6 +877,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);

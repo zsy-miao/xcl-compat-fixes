@@ -181,9 +181,11 @@ pub struct GsInterface {
 /// triangles per thread group (their 3 vertices each fit the 64 ES lanes)
 pub const GS_PRIMS_PER_GROUP: u32 = 21;
 /// io slots (trap-temp SGPR range, unused by titles): primitive count, address of the
-/// pre-fetched vertex attributes in `mem`
+/// pre-fetched vertex attributes in `mem`, and the high 32 bits of UMA window 0's base
+/// (`Uma::base() >> 32`, used when `mem_windows > 1` to range-check memory window selection).
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
+pub const IO_UMA_BASE_HI: usize = 112;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

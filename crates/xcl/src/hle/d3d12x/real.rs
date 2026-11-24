@@ -2782,6 +2782,34 @@ creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
 creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
+
+/// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
+/// (used for deferred mid-list split segments on the same allocator).
+pub(super) unsafe fn create_raw_pc_command_list(
+    dev: *mut c_void,
+    ty: D3D12_COMMAND_LIST_TYPE,
+    alloc: usize,
+    init_pso: usize,
+) -> Option<*mut c_void> {
+    if dev.is_null() || alloc == 0 {
+        return None;
+    }
+    let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList")?.iid);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let hr = if is_ext(vt(dev) as usize) {
+        dev_create_command_list(dev, 0, ty.0 as usize, alloc, init_pso, &iid, &mut out)
+    } else {
+        type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+        let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
+        let f: F = std::mem::transmute(*vt(dev).add(slot));
+        let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
+        if hr >= 0 && !out.is_null() {
+            adopt(out, Kind::CommandList);
+        }
+        hr
+    };
+    (hr >= 0 && !out.is_null()).then_some(out)
+}
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
@@ -5347,10 +5375,19 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     match older {
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
+            if older == 14 {
+                super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
+            }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
             let hr = f(this, a1, a2);
-            if older == 14 && hr >= 0 {
-                super::fence_x::note_queue_signal(a1, a2 as u64);
+            if hr >= 0 {
+                if older == 14 {
+                    super::fence_x::note_queue_signal(a1, a2 as u64);
+                    super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
+                } else {
+                    super::fence_x::note_queue_wait(a1, a2 as u64);
+                    super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                }
             }
             hr as u32 as usize
         }
@@ -5434,10 +5471,12 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
     const PC_SIGNAL: usize = 14;
+    super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
     let hr = f(this, fence, value);
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
+        super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
     hr
 }
@@ -5460,14 +5499,20 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
-        .iter()
-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
-        .collect();
+    // console-shaped lists run as the PC lists they were translated into (split title lists expand
+    // into all of their recorded PC segments in exact chronological order)
+    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    for &l in std::slice::from_raw_parts(lists, n as usize) {
+        if let Some(pc) = super::console_list::pc_list(l) {
+            mapped.push(pc);
+        } else if !super::title_list::push_segments(l, &mut mapped) {
+            mapped.push(l);
+        }
+    }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| {
+    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });

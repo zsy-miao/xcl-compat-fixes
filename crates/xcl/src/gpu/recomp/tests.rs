@@ -3389,6 +3389,127 @@ fn memory_windows_above_4_gib(heap: bool) {
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
 }
 
+/// Out-of-UMA addresses must NEVER alias onto live UMA windows via `& 3`:
+/// - high dwords outside `[base_hi, base_hi + mem_windows)` (such as `base_hi + 4` / `+ 5` /
+///   `base_hi - 1` / `0xFFFFFFFF` that share low bits with live windows) drop stores & atomics
+///   (including CAS-loop atomics like `global_atomic_inc`) and read 0;
+/// - `hi == 0` reads still reach window 0 (32-bit console descriptor tables), while `hi == 0`
+///   writes are dropped so null pointers cannot clobber window 0;
+/// - V# stride bits `d1[29:16]` are masked off before window selection, and 64-bit carry/borrow
+///   on `global_load`/`global_store` updates the target window accurately.
+#[test]
+fn gpu_memory_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(false);
+}
+
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(true);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap_windows: bool) {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let base_hi = (w0 >> 32) as u32;
+    assert!(base_hi >= 4);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+
+    // Canaries in window 0 and window 1 that out-of-UMA stores/atomics must NOT touch
+    const CANARY0: u32 = 0xCAFE_BABE;
+    const CANARY1: u32 = 0x1337_BEEF;
+    *word(w0 + 0x1000) = CANARY0;
+    *word(w1 + 0x1000) = CANARY1;
+    *word(w0 + 0x2000) = CANARY0;
+    *word(w1 + 0x2000) = CANARY1;
+    *word(w0 + 0x3000) = CANARY0;
+    *word(w1 + 0x3000) = CANARY1;
+    *word(w0 + 0x4000) = 0xABCD_0123; // 32-bit hi=0 descriptor-table style read target
+    *word(w1 + 0x5000) = 0x5566_7788; // valid strided V# buffer_load target
+    *word(w1 + 0x0010) = 0x99AA_BBCC; // 64-bit carry target: (w0 + 0xFFFF_FFF0) + 0x20 == w1 + 0x10
+
+    let glbl = |n: &'static str, f: &[(&str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        (n, "ENC_FLAT_GLBL", f.iter().map(|&(a, b)| (unsafe { std::mem::transmute::<&str, &'static str>(a) }, b)).collect(), None)
+    };
+    let list = vec![
+        // 1. Out-of-UMA s_load from hi = base_hi + 4 (would alias w0 under `& 3`) -> must read 0
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 30), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3]
+        // 2. 32-bit hi == 0 s_load at offset 0x4000 -> MUST read w0 + 0x4000
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 31), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5]
+        // 3. Out-of-UMA buffer_store with V# hi = base_hi + 5 and stride = 4 -> must NOT touch w1 + 0x1000
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None), // s[8:11]
+        // 4. Out-of-UMA buffer_load with V# hi = base_hi + 5 and stride = 4 -> must read 0 (v2)
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 2), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // 5. Valid strided V# buffer_load from w1 + 0x5000 (d1 has non-zero stride 4 in bits 29:16) -> must read 0x5566_7788 (v3)
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 3), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None), // s[12:15]
+        // 6. Out-of-UMA global_store with hi = base_hi + 4 (would alias w0 + 0x1000) -> dropped
+        glbl("GLOBAL_STORE_DWORD", &[("ADDR", 4), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        // 7. Out-of-UMA global_store with hi = 0 (null/32-bit pointer at 0x2000) -> dropped, must NOT touch w0 + 0x2000
+        glbl("GLOBAL_STORE_DWORD", &[("ADDR", 6), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0)]),
+        // 8. Out-of-UMA global_atomic_add (hi = base_hi + 5) & global_atomic_inc CAS loop (hi = 0xFFFF_FFFF) -> dropped & terminates cleanly
+        glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 10), ("ADDR", 8), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)]),
+        glbl("GLOBAL_ATOMIC_INC", &[("VDST", 11), ("ADDR", 12), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)]),
+        // 9. Out-of-UMA buffer_atomic_add with V# hi = base_hi + 4 (would alias w0 + 0x3000) -> dropped
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", vec![("VDATA", 14), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1), ("GLC", 1)], None), // s[16:19]
+        // 10. 64-bit carry on global_load: s[20:21] = (w0 + 0xFFFF_FFF0) + v16 (0x20) -> w1 + 0x10 -> must read 0x99AA_BBCC (v17)
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 17), ("ADDR", 16), ("SADDR", 20), ("OFFSET", 0)]),
+        // 11. 64-bit signed borrow out of UMA: s[22:23] = w0 + 0x0 + (-16) -> (base_hi - 1, 0xFFFF_FFF0) -> dropped, reads 0 (v18)
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 18), ("ADDR", 0), ("SADDR", 22), ("OFFSET", 0xFF0)]),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let p = prog(&refs);
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows, ..Default::default() })).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]); // s[2:3]: out-of-UMA hi = base_hi + 4
+    st.sgpr[4..6].copy_from_slice(&[0x4000, 0]); // s[4:5]: hi == 0 32-bit descriptor read
+    st.sgpr[8..12].copy_from_slice(&[0x1000, ((base_hi + 5) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA V# (aliases w1 under & 3)
+    st.sgpr[12..16].copy_from_slice(&[0x5000, ((base_hi + 1) & 0xFFFF) | (4 << 16), 64, 0]); // valid strided V# in w1
+    st.sgpr[16..20].copy_from_slice(&[0x3000, ((base_hi + 4) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA atomic V# (aliases w0 under & 3)
+    st.sgpr[20..22].copy_from_slice(&[0xFFFF_FFF0, base_hi]); // carry base
+    st.sgpr[22..24].copy_from_slice(&[0, base_hi]); // borrow base (0 - 16 borrows into base_hi - 1)
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0; // index 0
+        r[1] = 0xBAD0_DEAD; // poison value to store
+        r[2] = 0x7777_7777; // sentinel overwritten to 0 by out-of-UMA buffer_load
+        r[10] = 0x7777_7777;
+        r[11] = 0x7777_7777;
+        r[14] = 0xBAD0_DEAD;
+        r[4] = 0x1000;
+        r[5] = base_hi + 4; // out-of-UMA global_store (aliases w0 under & 3)
+        r[6] = 0x2000;
+        r[7] = 0; // hi == 0 global_store (null pointer -> must be dropped)
+        r[8] = 0x2000;
+        r[9] = base_hi + 5; // out-of-UMA global_atomic_add (aliases w1 under & 3)
+        r[12] = 0x3000;
+        r[13] = 0xFFFF_FFFF; // out-of-UMA global_atomic_inc CAS loop
+        r[16] = 0x20; // carry offset: 0xFFFF_FFF0 + 0x20 = 0x1_0000_0010 -> w1 + 0x10
+        r[18] = 0x7777_7777;
+    }
+
+    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    assert_eq!(r.sgpr[30], 0, "out-of-UMA s_load must return 0");
+    assert_eq!(r.sgpr[31], 0xABCD_0123, "hi == 0 s_load must still read window 0 (32-bit descriptor tables)");
+    assert_eq!(r.vgpr[0][2], 0, "out-of-UMA buffer_load must return 0");
+    assert_eq!(r.vgpr[0][3], 0x5566_7788, "valid strided V# buffer_load must mask stride out of d1");
+    assert_eq!(r.vgpr[0][10], 0, "out-of-UMA global_atomic_add GLC must return 0");
+    assert_eq!(r.vgpr[0][11], 0, "out-of-UMA global_atomic_inc CAS loop must return 0 and terminate");
+    assert_eq!(r.vgpr[0][14], 0, "out-of-UMA buffer_atomic_add GLC must return 0");
+    assert_eq!(r.vgpr[0][17], 0x99AA_BBCC, "64-bit carry global_load must cross from w0 into w1");
+    assert_eq!(r.vgpr[0][18], 0, "64-bit signed borrow below window 0 must be rejected and read 0");
+
+    assert_eq!(*word(w0 + 0x1000), CANARY0, "out-of-UMA global_store must not clobber w0");
+    assert_eq!(*word(w1 + 0x1000), CANARY1, "out-of-UMA buffer_store must not clobber w1");
+    assert_eq!(*word(w0 + 0x2000), CANARY0, "hi == 0 global_store must not clobber w0");
+    assert_eq!(*word(w1 + 0x2000), CANARY1, "out-of-UMA global_atomic_add must not clobber w1");
+    assert_eq!(*word(w0 + 0x3000), CANARY0, "out-of-UMA buffer_atomic_add must not clobber w0");
+    assert_eq!(*word(w1 + 0x3000), CANARY1, "out-of-UMA global_atomic_inc must not clobber w1");
+}
+
 /// The start-up check of the coherent UMA windows (`real::check_uma_import`): the GPU sees what
 /// the CPU writes there. Fails, as it should, where the import fell back to memory of its own
 /// (vkd3d-proton under a Wine without `userfaultfd` write watches, #175).
@@ -3496,6 +3617,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
         // User SGPRs: s[0:1] = 64-bit arg_table (Window 3), s4 = 32-bit descriptor table offset in Window 0
         let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
+        io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
         io[0] = arg_table as u32;
         io[1] = (arg_table >> 32) as u32;
         io[4] = (heap_va - u.base()) as u32;
@@ -6053,9 +6175,8 @@ fn gpu_split_wave64_waves_diverge() {
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
         let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && std::env::var_os("XCL_WAVE64_SPIN").is_none() {
-            let spin = if threads > 64 { "#define XCL_X_SPIN 1" } else { "#define XCL_X_SPIN 0" };
-            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains(spin), "{dims:?}");
+        if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
+            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
         let base = 0x100usize;
@@ -7358,6 +7479,96 @@ fn fspx_compute_user_sgprs_from_rsrc2() {
         super::pso::compute_user_sgprs(&blob)
     });
     assert_eq!(counts, [Some(4), Some(8)]);
+}
+
+/// Verifies early-exit-safe, bounded `xcl_s_barrier()` on real multi-warp compute shaders:
+/// 1. All 4 hardware wave32s in `numthreads(128, 1, 1)` exchange LDS values across two back-to-back
+///    `s_barrier` generations (both split-wave64 and native wave32).
+/// 2. Upper console wave (`tid >= 64`) takes an early `s_endpgm` while the lower console wave
+///    (`tid 0..63`, 2 hardware wave32s) executes two `s_barrier`s and exchanges LDS across its
+///    surviving warps — legal on RDNA2, would permanently deadlock `bar.sync 0` on NVIDIA.
+#[test]
+fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+
+    // Shader 1: 4 hardware wave32s, 2 consecutive s_barrier generations exchanging across waves
+    // using disjoint LDS banks (bank 0: 0..512, bank 1: 512..1024) so there is no WAR data race.
+    let p_all = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),           // v1 = tid * 4 (bank 0)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 1)], Some(512)),       // v9 = 512 + tid * 4 (bank 1)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 192), ("VSRC1", 0)], None),               // v2 = tid ^ 64
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)], None),           // v2 = (tid ^ 64) * 4 (bank 0)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 160), ("VSRC1", 0)], None),               // v3 = tid ^ 32
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),           // v3 = (tid ^ 32) * 4
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 3)], Some(512)),       // v3 = 512 + (tid ^ 32) * 4 (bank 1)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0)], Some(0x100)),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 4)], None),            // +1
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 9), ("DATA0", 4)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 1)], None),              // s0 + tid*4
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+    let base = 0x100usize;
+    let mut io = vec![0u32; 128];
+    io[0] = base as u32;
+    for wave64 in [true, false] {
+        let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+        if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+            assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
+        for tid in 0..128usize {
+            let want = ((tid ^ 96) + 0x101) as u32;
+            assert_eq!(out[(base + tid * 4) / 4], want, "wave64={wave64} tid={tid}: 2-gen xcl_s_barrier LDS exchange");
+        }
+    }
+
+    // Shader 2: upper console wave (tid >= 64) exits early via `s_endpgm` before 2 `s_barrier`s;
+    // lower console wave (tid 0..63, 2 hardware wave32s) synchronizes and exchanges LDS across halves.
+    let p_early = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),                    // s10 = first tid in wave
+        ("S_CMP_GE_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 192)], None),                       // scc = (s10 >= 64)
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),                                     // skip s_endpgm if < 64
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),           // v1 = tid * 4 (bank 0)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 1)], Some(512)),       // v9 = 512 + tid * 4 (bank 1)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 160), ("VSRC1", 0)], None),               // v3 = tid ^ 32
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),           // v3 = (tid ^ 32) * 4 (bank 0)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 3)], Some(512)),       // v2 = 512 + (tid ^ 32) * 4 (bank 1)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0)], Some(0x200)),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 135), ("VSRC1", 4)], None),            // +7
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 9), ("DATA0", 4)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    let t = translate(&p_early, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let out = runner::dispatch(&dxil, [2, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
+    for tid in 0..64usize {
+        assert_eq!(out[(base + tid * 4) / 4], (tid + 0x207) as u32, "tid={tid}: surviving warps must pass 2 s_barriers after upper wave early s_endpgm");
+    }
+    for tid in 64..128usize {
+        assert_eq!(out[(base + tid * 4) / 4], 0, "tid={tid}: exited wave must not store");
+    }
 }
 
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –

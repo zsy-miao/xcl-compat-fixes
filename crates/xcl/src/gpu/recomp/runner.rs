@@ -1245,6 +1245,9 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
+    if let Some(&(base, _)) = arena.windows.first() {
+        io[super::IO_UMA_BASE_HI] = ((base as usize) >> 32) as u32;
+    }
     for lane in 0..KERNEL_LANES {
         let mut regs = state.vgpr.get(lane).cloned().unwrap_or_default();
         regs.resize(KERNEL_VGPRS, 0);

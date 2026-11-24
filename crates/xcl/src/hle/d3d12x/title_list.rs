@@ -14,8 +14,9 @@
 //! hands out the console object again, Release frees it with the PC list, and
 //! ExecuteCommandLists runs the PC lists (`backing`).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::core::GUID;
 
@@ -23,9 +24,11 @@ use crate::util::HRESULT;
 
 const LIST_SLOTS: usize = 600;
 /// the object: console fields up to `ROOM`, no-room "buffer" at `ROOM` (with slack after it
-/// for code that would write before checking), the PC list at `F_BACKING`
+/// for code that would write before checking), primary PC list at `F_PRIMARY` (identity /
+/// refcount), currently active recording PC list at `F_BACKING` (swapped on mid-list sync split).
 const OBJECT_BYTES: usize = 0x3000;
 const ROOM: usize = 0x1000;
+const F_PRIMARY: usize = 0x2FF0;
 const F_BACKING: usize = 0x2FF8;
 const F_WRITE: usize = 0x18;
 const F_DISPATCH_END: usize = 0x28;
@@ -34,11 +37,26 @@ const F_END: usize = 0x30;
 const F_RING: usize = 0x2000;
 const F_RING_AT: usize = 0x2100;
 const RING: usize = 64;
+/// Maximum number of mid-list split segments per command list recording.
+const MAX_EXTRA_SEGMENTS: usize = 32;
+
+#[derive(Default)]
+struct SegmentBook {
+    /// Additional PC command lists recorded after `primary` in this recording (in order).
+    extra_active: Vec<usize>,
+    /// Closed extra PC command lists from earlier recordings, kept for reuse on future splits.
+    spares: Vec<usize>,
+}
+
+/// Wrapper address -> split segment book (populated lazily only for lists that split).
+static SEGMENTS: Mutex<Option<HashMap<usize, SegmentBook>>> = Mutex::new(None);
+/// Active recording PC command list address -> `title_list` wrapper address.
+static WRAPPER_OF: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 struct Vtable(usize);
 
-/// The console list vtable: QueryInterface / Release of their own, every other slot a thunk
-/// to the PC list's entry.
+/// The console list vtable: QueryInterface / AddRef / Release / Close / Reset of their own,
+/// every other slot a thunk to the currently active PC list's entry (`F_BACKING`).
 fn vtable() -> usize {
     static V: OnceLock<Vtable> = OnceLock::new();
     V.get_or_init(|| {
@@ -48,8 +66,10 @@ fn vtable() -> usize {
             *e = if trace { forward_traced(slot) } else { forward(slot) };
         }
         v[0] = qi as usize;
+        v[1] = add_ref as usize;
         v[2] = release as usize;
         v[9] = close as usize;
+        v[10] = reset as usize;
         Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
     })
     .0
@@ -103,7 +123,8 @@ unsafe extern "system" fn record(this: *mut c_void, slot: u32) {
     *at += 1;
 }
 
-/// #9 Close: a failure is logged with the last methods called (`XCL_LIST_TRACE`)
+/// #9 Close: closes the active recording segment (`F_BACKING`); a failure is logged with
+/// the last methods called (`XCL_LIST_TRACE`). Prior split segments were closed on split.
 unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
@@ -116,6 +137,50 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     }
     // a new recording starts at Reset
     *((this as usize + F_RING_AT) as *mut usize) = 0;
+    hr
+}
+
+/// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_x`
+/// (calling directly rather than through the dual-dispatch vtable thunk so console state always
+/// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
+/// any extra split segments into the per-list spare pool.
+unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
+    let primary = *((this as usize + F_PRIMARY) as *const *mut c_void);
+    let hr = if super::real::is_adopted(primary) {
+        super::list_x::reset_x(primary, alloc, pso)
+    } else {
+        let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT = std::mem::transmute(pc_slot(primary, 10));
+        f(primary, alloc, pso)
+    };
+    if hr >= 0 {
+        *((this as usize + F_BACKING) as *mut usize) = primary as usize;
+        let moved = {
+            let mut sg = SEGMENTS.lock().unwrap();
+            sg.as_mut()
+                .and_then(|m| m.get_mut(&(this as usize)))
+                .map(|b| {
+                    let old = std::mem::take(&mut b.extra_active);
+                    b.spares.extend(old.iter().copied());
+                    old
+                })
+                .unwrap_or_default()
+        };
+        if !moved.is_empty() {
+            let mut wg = WRAPPER_OF.lock().unwrap();
+            if let Some(m) = wg.as_mut() {
+                for &seg in &moved {
+                    m.remove(&seg);
+                }
+                m.insert(primary as usize, this as usize);
+            }
+            drop(wg);
+            for seg in moved {
+                super::bind::reset(seg as *mut c_void, 0, 0);
+                super::list_x::clear_segment_state(seg);
+            }
+        }
+        *((this as usize + F_RING_AT) as *mut usize) = 0;
+    }
     hr
 }
 
@@ -134,23 +199,116 @@ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
     for f in [F_WRITE, F_DISPATCH_END, F_END] {
         *(o.add(f) as *mut usize) = room;
     }
+    *(o.add(F_PRIMARY) as *mut usize) = pc as usize;
     *(o.add(F_BACKING) as *mut usize) = pc as usize;
+    WRAPPER_OF.lock().unwrap().get_or_insert_with(HashMap::new).insert(pc as usize, o as usize);
     o as *mut c_void
 }
 
-/// The PC list behind a console list object (None: not one).
+/// The primary PC list behind a console list object (None: not one).
 pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
     if list.is_null() || !crate::gpu::shader::readable(list as usize, 8) {
         return None;
     }
-    unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_BACKING) as *const *mut c_void)) }
+    unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_PRIMARY) as *const *mut c_void)) }
+}
+
+/// Expand a console list object into all of its recorded PC command list segments (in exact
+/// recording order). Returns `false` if `list` is not a `title_list` wrapper.
+pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
+    let Some(primary) = backing(list) else {
+        return false;
+    };
+    out.push(primary);
+    let sg = SEGMENTS.lock().unwrap();
+    if let Some(book) = sg.as_ref().and_then(|m| m.get(&(list as usize))) {
+        for &seg in &book.extra_active {
+            out.push(seg as *mut c_void);
+        }
+    }
+    true
+}
+
+/// Look up the `title_list` wrapper currently recording into `pc`.
+pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
+    if pc.is_null() {
+        return None;
+    }
+    WRAPPER_OF.lock().unwrap().as_ref()?.get(&(pc as usize)).map(|&w| w as *mut c_void)
+}
+
+/// Whether `wrapper` may allocate/activate another split segment for this recording.
+pub(super) fn can_split(wrapper: *mut c_void) -> bool {
+    let sg = SEGMENTS.lock().unwrap();
+    sg.as_ref()
+        .and_then(|m| m.get(&(wrapper as usize)))
+        .is_none_or(|b| b.extra_active.len() < MAX_EXTRA_SEGMENTS)
+}
+
+/// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse.
+pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
+    let mut sg = SEGMENTS.lock().unwrap();
+    sg.as_mut()?.get_mut(&(wrapper as usize))?.spares.pop().map(|p| p as *mut c_void)
+}
+
+/// Switch `wrapper` from closed segment `old_pc` to newly opened segment `new_pc`.
+pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void, new_pc: *mut c_void) {
+    *((wrapper as usize + F_BACKING) as *mut usize) = new_pc as usize;
+    {
+        let mut sg = SEGMENTS.lock().unwrap();
+        sg.get_or_insert_with(HashMap::new)
+            .entry(wrapper as usize)
+            .or_default()
+            .extra_active
+            .push(new_pc as usize);
+    }
+    let mut wg = WRAPPER_OF.lock().unwrap();
+    let m = wg.get_or_insert_with(HashMap::new);
+    m.remove(&(old_pc as usize));
+    m.insert(new_pc as usize, wrapper as usize);
+}
+
+/// For `KickoffX` on an already-split list: returns `(primary, prior_closed_segments, extra_to_reclaim)`
+/// when `active_pc != primary`, switches `F_BACKING` back to `primary`, and moves all extra
+/// segments (including `active_pc`) into `spares` so recording resumes cleanly on `primary`.
+pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut c_void, Vec<*mut c_void>, Vec<usize>)> {
+    let wrapper = wrapper_of(active_pc)?;
+    let primary = *((wrapper as usize + F_PRIMARY) as *const *mut c_void);
+    if primary == active_pc {
+        return None;
+    }
+    let (prior, reclaimed) = {
+        let mut sg = SEGMENTS.lock().unwrap();
+        let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
+        let extra = std::mem::take(&mut book.extra_active);
+        let mut prior = Vec::with_capacity(extra.len());
+        prior.push(primary);
+        for &seg in &extra {
+            if seg != active_pc as usize {
+                prior.push(seg as *mut c_void);
+            }
+        }
+        book.spares.extend(extra.iter().copied());
+        (prior, extra)
+    };
+    *((wrapper as usize + F_BACKING) as *mut usize) = primary as usize;
+    {
+        let mut wg = WRAPPER_OF.lock().unwrap();
+        if let Some(m) = wg.as_mut() {
+            for &seg in &reclaimed {
+                m.remove(&seg);
+            }
+            m.insert(primary as usize, wrapper as usize);
+        }
+    }
+    Some((primary, prior, reclaimed))
 }
 
 unsafe fn pc_slot(pc: *mut c_void, slot: usize) -> usize {
     *(*(pc as *const *const usize)).add(slot)
 }
 
-/// QueryInterface: the PC list answers; where it hands out itself, the console object goes out.
+/// QueryInterface: the primary PC list answers; where it hands out itself, the console object goes out.
 /// Command list interfaces of the console's headers that the PC does not know: the console's
 /// ID3D12GraphicsCommandList5 / 6 (the PC's data1–data3, another tail – titles ask for them
 /// and use the answer without a check). The console object has the console's whole vtable,
@@ -161,13 +319,13 @@ const CONSOLE_LIST_IIDS: [(u32, u16, u16, [u8; 8]); 2] = [
 ];
 
 unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 0));
     if !riid.is_null() && !ppv.is_null() {
         let g = &*riid;
         if CONSOLE_LIST_IIDS.contains(&(g.data1, g.data2, g.data3, g.data4)) {
-            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
-            add_ref(pc);
+            let add_ref_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
+            add_ref_fn(pc);
             *ppv = this;
             return 0;
         }
@@ -179,12 +337,40 @@ unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mu
     hr
 }
 
-/// Release: the console object goes with the PC list's last reference.
+/// AddRef: always references the primary PC list (`F_PRIMARY`).
+unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+    let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
+    f(pc)
+}
+
+/// Release: the console object (and any extra split segment PC lists) goes with the primary PC
+/// list's last reference.
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
+        let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+        {
+            let mut wg = WRAPPER_OF.lock().unwrap();
+            if let Some(m) = wg.as_mut() {
+                m.remove(&(pc as usize));
+                if let Some(ref b) = book {
+                    for &seg in b.extra_active.iter().chain(b.spares.iter()) {
+                        m.remove(&seg);
+                    }
+                }
+            }
+        }
+        if let Some(b) = book {
+            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()) {
+                let raw = seg as *mut c_void;
+                super::bind::forget(raw);
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
+                rel(raw);
+            }
+        }
         super::bind::forget(pc);
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }

@@ -21,6 +21,8 @@ struct Fence {
     cell: Option<&'static Cell>,
     /// the highest value a queue was told to signal
     signalled: u64,
+    /// the highest value a queue was told to wait for
+    waited: u64,
 }
 
 /// (fences are never freed: XCL holds a reference to each)
@@ -77,11 +79,35 @@ pub(super) unsafe fn note_queue_signal(fence: usize, value: u64) {
     }
 }
 
+/// A queue was told to wait for `fence` (one of the title's) to reach `value`.
+pub(super) fn note_queue_wait(fence: usize, value: u64) {
+    let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    let f = g.get_or_insert_with(HashMap::new).entry(fence).or_default();
+    f.waited = f.waited.max(value);
+}
+
 /// The CPU signalled `fence`.
 pub(super) fn note_cpu_signal(fence: usize) {
     let known = FENCES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.get(&fence).is_some_and(|f| f.cell.is_some()));
     if known {
         refresh();
+    }
+}
+
+/// Diagnostic summary of title fences whose completed value lags their signalled or waited value.
+pub(super) fn pending_summary() -> String {
+    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut parts = Vec::new();
+    for (&p, f) in g.iter().flatten() {
+        let done = unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(0);
+        if done < f.signalled || done < f.waited {
+            parts.push(format!("{p:#x}(done={done:#x}/sig={:#x}/wait={:#x},cell={})", f.signalled, f.waited, f.cell.is_some()));
+        }
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(", ")
     }
 }
 
