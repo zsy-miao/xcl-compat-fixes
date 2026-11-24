@@ -75,7 +75,7 @@ pub struct Report {
     /// XCL slots it called that XCL does not implement
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
-    /// DirectStorage: BCPack requests refused (no decoder) by mode, and bytes filled under
+    /// DirectStorage: BCPack requests unpacked and refused (no decoder) by mode, and bytes filled under
     /// `XCL_DSTORAGE_BCPACK_FILL`
     #[serde(default)]
     pub dstorage: crate::hle::dstorage::DStorageStats,

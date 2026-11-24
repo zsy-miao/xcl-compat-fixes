@@ -48,6 +48,16 @@ def runtime(path):
     return path.startswith("crates/xcl/src/") and "/tests" not in path and not path.endswith("tests.rs")
 
 
+# built into xcl.exe from outside crates/xcl/src: the data it compiles in (stubdb.toml, by
+# include_str!), its build script, and the manifests and lock file that pick its dependencies
+# and the release profile
+RUNTIME_BUILD = ("crates/xcl/build.rs", "crates/xcl/Cargo.toml", "Cargo.toml", "Cargo.lock")
+
+
+def builds_runtime(path):
+    return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
+
+
 def check(body, head, files, is_main_ancestor, *, test_only=False):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
@@ -75,7 +85,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         elif binary and not in_test_data:
             problems.append(f"`{path}` is a binary file outside tests/data/ or over 1 MB")
 
-    if not test_only and any(runtime(p) for p, *_ in files):
+    if not test_only and any(runtime(p) or builds_runtime(p) for p, *_ in files):
         blocks = smoke_blocks(body)
         mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]

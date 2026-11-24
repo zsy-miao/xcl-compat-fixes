@@ -31,6 +31,18 @@ class TestOnlyApprovalTests(unittest.TestCase):
         for reason in ("Not tested", "AI use", "content.rpf", "attachment.txt"):
             self.assertTrue(any(reason in problem for problem in problems), problems)
 
+    def test_runtime_build_inputs_require_smoke_until_approved(self):
+        for path in ("crates/xcl/data/stubdb.toml", "crates/xcl/build.rs", "crates/xcl/Cargo.toml",
+                     "Cargo.toml", "Cargo.lock"):
+            with self.subTest(path=path):
+                problems = check(BODY, HEAD, [changed(path)], lambda _: False)
+                self.assertEqual(2, len(problems))
+                self.assertTrue(all("Regression run" in problem for problem in problems))
+                self.assertEqual([], check(BODY, HEAD, [changed(path)], lambda _: False, test_only=True))
+        for path in ("tests/testtitle/Cargo.toml", "tests/testgamedll/build.rs", "crates/xcl/tests/data/x.toml"):
+            with self.subTest(path=path):
+                self.assertEqual([], check(BODY, HEAD, [changed(path)], lambda _: False))
+
     def test_test_paths_do_not_need_approval(self):
         files = [changed("crates/xcl/tests/integration.rs"), changed("crates/xcl/src/gpu/recomp/tests.rs")]
         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))

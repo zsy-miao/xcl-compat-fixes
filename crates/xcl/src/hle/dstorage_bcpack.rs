@@ -1,6 +1,7 @@
-//! Bounded BCPack adapter. Native BC1 uses attributed estimated tables. Exact
-//! native BC7 subsets run first; an explicitly
-//! configured separate research executable may supply provisional BC7/BC5 decoding.
+//! Legacy bounded BCPack research adapter and its independent controls.
+//! Normal requests use the official `hle::bcpack` codec. Only after its rejection,
+//! an explicitly configured separate research executable may enable this older
+//! provisional BC5/BC7 path. Estimated legacy BC1 remains test coverage only.
 
 #[path = "bcpack.rs"]
 mod entropy;
@@ -70,6 +71,20 @@ fn decode_bc1_with_tables(source: &[u8], destination: usize, tables: &bc1::Table
 
 fn external_executable() -> Option<std::ffi::OsString> {
     std::env::var_os("XCL_BCPACK_EXTERNAL_DECODER").filter(|s| !s.is_empty())
+}
+
+/// Preserve the existing opt-in research path without overriding official success.
+pub(super) fn explicit_research_fallback(mode: u8, source: &[u8], destination: usize) -> Option<Result<Vec<u8>, String>> {
+    external_executable()?;
+    if !matches!(mode, 5 | 7) { return None; }
+    if !supported_sizes(source.len(), destination) {
+        return Some(Err("research fallback sizes exceed its bounded decoder".into()));
+    }
+    match mode {
+        5 => Some(decode_bc5(source.to_vec(), destination)),
+        7 => Some(decode(source, destination)),
+        _ => None,
+    }
 }
 
 pub(super) fn decode(source: &[u8], destination: usize) -> Result<Vec<u8>, String> {
@@ -498,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn bc5_refusal_without_configured_helper_preserves_virtual_and_physical_destinations() {
+    fn official_bc5_without_helper_preserves_success_and_failure_destinations() {
         use super::super::{Request, execute, SOURCE_MEMORY_BIT, DEST_PHYS_PAGES_BIT, E_DECOMPRESSION};
         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, read_physical_pages, write_physical_pages, PHYS_PAGE_SIZE};
         // Isolate environment changes from parallel tests and from a central run
@@ -507,10 +522,10 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             use std::os::windows::process::CommandExt;
             let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &subprocess_test_name("bc5_refusal_without_configured_helper_preserves_virtual_and_physical_destinations"), "--nocapture"])
+                .args(["--exact", &subprocess_test_name("official_bc5_without_helper_preserves_success_and_failure_destinations"), "--nocapture"])
                 .env(CHILD,"1").env_remove("XCL_BCPACK_EXTERNAL_DECODER")
                 .creation_flags(CREATE_NO_WINDOW).output().unwrap();
-            assert!(result.status.success(), "isolated mode5 refusal failed: {}{}",
+            assert!(result.status.success(), "isolated official mode5 integration failed: {}{}",
                 String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
             return;
         }
@@ -521,10 +536,26 @@ mod tests {
         let mut destination = [0xA5u8;16];
         let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
             source_size: source.len() as u32, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
-        assert_eq!(request.check(true),Err(E_DECOMPRESSION));
+        assert_eq!(request.check(true),Ok(()));
+        assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
+        assert_eq!(destination,BC5_EXPECTED);
+        destination.fill(0xA5);
+        request.source_size -= 1;
         assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
         assert_eq!(destination,[0xA5;16]);
-        assert!(crate::gpu::uma::get().is_some(), "physical-page BC5 refusal requires the local UMA reservation");
+
+        // This older MIT control is a valid legacy subset, but the official
+        // codec rejects its framing. No helper means that real error propagates;
+        // the fitted/subset implementation must not silently replace it.
+        let legacy = control();
+        assert!(decode(&legacy,16).is_ok());
+        assert!(crate::hle::bcpack::decode(7,&legacy,16).is_err());
+        let rejected = Request { options: SOURCE_MEMORY_BIT | (7 << 1), source: legacy.as_ptr() as u64,
+            source_size: legacy.len() as u32, destination: destination.as_mut_ptr() as u64,
+            destination_size: 16, ..Default::default() };
+        assert_eq!(unsafe { execute(&rejected,None,None,None) },Err(E_DECOMPRESSION));
+        assert_eq!(destination,[0xA5;16]);
+        assert!(crate::gpu::uma::get().is_some(), "physical-page BC5 integration requires the local UMA reservation");
         unsafe {
             let mut count = 2usize; let mut pages = [0usize;2];
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(),0,&mut count,pages.as_mut_ptr()),1);
@@ -540,7 +571,7 @@ mod tests {
             let read = read_physical_pages(&scattered,offset,&mut readback);
             let freed = FreeTitlePhysicalPages(std::ptr::null_mut(),count,pages.as_mut_ptr());
             assert!(seeded && read); assert_eq!(freed,1);
-            assert_eq!(check,Err(E_DECOMPRESSION)); assert_eq!(result,Err(E_DECOMPRESSION)); assert_eq!(readback,[0xA5;16]);
+            assert_eq!(check,Ok(())); assert_eq!(result,Err(E_DECOMPRESSION)); assert_eq!(readback,[0xA5;16]);
         }
     }
 
@@ -550,18 +581,24 @@ mod tests {
         use super::super::{Request, execute, SOURCE_MEMORY_BIT, E_DECOMPRESSION};
         assert!(external_executable().is_some(), "set XCL_BCPACK_EXTERNAL_DECODER to the validated BC5 helper");
         let mut source = bc5_control(); source.push(0);
+        // Exercise the separate helper itself, even though normal successful
+        // requests now take the official codec before any helper call.
+        assert_eq!(decode_bc5(source[..84].to_vec(),16).unwrap(),BC5_EXPECTED);
+        for size in [83,85] { assert!(decode_bc5(source[..size].to_vec(),16).is_err()); }
         let mut destination = [0xA5u8;16];
         let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
             source_size: 84, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
         assert_eq!(request.check(true),Ok(()));
         assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
         assert_eq!(destination,BC5_EXPECTED);
-        // Neither truncated entropy nor an unconsumed zero tail may modify output.
-        for size in [83,85] {
-            destination.fill(0xA5); request.source_size = size;
-            assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
-            assert_eq!(destination,[0xA5;16]);
-        }
+        // Official framing accepts this zero tail, unlike the strict research
+        // helper above. Native success wins; truncation still writes nothing.
+        destination.fill(0xA5); request.source_size = 83;
+        assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
+        assert_eq!(destination,[0xA5;16]);
+        request.source_size = 85;
+        assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
+        assert_eq!(destination,BC5_EXPECTED);
     }
 
     #[test]
@@ -574,7 +611,12 @@ mod tests {
         assert!(crate::gpu::uma::get().is_some(), "physical-page BC5 regression requires the local UMA reservation");
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("xcl-bc5-file-{}-{nonce}.bin", std::process::id()));
-        let mut file_bytes = b"prefix".to_vec(); file_bytes.extend(bc5_control()); file_bytes.push(0);
+        let packed = bc5_control();
+        assert_eq!(decode_bc5(packed.clone(),16).unwrap(),BC5_EXPECTED);
+        assert!(decode_bc5(packed[..83].to_vec(),16).is_err());
+        let mut tail = packed.clone(); tail.push(0);
+        assert!(decode_bc5(tail.clone(),16).is_err());
+        let mut file_bytes = b"prefix".to_vec(); file_bytes.extend(tail);
         std::fs::write(&path,file_bytes).unwrap();
         let file = FileInner { id: 1, path: crate::util::wide(&path.to_string_lossy()),
             file: Mutex::new(Some(Arc::new(std::fs::File::open(&path).unwrap()))) };
@@ -600,17 +642,17 @@ mod tests {
         drop(file); std::fs::remove_file(path).unwrap();
         assert_eq!(freed,1); assert!(reads.into_iter().all(|ok|ok));
         assert_eq!(checks,vec![Ok(());3]);
-        assert_eq!(results,vec![Ok(()),Err(E_DECOMPRESSION),Err(E_DECOMPRESSION)]);
-        assert_eq!(outputs,vec![BC5_EXPECTED,[0xA5;16],[0xA5;16]]);
+        assert_eq!(results,vec![Ok(()),Err(E_DECOMPRESSION),Ok(())]);
+        assert_eq!(outputs,vec![BC5_EXPECTED,[0xA5;16],BC5_EXPECTED]);
     }
 
     #[test]
-    fn native_packet_to_virtual_destination_and_failure_leave_complete_results() {
+    fn official_packet_to_virtual_destination_and_failure_leave_complete_results() {
         use super::super::{Request, execute, SOURCE_MEMORY_BIT, E_DECOMPRESSION};
-        let source = control();
-        let expected = [0x40,0x31,0x72,0x04,0xa5,0x68,0x19,0xbe,0x02,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0];
+        let source = bc5_control();
+        let expected = BC5_EXPECTED;
         let mut destination = [0xA5u8;16];
-        let mut request = Request { options: SOURCE_MEMORY_BIT | (7 << 1), source: source.as_ptr() as u64,
+        let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
             source_size: source.len() as u32, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
         assert_eq!(request.check(true), Ok(()));
         assert_eq!(unsafe { execute(&request,None,None,None) }, Ok(()));
@@ -622,12 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn native_file_packet_reaches_scattered_physical_pages() {
+    fn official_file_packet_reaches_scattered_physical_pages() {
         use super::super::{Request, FileInner, execute, DEST_PHYS_PAGES_BIT};
         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, read_physical_pages, PHYS_PAGE_SIZE};
         use std::sync::{Arc,Mutex};
-        let source = control();
-        let expected = [0x40,0x31,0x72,0x04,0xa5,0x68,0x19,0xbe,0x02,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0];
+        let source = bc5_control();
+        let expected = BC5_EXPECTED;
         assert!(crate::gpu::uma::get().is_some(), "physical-page BCPack regression requires the local UMA reservation");
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("xcl-bcpack-file-{}-{nonce}.bin", std::process::id()));
@@ -641,7 +683,7 @@ mod tests {
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(),0,&mut count,pages.as_mut_ptr()),1);
             let scattered = [pages[1],pages[0]];
             let offset = (PHYS_PAGE_SIZE - 8) as u16;
-            let request = Request { options: DEST_PHYS_PAGES_BIT | (7 << 1), source: 0, offset: 6,
+            let request = Request { options: DEST_PHYS_PAGES_BIT | (5 << 1), source: 0, offset: 6,
                 source_size: source.len() as u32, destination: scattered.as_ptr() as u64, destination_page_offset: offset,
                 destination_size: 16, ..Default::default() };
             assert_eq!(request.check(false),Ok(()));

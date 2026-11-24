@@ -106,7 +106,12 @@ fn bc1_virtual_request_succeeds_or_keeps_destination_untouched() {
     assert_eq!(r.check(true), Ok(()));
     assert_eq!(unsafe { execute(&r, None, None, None) }, Ok(()));
     assert_eq!(destination, FITTED);
-    for n in [45, 91] {
+    // The official codec permits this FF tail. The legacy adapter's stricter
+    // exact-consumption refusal remains covered by its direct test above.
+    r.source_size = 91;
+    assert_eq!(unsafe { execute(&r, None, None, None) }, Ok(()));
+    assert_eq!(destination, FITTED);
+    for n in [45] {
         r.source_size = n;
         destination.fill(0xa5);
         assert_eq!(
@@ -178,7 +183,7 @@ fn bc1_file_request_reaches_scattered_physical_pages_transactionally() {
     assert_eq!(checks, vec![Ok(()); 3]);
     assert_eq!(
         results,
-        vec![Ok(()), Err(E_DECOMPRESSION), Err(E_DECOMPRESSION)]
+        vec![Ok(()), Err(E_DECOMPRESSION), Ok(())]
     );
-    assert_eq!(outputs, vec![FITTED, [0xa5; 16], [0xa5; 16]]);
+    assert_eq!(outputs, vec![FITTED, [0xa5; 16], FITTED]);
 }
