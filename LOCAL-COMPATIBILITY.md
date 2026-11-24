@@ -99,3 +99,10 @@ screens on this PC. It displayed 1,132 frames and exited at its 430-second timer
 without a reported crash. The subsequent build `b696652` passed 125 release checks,
 including both optional BC5 helper tests. Its first 285-second game run exited
 normally after 548 frames. The log for that run did not record a BC5 request.
+
+A second offline run of `b696652` reached the BC5 path. The helper returned
+65,536 bytes per logged request, including request 64. The game displayed 1,061
+frames, recorded zero pipeline or compiler failures, and exited normally after
+422.75 seconds at its 420-second timer. The 16 KiB graphics-memory copy was still
+refused. This run verifies use of the experimental decoder. Texture accuracy
+against a console and gameplay remain unverified.

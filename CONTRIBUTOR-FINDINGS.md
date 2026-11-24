@@ -57,3 +57,20 @@ The existing late-page-array work in [PR #289](https://github.com/ivall/xcl/pull
 addresses a different problem and should be reused if its measured conditions
 apply. New work should be checked against the private overlap ledger, current
 PR diffs and review discussions before implementation.
+
+## Pull request evidence
+
+Before opening a PR, fill in **Tested** with the exact commit, CPU, GPU, driver,
+Windows build, Rust version, commands, pass/fail/ignore counts and named GPU
+skips. Read the rendered description and replace every template prompt. Include
+the two official smoke reports when required. Record sample-data availability
+and any hardware or gameplay coverage still missing under **Not tested**.
+When a reviewer tests a merged batch, link that report separately and identify
+the commit and hardware they tested.
+
+Our GPU mirror regression was merged in [upstream PR #338](https://github.com/ivall/xcl/pull/338).
+Our NVIDIA suite reported 671 passed, zero failed and 41 ignored, with two wave64
+tests reporting a skip. The maintainer separately reported 636 unit tests passed
+and zero failed on an RX 9070 at merged main `a6f5f7a`. The retail title drew its
+menu and continued in that combined build.
+[Maintainer's validation](https://github.com/ivall/xcl/pull/338#issuecomment-7117662730)
