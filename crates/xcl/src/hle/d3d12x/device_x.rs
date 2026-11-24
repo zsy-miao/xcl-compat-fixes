@@ -721,6 +721,9 @@ fn depth_typeless(f: u32) -> Option<u32> {
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
+        // a target made R11G11B10_FLOAT (`pc_resource_desc`) — pipelines and clear values name
+        // it too, or the PSO's RT format stays 67 and disagrees with the retyped resource
+        67 => 26,
         f => pc_view_format(f),
     }
 }
@@ -1177,8 +1180,11 @@ mod tests {
         let mut input = [0u8; 24];
         input[0..4].copy_from_slice(&67u32.to_le_bytes());
         let mut output = [0u8; 24];
+        // pc_target_format promotes 67 to 26 now (pipelines and clear values name it too);
+        // a real title never pairs a clear value with a flags-0 texture, so the old
+        // "resource 67, clear 67" combination no longer occurs
         unsafe { pc_clear(input.as_ptr().cast(), &mut output, Some((67, 67)), 0) };
-        assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 67);
+        assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 26);
 
         // a clear value in a format that is not the resource's console format is left to pc_target_format
         let mut other = [0u8; 24];
