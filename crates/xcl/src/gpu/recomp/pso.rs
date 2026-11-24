@@ -73,9 +73,45 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
     Some(Fspx { threads, rsrc1: u32_at(head, 0x14)?, rsrc2: u32_at(head, 0x18)?, code: &code[..4 * (end + 1)] })
 }
 
-/// Memory windows of the title's unified memory (1 without it).
+/// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
+/// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
-    crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32)
+    let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
+    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+        n | super::HEAP_WINDOWS
+    } else {
+        n
+    }
+}
+
+thread_local! {
+    /// this thread translates in the switch form (`in_switch_form`)
+    static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's translations in the switch form over root UAVs (`mem_windows`
+/// without `HEAP_WINDOWS`, so other cache keys): for a pipeline the driver would not build with
+/// heap windows. The root signature and the binds are the same for both forms.
+pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SWITCH_FORM.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SWITCH_FORM.with(|s| s.replace(true)));
+    f()
+}
+
+/// Whether translated shaders reach the memory windows through the shared descriptor heap
+/// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
+/// instead of a `switch` over root UAVs. Opt-in: on with `XCL_HEAP_WINDOWS=1`, unless the views
+/// could not be made (no shared heap: then the switch, as before). Off by default: two NVIDIA
+/// setups failed with it (the driver's compiler ending the process; a device removal when the
+/// views are made on an 8 GB card) that other machines do not show.
+pub fn heap_windows() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
@@ -120,6 +156,8 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
+    // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
+    // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
@@ -149,6 +187,46 @@ mod translated {
         h | 1
     }
 
+    /// The backend producing an entry: the HLSL path, or `XCL_DIRECT_DXIL` routing (whose
+    /// results may also be HLSL fallbacks, so its identity extends the HLSL one).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Backend {
+        Hlsl,
+        /// direct DXIL for compute + the mesh pass (`=1`)
+        DirectCompute,
+        /// direct DXIL for VS / PS too (`=all`)
+        DirectAll,
+    }
+
+    impl Backend {
+        pub(super) fn current() -> Self {
+            match (crate::gpu::dxil::kernel::enabled(), crate::gpu::dxil::kernel::enabled_graphics()) {
+                (_, true) => Backend::DirectAll,
+                (true, false) => Backend::DirectCompute,
+                _ => Backend::Hlsl,
+            }
+        }
+    }
+
+    /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
+    /// tagged with the direct translator's version and routing mode otherwise.
+    pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u32) -> u64 {
+        let base = identity_for(source, toolchain);
+        let tag = match backend {
+            Backend::Hlsl => return base,
+            Backend::DirectCompute => "compute",
+            Backend::DirectAll => "all",
+        };
+        let mut h = base;
+        for part in ["xcl-direct-dxil", tag, &direct_version.to_string()] {
+            for byte in part.bytes().chain([0]) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h | 1
+    }
+
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
     fn identity() -> u64 {
@@ -157,7 +235,12 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), super::dxc::toolchain_identity())
+            identity_with(
+                env!("XCL_TRANSLATOR_SOURCE_ID"),
+                super::dxc::toolchain_identity(),
+                Backend::current(),
+                crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
+            )
         })
     }
 
@@ -259,6 +342,29 @@ mod translated {
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
+    // for what it cannot translate yet
+    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+        match direct_compute(blob, sampler_base, windows, split_wave64) {
+            Ok(c) => {
+                crate::gpu::dxil::coverage::record_translated("CS");
+                return Ok(c);
+            }
+            Err(e) => direct_fallback("CS", &e),
+        }
+    }
+    // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
+    let ps_debug = stage == Stage::Pixel
+        && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
+    if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
+        match direct_graphics(blob, stage, sampler_base, windows) {
+            Ok(c) => {
+                crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
+                return Ok(c);
+            }
+            Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
+        }
+    }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
@@ -475,6 +581,64 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// A direct DXIL translation that fell back to the HLSL path: one structured log line
+/// (`stage=… reason=…`, the reason with operands stripped) and the live summary counter
+/// (`XCL_DIRECT_DXIL_STATS=1`, `gpu::dxil::coverage`).
+fn direct_fallback(stage: &str, err: &str) {
+    let reason = crate::gpu::dxil::coverage::record_fallback(stage, err);
+    crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
+}
+
+/// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
+/// FSPX (driver) containers are left to the HLSL path.
+fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
+    let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let wave64 = super::detect_wave64(code);
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
+    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    dump_direct(blob, &k.dxil);
+    Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+}
+
+/// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's
+/// DXIL to `%TEMP%\xcl-dxil-dump\<hash>.dxil` (with `XCL_TRANSLATED_CACHE=0`, so cached
+/// translations are redone).
+fn dump_direct(blob: &[u8], dxil: &[u8]) {
+    let Ok(want) = std::env::var("XCL_DXIL_DUMP") else { return };
+    let h = crate::gpu::shader::fnv64(blob);
+    if want == "all" || want.split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).any(|v| v == h) {
+        let dir = std::env::temp_dir().join("xcl-dxil-dump");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{h:016x}.dxil"));
+        match std::fs::write(&path, dxil) {
+            Ok(()) => crate::xlog_info!("[SHADER] direct DXIL of {h:016x} ({} B) written to {}", dxil.len(), path.display()),
+            Err(e) => crate::xlog_warn!("[SHADER] XCL_DXIL_DUMP {}: {e}", path.display()),
+        }
+    }
+}
+
+/// A console vertex / pixel shader through the direct DXIL translator.
+fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -> Result<Compiled, String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let want = if stage == Stage::Vertex { 4 } else { 5 };
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == want)).ok_or("no hardware variant")?;
+    let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
+    let k = match (&mode, stage) {
+        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+        _ => return Err("the shader stage does not match its slot in the PSO".into()),
+    };
+    dump_direct(blob, &k.dxil);
+    Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
@@ -555,7 +719,22 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, mem_windows())?, record, ps)
+    let wave64 = super::detect_wave64(code);
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    if crate::gpu::dxil::kernel::enabled() {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("MS");
+                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+            }
+            Err(e) => direct_fallback("MS", &e),
+        }
+    }
+    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -765,6 +944,61 @@ mod shader_cache_tests {
 
         let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct DXIL entries have their own identity per routing mode and translator version;
+    /// the HLSL identity is the pre-direct one (its entries stay valid).
+    #[test]
+    fn direct_dxil_identity_never_collides_with_hlsl() {
+        use translated::{identity_for, identity_with, Backend};
+        let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
+        assert_eq!(hlsl, identity_for("s", "t"));
+        assert_eq!(hlsl, identity_with("s", "t", Backend::Hlsl, 2), "the direct version does not touch HLSL entries");
+        let ids = [
+            hlsl,
+            identity_with("s", "t", Backend::DirectCompute, 1),
+            identity_with("s", "t", Backend::DirectAll, 1),
+            identity_with("s", "t", Backend::DirectCompute, 2),
+            identity_with("s2", "t", Backend::DirectCompute, 1),
+            identity_with("s", "t2", Backend::DirectCompute, 1),
+        ];
+        assert!(ids.iter().all(|&i| i != 0));
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
+    /// is a miss for the HLSL identity (and the other way round) for the same request.
+    #[test]
+    fn direct_and_hlsl_disk_entries_are_separate() {
+        use translated::{cached_in, identity_with, Backend};
+        let dir = std::env::temp_dir().join(format!("xcl-translated-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console-direct";
+        let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
+        let direct = identity_with("s", "t", Backend::DirectCompute, 1);
+        let go = |ident, marker: u8, calls: &mut u32| {
+            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, true, || {
+                *calls += 1;
+                Ok(compiled(marker))
+            })
+            .unwrap()
+            .dxil[0]
+        };
+        let mut calls = 0;
+        assert_eq!(go(direct, 1, &mut calls), 1);
+        assert_eq!(go(direct, 9, &mut calls), 1, "direct hit");
+        assert_eq!(calls, 1);
+        assert_eq!(go(hlsl, 2, &mut calls), 2, "HLSL misses the direct entry");
+        assert_eq!(calls, 2);
+        assert_eq!(go(hlsl, 9, &mut calls), 2, "HLSL hit");
+        assert_eq!(go(direct, 9, &mut calls), 1, "direct entry not overwritten");
+        assert_eq!(calls, 2);
+        let v2 = identity_with("s", "t", Backend::DirectCompute, 2);
+        assert_eq!(go(v2, 3, &mut calls), 3, "a version bump misses");
+        // another split_wave64 / sampler base is another entry
+        let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, || Ok(compiled(4))).unwrap();
+        assert_eq!(other.dxil[0], 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

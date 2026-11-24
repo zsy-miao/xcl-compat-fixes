@@ -241,7 +241,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
 /// The test title's draws under the D3D12 debug layer (`XCL_D3D12_DEBUG=1`): none without a
 /// root signature. Its untranslated pipelines (PC shaders, stand-ins, fallbacks) were drawn with
 /// no root signature on the PC list – console SetGraphicsRootSignature binds nothing there –
-/// which the debug layer reports on every GPU and WARP faults on. Needs the debug layer
+/// which the debug layer reports on every GPU and WARP faults on. No copy reads a buffer in
+/// another state than COPY_SOURCE either. Needs the debug layer
 /// (Graphics Tools) and the system XGameRuntime, as the run above does; skipped without them.
 #[test]
 fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
@@ -269,4 +270,8 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     assert!(log.contains("D3D12: debug layer enabled"), "the debug layer did not come up");
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("No root signature has been set")).collect();
     assert!(bad.is_empty(), "{} draws without a root signature, first: {}", bad.len(), bad[0]);
+    // CopyMemoryToMemoryX within one window (console_list_methods) reads a buffer in COPY_SOURCE (#958)
+    assert!(log.contains("CopyMemoryToMemoryX same-window scratch copies recorded: 1"), "the test title did not record a same-window scratch copy");
+    let bad: Vec<&str> = log.lines().filter(|l| l.contains("is invalid for use as a source buffer")).collect();
+    assert!(bad.is_empty(), "{} copies from a buffer that is not in COPY_SOURCE, first: {}", bad.len(), bad[0]);
 }

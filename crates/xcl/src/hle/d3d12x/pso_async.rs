@@ -29,9 +29,80 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
+    demand: Mutex<Demand>,
+}
+
+/// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
+#[derive(Default)]
+struct Demand {
+    wanted: bool,
+    /// thread id of the preload worker (lowest priority) building it, 0 = none
+    preload_thread: u32,
+}
+
+thread_local! {
+    /// what this worker is building
+    static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread is a worker and one of the title's threads waits for what it is building: the
+/// build must not stand back for the title's sake (`real::big_compile_turn`).
+pub(super) fn build_is_wanted() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+}
+
+/// Whether one of the title's threads waits for what this thread is doing, to be asked later and
+/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
+/// title's own.
+pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        return Box::new(move || p.demand.lock().unwrap().wanted);
+    }
+    let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
+    Box::new(move || own)
+}
+
+/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
+fn build(p: &Arc<Pending>, job: Job, preload: bool) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    if preload {
+        let mut d = p.demand.lock().unwrap();
+        d.preload_thread = unsafe { GetCurrentThreadId() };
+        if d.wanted {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+        }
+    }
+    complete(p, job());
+    if preload {
+        // (under the lock: `want` does not raise this thread after it)
+        let mut d = p.demand.lock().unwrap();
+        d.preload_thread = 0;
+        if d.wanted {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+        }
+    }
+    BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
 impl Pending {
+    /// One of the title's threads is about to wait for it: the worker building it goes on now,
+    /// at a normal priority.
+    fn want(&self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
+        let mut d = self.demand.lock().unwrap();
+        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+            unsafe {
+                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
+                if !h.is_null() {
+                    SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+                    CloseHandle(h);
+                }
+            }
+        }
+    }
+
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
@@ -89,7 +160,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
-                    complete(&p, job());
+                    build(&p, job, false);
                 }
             });
         }
@@ -137,6 +208,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
+        demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -273,8 +345,7 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
-                        let real = job();
-                        complete(&p, real);
+                        build(&p, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
@@ -312,6 +383,49 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
+        let _ = released(standin);
+    }
+
+    /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
+    /// another thread, as the DXC workers do; a thread that builds nothing (no title runs here)
+    /// wants nothing.
+    #[test]
+    fn a_waiting_bind_makes_the_builds_compiles_wanted() {
+        let standin = 0x7E57_B005usize;
+        let (tx, rx) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            tx.send(wanted_here()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0x5454
+        }));
+        let wanted = rx.recv().unwrap();
+        assert!(!wanted(), "nobody waits yet");
+        assert_eq!(resolve_wait_for(standin, None), 0x5454);
+        assert!(wanted());
+        assert!(!wanted_here()());
+        let _ = released(standin);
+    }
+
+    /// A worker's build hears that a bind waits for it (and only its own build does).
+    #[test]
+    fn a_waiting_bind_makes_the_build_wanted() {
+        let standin = 0x7E57_B004usize;
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            let unwanted_first = !build_is_wanted();
+            started_tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if unwanted_first && build_is_wanted() { 0x5353 } else { 0 }
+        }));
+        started.recv().unwrap();
+        assert!(!build_is_wanted(), "this thread builds nothing");
+        assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
         let _ = released(standin);
     }
 
@@ -383,6 +497,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(job) = job {
         complete(&p, job());
     }
+    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -419,6 +534,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
+    p.want();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
     if *done {
         return built(p);

@@ -399,6 +399,12 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
+/// upload's allocator `Reset` in `begin_slot`), and `late_release` asks for the queue from a
+/// resource's last `Release`, which D3D12 can make inside a call of its own on another thread
+/// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
+static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
@@ -564,8 +570,11 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            // (the queue first: `queue()` never answers with one older than the state's)
+            let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
+            drop(old_queue);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
@@ -1216,9 +1225,10 @@ pub unsafe fn free(p: usize) -> bool {
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
-/// The queue tile mappings go out on, once there is one.
+/// The queue tile mappings go out on, once there is one. Answered without `STATE` (`QUEUE`):
+/// a caller may be inside a D3D12 call that a holder of `STATE` waits for.
 pub fn queue() -> Option<ID3D12CommandQueue> {
-    STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+    QUEUE.lock().unwrap().clone()
 }
 
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
@@ -1593,6 +1603,23 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
+    /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
+    /// waiting for (a list's `Reset` against an upload's allocator `Reset`, with `XCL_DRED=1`).
+    #[test]
+    fn the_queue_is_answered_while_the_state_is_locked() {
+        let held = STATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = std::thread::spawn(move || {
+            let _ = queue();
+            let _ = tx.send(());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(held);
+        asked.join().unwrap();
+        assert!(answered, "queue() waited for the sparse state's lock");
+    }
 
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another

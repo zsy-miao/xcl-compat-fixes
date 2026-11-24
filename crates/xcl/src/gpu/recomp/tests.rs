@@ -60,10 +60,40 @@ fn gpu_waves() -> Vec<bool> {
 /// A kernel compiled as a wave64 or wave32 program, and the code as memory from address 0,
 /// where `runner::run_program` puts it.
 fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
+    let mem = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    if runner::direct_dxil() {
+        return (runner::direct_kernel(code, wave64).unwrap(), mem);
+    }
     let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// `XCL_DIRECT_DXIL=1`: the direct DXIL translator's kernel for a kernel-mode program with
+/// one memory window (else `hlsl`, the HLSL path's container).
+fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
+    use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
+    let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
+    if !runner::direct_dxil() || !windows {
+        return hlsl;
+    }
+    let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
+    let o = KernelOptions { wave64: opt.wave64, split, mem_windows: opt.mem_windows, sampler_base: opt.static_sampler_base };
+    match &opt.mode {
+        Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
+        Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        Mode::Vertex(vs) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        Mode::Pixel(ps) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        _ => hlsl,
+    }
+}
+
+/// `XCL_DIRECT_DXIL=1`: a kernel-mode program the HLSL path only compiles must also go
+/// through the direct DXIL translator (and its validator check).
+fn direct_check(code: &[u8], opt: &Options) {
+    let _ = direct_or(code, opt, Vec::new());
 }
 
 /// `runner::run_program` as a wave64 or wave32 program, with the number of lanes that ran.
@@ -196,6 +226,7 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     assert!(t.hlsl.contains("& (0xFFFFFFFFFFFFFFFFull >> (64u -") && t.hlsl.contains("(int64_t)(t") && t.hlsl.contains("== 0u) ? 0ull"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -211,6 +242,7 @@ fn scalar_bitcmp_64_selects_the_indexed_half() {
     assert!(t.hlsl.contains("scc = (uint)(") && t.hlsl.contains("== 0u);"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -229,6 +261,7 @@ fn scalar_64_bit_count_scan_and_set_cluster() {
     assert!(t.hlsl.contains("31u - firstbithigh(s5)") && t.hlsl.contains("s7 | select((s10 & 32u) != 0u") && t.hlsl.contains("s6 & ~select((s11 & 32u) == 0u"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -246,6 +279,7 @@ fn scalar_signed_leading_bit_scans() {
     assert!(t.hlsl.contains("31u - firstbithigh(") && t.hlsl.contains("63u - firstbithigh(") && t.hlsl.contains("0xFFFFFFFFu"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -263,6 +297,7 @@ fn scalar_relative_move_cluster() {
     assert!(t.hlsl.contains("switch (m0)") && t.hlsl.contains("switch ((m0 & 0x3FFu))") && t.hlsl.contains("switch (((m0 >> 16) & 0x3FFu))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -302,6 +337,7 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
     assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -431,6 +467,7 @@ fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
+        direct_check(&code, &Options { mem_windows: 2, ..Default::default() });
     }
 }
 
@@ -455,6 +492,7 @@ fn unary_f64_math_vop1_and_vop3() {
     assert_eq!(t.hlsl.matches("(double)1 / sqrt_d(").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -655,6 +693,7 @@ fn frexp_f64_instructions() {
     assert!(t.hlsl.contains("frexp_mant_d(asdouble(0x00000000u, 0xBFF00000u))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -670,6 +709,7 @@ fn rndne_f64_instructions() {
     assert!(t.hlsl.contains("round_ne_d(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -1487,6 +1527,7 @@ fn buffer_format_d16_packs_and_unpacks_halves() {
     assert!(t.hlsl.contains("f16tof32(((v16 >> 16) & 0xFFFFu))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -1619,11 +1660,12 @@ fn gpu_graphics_vs_ps_draw() {
         input_ena: 0x302,
         attrs: None,
     };
-    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
-    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+    let (vo, po) = (Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() });
+    let vt = translate(&vs_code, &vo).unwrap();
+    let pt = translate(&ps_code, &po).unwrap();
     assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
-    let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
-    let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let vs = direct_or(&vs_code, &vo, super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl)));
+    let ps = direct_or(&ps_code, &po, super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl)));
     let c = [0.8f32, 0.6, 0.4, 1.0];
     let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], c[0], c[1], c[2], c[3]]).collect();
     let layout = [
@@ -2603,6 +2645,7 @@ fn global_dword_addtid_address_is_saddr_plus_4_per_lane() {
     assert_eq!(t.hlsl.matches("_a = ").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -2853,9 +2896,10 @@ fn gpu_mesh_mode_two_passes() {
     list.push(exp(20, 1, [21, 0, 0, 0], 1));
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let code = prog(&refs);
-    let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
     let pass = mesh_passthrough(&ms);
     let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
@@ -3102,7 +3146,7 @@ fn gpu_unified_memory_arena() {
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
     ]);
     let t = translate(&p, &on_gpu(Options::default())).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&p, &on_gpu(Options::default()), super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
     let hi = (va >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(va + 0x1000) as u32, hi]);
@@ -3183,6 +3227,17 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
+    memory_windows_above_4_gib(false);
+}
+
+/// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
+/// same results, and no `switch` over windows in the HLSL.
+#[test]
+fn gpu_memory_windows_from_the_heap() {
+    memory_windows_above_4_gib(true);
+}
+
+fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3213,9 +3268,13 @@ fn gpu_memory_windows_above_4_gib() {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    // the direct translator binds windows as root UAVs only (no heap windows yet)
+    let dxil = if heap { hlsl_dxil() } else { direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil()) };
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
@@ -3256,6 +3315,17 @@ fn gpu_memory_windows_above_4_gib() {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(false);
+}
+
+/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
+/// address outside them reads 0 and drops its stores and atomics there too.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(true);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3309,7 +3379,8 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
 
     let mut st = KernelState::default();
@@ -3443,8 +3514,9 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
     ]);
     let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
-    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let opt = on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() });
+    let t = translate(&p, &opt).unwrap();
+    let dxil = direct_or(&p, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap());
 
     // Execute on the real D3D12.X device + queue (goes through q_execute_command_lists -> sparse::before_execute)
     unsafe {
@@ -4099,9 +4171,10 @@ fn gpu_compute_mode_dispatch_abi() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
     ]);
-    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+    let t = translate(&p, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
     let (w, h, base) = (32usize, 24usize, 0x100usize);
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
@@ -4135,7 +4208,7 @@ fn gpu_wave32_program_in_wave64_hardware() {
     ]);
     let t = translate(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }).unwrap();
     assert!(t.hlsl.contains("[WaveSize(64)]") && t.hlsl.contains("xcl_half"), "{}", t.hlsl);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
     let mut st = KernelState::default();
     st.sgpr[126] = u32::MAX; // exec of each half
     for (l, r) in st.vgpr.iter_mut().enumerate() {
@@ -4391,7 +4464,7 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
 
     let t = translate(&code, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&code, &on_gpu(Options { mem_windows: 2, ..Default::default() }), super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap());
 
     let mut st = KernelState::default();
     st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
@@ -5943,13 +6016,14 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
     for dims in [[256u32, 1, 1], [8, 8, 4]] {
         let threads = dims.iter().product::<u32>();
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() {
             assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
             assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
         }
-        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
         io[0] = base as u32;
@@ -6021,12 +6095,13 @@ fn gpu_split_wave64_waves_diverge() {
     for dims in [[256u32, 1, 1], [64, 1, 1], [8, 8, 4], [16, 4, 1]] {
         let threads = dims.iter().product::<u32>();
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
         }
-        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
         io[0] = base as u32;
@@ -6098,12 +6173,13 @@ fn bench_split_wave64() {
             let mut exchanges = 0;
             for wave64 in [false, true] {
                 let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
-                let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+                let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+                let t = translate(&p, &opt).unwrap();
                 // the loop's exchanges: masks read whole (`x64_masks`: not the v_cndmask
                 // selector, unless `XCL_X64_ALL_MASKS`) and the readfirstlane
                 exchanges = t.hlsl.matches("= xcl_x_ballot(and(").count() + t.hlsl.matches("xcl_x_rla_uniform(").count().saturating_sub(1);
                 assert!(t.complete(), "{:?}", t.unsupported_why);
-                let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+                let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
                 let groups = (1u32 << 18) / threads;
                 let mut io = vec![0u32; 128];
                 io[0] = 0;
@@ -6677,7 +6753,7 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
 
     let mut st = KernelState::default();
     st.sgpr[127] = 0;
@@ -6793,7 +6869,7 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
 
     // (f32 bits, RNE, RTZ, +inf, -inf)
     let cases: &[(u32, u16, u16, u16, u16)] = &[
@@ -6940,7 +7016,7 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
         let code = prog(&insns);
         let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
         assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let dxil = direct_or(&code, &Options { wave64, split_wave64, ..Default::default() }, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
         let mut st = KernelState::default();
         let lanes = if wave64 { 64 } else { 32 };
         for (l, r) in st.vgpr.iter_mut().take(lanes).enumerate() {
@@ -7451,4 +7527,141 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
+/// inner loops, loops whose end is an inner loop's – give the same state as structured code and as
+/// the block dispatcher (`structured: false`).
+#[test]
+fn jumps_to_outer_loop_heads_are_structured() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = move |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 11) % n
+    };
+    /// (loop head, jumps to its end and into its middle to be filled in)
+    struct Open {
+        head: usize,
+        ends: Vec<usize>,
+        entries: Vec<usize>,
+    }
+    let (mut structured, mut ran, mut entered) = (0, 0, 0);
+    for round in 0..120 {
+        let mut code: Vec<u8> = Vec::new();
+        let mut open: Vec<Open> = Vec::new();
+        // s20: steps left – every backward jump is taken only while there are some; s0 - s3: state
+        let work = |code: &mut Vec<u8>, k: u64| {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", k % 4), ("SSRC0", k % 4), ("SSRC1", 129 + k % 7)]));
+            code.extend(i("S_XOR_B32", "ENC_SOP2", &[("SDST", (k + 1) % 4), ("SSRC0", (k + 1) % 4), ("SSRC1", k % 4)]));
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1 + k % 3), ("SRC0", k % 4), ("VSRC1", 1 + k % 3)]));
+        };
+        // a step used up; SCC = some left and a bit of the state
+        let test = |code: &mut Vec<u8>, bit: u64| {
+            code.extend(i("S_SUB_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 129)]));
+            code.extend(i("S_LSHR_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", bit % 4), ("SSRC1", 128 + bit % 3)]));
+            code.extend(i("S_AND_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 21), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_GT_I32", "ENC_SOPC", &[("SSRC0", 20), ("SSRC1", 128)]));
+            code.extend(i("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 21), ("SSRC1", 128)]));
+            code.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 21), ("SSRC1", 128)]));
+        };
+        let branch = |code: &mut Vec<u8>, name: &str, to: Option<usize>| -> usize {
+            let at = code.len();
+            let d = to.map_or(0, |t| (t as i64 - at as i64) / 4 - 1);
+            code.extend(i(name, "ENC_SOPP", &[("SIMM16", d as u64 & 0xFFFF)]));
+            at
+        };
+        let patch = |code: &mut Vec<u8>, at: usize| {
+            let d = ((code.len() - at) / 4 - 1) as u16;
+            code[at..at + 2].copy_from_slice(&d.to_le_bytes());
+        };
+        for _ in 0..(8 + rnd(14)) {
+            let k = rnd(1000);
+            work(&mut code, k);
+            match rnd(10) {
+                0..=2 if open.len() < 4 => {
+                    // half of them entered in their middle by a jump from before
+                    let mut entries = vec![];
+                    if rnd(2) == 0 {
+                        test(&mut code, k + 1);
+                        entries.push(branch(&mut code, "S_CBRANCH_SCC1", None));
+                        work(&mut code, k + 2);
+                    }
+                    open.push(Open { head: code.len(), ends: vec![], entries });
+                }
+                8 | 9 if open.last().is_some_and(|o| !o.entries.is_empty()) => {
+                    for at in std::mem::take(&mut open.last_mut().unwrap().entries) {
+                        patch(&mut code, at);
+                        entered += 1;
+                    }
+                    work(&mut code, k + 3);
+                }
+                3 | 4 if !open.is_empty() => {
+                    // conditional `continue` of any loop around
+                    let l = rnd(open.len() as u64) as usize;
+                    test(&mut code, k);
+                    let head = open[l].head;
+                    branch(&mut code, "S_CBRANCH_SCC1", Some(head));
+                }
+                5 if !open.is_empty() => {
+                    // conditional `break` of any loop around
+                    let l = rnd(open.len() as u64) as usize;
+                    test(&mut code, k);
+                    let at = branch(&mut code, "S_CBRANCH_SCC1", None);
+                    open[l].ends.push(at);
+                }
+                6 | 7 if !open.is_empty() => {
+                    // the innermost loop ends, with a back edge of its own or without
+                    let o = open.pop().unwrap();
+                    for at in o.entries {
+                        patch(&mut code, at);
+                        work(&mut code, k + 4);
+                    }
+                    if rnd(3) > 0 {
+                        test(&mut code, k);
+                        branch(&mut code, "S_CBRANCH_SCC1", Some(o.head));
+                    }
+                    for at in o.ends {
+                        patch(&mut code, at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        while let Some(o) = open.pop() {
+            for at in o.entries {
+                patch(&mut code, at);
+                work(&mut code, 4);
+            }
+            test(&mut code, 3);
+            branch(&mut code, "S_CBRANCH_SCC1", Some(o.head));
+            for at in o.ends {
+                patch(&mut code, at);
+            }
+        }
+        work(&mut code, 5);
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
+        let (a, b) = (t(true), t(false));
+        assert!(a.complete() && b.complete(), "{:?}", a.unsupported_why);
+        structured += !a.hlsl.contains("if (pc ==") as usize;
+        if !gpu_waves().contains(&true) {
+            continue;
+        }
+        ran += 1;
+        let mut st = KernelState::default();
+        for k in 0..4 {
+            st.sgpr[k] = rnd(1 << 16) as u32;
+        }
+        st.sgpr[20] = 60;
+        let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let run = |h: &str| runner::run(&super::dxc::compile(h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}")), &st, &mem).unwrap();
+        let (u, w) = (run(&a.hlsl), run(&b.hlsl));
+        assert_eq!((&u.sgpr[..24], u.scc), (&w.sgpr[..24], w.scc), "round {round}\n{}", a.hlsl);
+        assert_eq!(u.vgpr, w.vgpr, "round {round}");
+    }
+    println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
+    assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }

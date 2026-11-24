@@ -81,6 +81,49 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
 
 const V: u64 = 256; // VALU source code of v0
 
+#[test]
+fn offline_compute_pipeline_is_reused_by_a_second_process() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU with 32- or 64-lane waves");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-offline-pso-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("kernel.bin"), console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1])).unwrap();
+    let run = |enabled: bool| {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
+            .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    run(false);
+    assert!(!cache.join("driver").exists());
+    run(true);
+    let dxil_file = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
+    let dxil = fs::read(dxil_file).unwrap();
+    let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
+    let driver_file = cache.join("driver").join(name);
+    assert!(driver_file.metadata().unwrap().len() > 0);
+    let warm = run(true);
+    // A blob from an earlier driver can be refused. The normal build must still succeed.
+    fs::write(&driver_file, b"invalid cached pipeline").unwrap();
+    run(true);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.
@@ -135,7 +178,12 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
     let raw = real::device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
     println!("backend device: {}", real::stats().adapter);
+    mirror_program_through_the_hook(&dev);
+}
 
+/// Hand the wave64 mirror program to the CreateComputePipelineState hook, dispatch the
+/// pipeline it built and check every thread's output.
+fn mirror_program_through_the_hook(dev: &ID3D12Device) {
     // user SGPRs 2, TGID_X + TGID_Y, thread ids v0 + v1
     let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
     assert!(xcl::gpu::xbox::is_xbox(&blob), "expected a console container");
@@ -180,6 +228,43 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
             assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
         }
     }
+}
+
+/// A driver that refuses a pipeline with heap windows (E_OUTOFMEMORY, as NVIDIA 616.92 does
+/// with some big retail programs, #156) gets the program again in the switch form, and the
+/// pipeline from it runs correctly. The refusals are injected (`real::inject_heap_window_oom`).
+#[test]
+fn heap_window_out_of_memory_falls_back_to_the_switch_form() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        println!("no real D3D12 device – skipping");
+        runner::skip_test("no GPU");
+        return;
+    }
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+    if xcl::gpu::recomp::pso::mem_windows() & xcl::gpu::recomp::HEAP_WINDOWS == 0 {
+        println!("no heap windows (opt-in: XCL_HEAP_WINDOWS=1; or no shared heap) – skipping");
+        runner::skip_test("no heap windows");
+        return;
+    }
+    struct StopInjecting;
+    impl Drop for StopInjecting {
+        fn drop(&mut self) {
+            real::inject_heap_window_oom(0);
+        }
+    }
+    let _stop = StopInjecting;
+    // every heap-window build fails, also the background one behind a stand-in
+    real::inject_heap_window_oom(u64::MAX);
+    let before = real::switch_form_retries();
+    mirror_program_through_the_hook(&dev);
+    assert!(real::switch_form_retries() > before, "the pipeline was not rebuilt in the switch form");
 }
 
 /// Cold DXIL cache: `CreateComputePipelineState` returns a stand-in immediately and compiles

@@ -171,6 +171,8 @@ fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
 pub fn write_final(crash: Option<String>) {
     // the process ends: a cursor held in the XCL window is let go
     crate::hle::kbm::release();
+    // `XCL_DIRECT_DXIL_STATS=1`: the direct DXIL translator's live fallback summary
+    crate::gpu::dxil::coverage::dump_fallbacks();
     // a crash is kept even while another thread writes the report, and is written once that
     // thread is done – the process ends right after (#106); other calls give way at once
     let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };

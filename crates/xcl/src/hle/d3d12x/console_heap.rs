@@ -27,6 +27,7 @@
 
 use std::sync::Mutex;
 
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// bytes of a CBV/SRV/UAV slot (T# / V#) and of a sampler slot (S#)
@@ -157,11 +158,48 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            next: 0,
+            // the memory windows' raw UAVs (`set_window_views`) come first
+            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32,
             free: Vec::new(),
         });
     }
     true
+}
+
+static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the memory windows could not be put in the shared heap (`set_window_views`):
+/// translated shaders then switch over root UAVs (`pso::heap_windows`).
+pub fn window_views_failed() -> bool {
+    WINDOW_VIEWS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
+/// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
+/// A window without a buffer gets window 0's. False (and the shaders keep the switch): no
+/// shared heap.
+pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
+    let ok = !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
+        let (device, cpu, inc) = {
+            let g = GLOBAL.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            (s.dev.clone(), s.cpu, s.inc)
+        };
+        // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
+        for k in 0..crate::gpu::uma::MAX_WINDOWS {
+            let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
+            let raw = raw as *mut std::ffi::c_void;
+            let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
+            device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
+        }
+        true
+    };
+    if !ok {
+        WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::xlog_warn!("memory windows: not in the shared descriptor heap – translated shaders switch over the windows' root UAVs");
+    }
+    ok
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
@@ -502,6 +540,52 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    #[test]
+    fn window_views_do_not_hold_global_during_device_calls() {
+        const CHILD: &str = "XCL_TEST_WINDOW_VIEWS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::window_views_do_not_hold_global_during_device_calls", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static UNLOCKED: AtomicBool = AtomicBool::new(true);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn create_uav(_this: *mut c_void, _resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, _at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            // The adopted device hook can re-enter descriptor bookkeeping.
+            UNLOCKED.fetch_and(GLOBAL.try_lock().is_ok(), Ordering::Relaxed);
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut vt = [0usize; 20];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[19] = create_uav as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        let mut heap = Object { vt: vt.as_ptr() };
+        let mut resource = Object { vt: vt.as_ptr() };
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: dev.clone(),
+                heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
+                next: crate::gpu::uma::MAX_WINDOWS as u32, free: Vec::new(),
+            });
+            assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)]));
+            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
+            *GLOBAL.lock().unwrap() = None;
+        }
     }
 
     #[test]

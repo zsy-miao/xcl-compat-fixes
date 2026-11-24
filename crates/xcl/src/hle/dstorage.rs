@@ -619,7 +619,8 @@ unsafe extern "system" fn factory_create_status_array(_p: *mut c_void, capacity:
     if capacity == 0 || capacity > 1 << 20 {
         return E_INVALIDARG;
     }
-    let inner = Arc::new(StatusInner { slots: (0..capacity).map(|_| AtomicI32::new(E_PENDING)).collect() });
+    // a slot nothing was enqueued into is complete (S_OK); EnqueueStatus makes it E_PENDING
+    let inner = Arc::new(StatusInner { slots: (0..capacity).map(|_| AtomicI32::new(S_OK)).collect() });
     let o = new_object(status_vtbl(), inner);
     let hr = status_qi(o, riid, out);
     status_release(o);
@@ -975,8 +976,9 @@ enum Entry {
         dest_pages: Option<Vec<usize>>,
         src_pages: Option<Vec<usize>>,
     },
-    /// refused at enqueue: reported in queue order by the worker
+    /// refused at enqueue: reported in queue order by the worker (unless cancelled, as a request)
     Refused {
+        seq: u64,
         hr: HRESULT,
         req: Request,
         file: Option<Arc<FileInner>>,
@@ -1110,7 +1112,11 @@ impl QueueInner {
                             }
                         }
                     }
-                    Entry::Refused { hr, req, file, fill } => {
+                    Entry::Refused { seq, hr, req, file, fill } => {
+                        // a cancelled request is no failure, refused or not
+                        if self.is_cancelled(seq, req.tag) {
+                            continue;
+                        }
                         if let Some(t) = &fill {
                             // the destination gets solid blocks; the request still fails
                             unsafe { bcpack_fill(&req, t) };
@@ -1159,6 +1165,15 @@ impl QueueInner {
     }
 
     fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
+        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, src_pages });
+    }
+
+    /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
+    fn enqueue_refused(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>) {
+        self.enqueue_numbered(|seq| Entry::Refused { seq, hr, req, file, fill });
+    }
+
+    fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
         let n = {
             let mut p = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
@@ -1166,7 +1181,7 @@ impl QueueInner {
             }
             let seq = p.next_seq;
             p.next_seq += 1;
-            p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
+            p.entries.push(entry(seq));
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
@@ -1296,7 +1311,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 };
             }
         }
-        return q.enqueue(Entry::Refused { hr, req: r, file: None, fill });
+        return q.enqueue_refused(hr, r, None, fill);
     }
     let file = if r.memory_source() {
         None
@@ -1305,7 +1320,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         let f = r.source as *mut c_void;
         let mut vt = 0usize;
         if !read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) || vt != file_vtbl().as_ptr() as usize {
-            return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None, fill: None });
+            return q.enqueue_refused(E_FILE_HANDLE, r, None, None);
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
@@ -1313,7 +1328,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.enqueue_refused(hr, r, file, None);
             }
         }
     } else {
@@ -1323,7 +1338,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.enqueue_refused(hr, r, file, None);
             }
         }
     } else {
@@ -1372,7 +1387,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let q = queue(p);
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
-        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } if req.tag & mask == value));
+        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1429,7 +1444,8 @@ unsafe extern "system" fn queue_get_error_event(p: *mut c_void) -> HANDLE {
 
 /// DSTORAGE_ERROR_RECORD (0x290): failure count u32 @0, then the first failure: HRESULT @8,
 /// command type @0xC (none: 0xFFFFFFFF), the request's options @0x10, destination @0x18 and
-/// size @0x20, its file name @0x24 (0x104 UTF-16) or memory source @0x238
+/// size @0x20, its file name @0x24 (0x104 UTF-16) and file offset @0x230 or memory source @0x238,
+/// source size @0x240, cancellation tag @0x248 (name @0x250 not kept)
 unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut u8) {
     if out.is_null() {
         return;
@@ -1452,7 +1468,10 @@ unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut 
                     for (i, c) in f.file.iter().take(0x103).enumerate() {
                         rec[0x24 + 2 * i..0x26 + 2 * i].copy_from_slice(&c.to_le_bytes());
                     }
+                    rec[0x230..0x238].copy_from_slice(&f.request.offset.to_le_bytes());
                 }
+                rec[0x240..0x244].copy_from_slice(&f.request.source_size.to_le_bytes());
+                rec[0x248..0x250].copy_from_slice(&f.request.tag.to_le_bytes());
             }
             None => rec[0xC..0x10].copy_from_slice(&NO_COMMAND.to_le_bytes()),
         }
@@ -1734,6 +1753,73 @@ mod tests {
         }
     }
 
+    /// A request refused at enqueue (here a file source on a memory queue) and
+    /// then cancelled by tag – submitted or still pending – is no failure: "a cancelled request
+    /// is not counted as a failure in either IDStorageStatusArray or DSTORAGE_ERROR_RECORD".
+    /// One with a tag the cancel does not match, or enqueued after it, still fails.
+    #[test]
+    fn a_refused_request_that_is_cancelled_is_no_failure() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory queue
+            desc[8..10].copy_from_slice(&32u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 3, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let cancel: unsafe extern "system" fn(*mut c_void, u64, u64) = std::mem::transmute(*qv.add(7));
+            let record: unsafe extern "system" fn(*mut c_void, *mut u8) = std::mem::transmute(*qv.add(10));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // a file source on this memory queue: refused at enqueue with E_SOURCE_TYPE
+            let not_a_file = [0usize; 2];
+            let mut dst = [0u8; 4];
+            let dst_ptr = dst.as_mut_ptr() as u64;
+            let refused = |tag: u64| request_ex(0, dst_ptr, 0, 4, not_a_file.as_ptr() as u64, 0, 4, 0, tag);
+
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            queue(q).enqueue(Entry::Gate(Arc::clone(&gate)));
+            enqueue(q, refused(0x1001).as_ptr()); // submitted, cancelled below
+            status(q, s, 0);
+            submit(q);
+            enqueue(q, refused(0x1002).as_ptr()); // pending, cancelled below
+            enqueue(q, refused(0x2001).as_ptr()); // pending, another tag: still fails
+            status(q, s, 1);
+            cancel(q, 0xF000, 0x1000);
+            enqueue(q, refused(0x1003).as_ptr()); // after the cancel: still fails
+            status(q, s, 2);
+            submit(q);
+            gate.wait();
+            let t = std::time::Instant::now();
+            while !complete(s, 2) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s, 0) && complete(s, 1) && complete(s, 2));
+            assert_eq!(hresult(s, 0), S_OK, "the cancelled submitted request is no failure");
+            assert_eq!(hresult(s, 1), E_SOURCE_TYPE, "the cancelled pending one is none; the other tag is one");
+            assert_eq!(hresult(s, 2), E_SOURCE_TYPE, "enqueued after the cancel");
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 2, "two failures: tag 0x2001 and the one after the cancel");
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
     #[test]
     fn multi_stage_intermediate_size_validation_and_zlib() {
         // Validation matrix for Request::check
@@ -1889,6 +1975,57 @@ mod tests {
         }
     }
 
+    /// The first failure carries the request's file offset, source size and cancellation tag
+    /// (DSTORAGE_ERROR_FIRST_FAILURE @0x230 / 0x240 / 0x248), not only its destination and file.
+    #[test]
+    fn error_record_has_the_failed_requests_offset_source_size_and_tag() {
+        unsafe {
+            let path = std::env::temp_dir().join(format!("xcl-dstorage-error-record-{}.bin", std::process::id()));
+            std::fs::write(&path, [0u8; 8]).unwrap();
+            let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain(Some(0)).collect();
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let open_file: unsafe extern "system" fn(*mut c_void, *const u16, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(4));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut file = std::ptr::null_mut();
+            assert_eq!(open_file(f, wide.as_ptr(), &IID_FILE, &mut file), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // 16 bytes at 0x100 of an 8-byte file
+            let mut dst = [0u8; 16];
+            queue_enqueue_request(q, request_ex(0, dst.as_mut_ptr() as u64, 0, 16, file as u64, 0x100, 16, 0, 0xABCD).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 0) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_ne!(status_get_hresult(s, 0), S_OK);
+
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            queue_retrieve_error_record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(rec[0x20..0x24].try_into().unwrap()), 16);
+            assert_eq!(u64::from_le_bytes(rec[0x230..0x238].try_into().unwrap()), 0x100, "FileOffset");
+            assert_eq!(u32::from_le_bytes(rec[0x240..0x244].try_into().unwrap()), 16, "SourceSize");
+            assert_eq!(u64::from_le_bytes(rec[0x248..0x250].try_into().unwrap()), 0xABCD, "CancellationTag");
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+            file_release(file);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     #[test]
     fn queue_release_concurrent_breaks_worker_cycle() {
         unsafe {
@@ -1977,6 +2114,23 @@ mod tests {
             assert!(queue(q).worker.lock().unwrap().is_none());
 
             queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A slot nothing was enqueued into is complete with S_OK, so a title that waits for
+    /// IsComplete before (re)using a slot does not wait forever on its first use.
+    #[test]
+    fn a_new_status_array_slot_is_complete() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 4, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            assert!(status_is_complete(s, 3));
+            assert_eq!(status_get_hresult(s, 3), S_OK);
             status_release(s);
         }
     }

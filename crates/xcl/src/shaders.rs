@@ -715,7 +715,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
+        let windows = opt("--windows").unwrap_or(4) as u32;
+        let windows = if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows };
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+    }
+    if args.iter().any(|a| a == "--direct") {
+        return direct_sweep(&input, args, top, json, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -734,14 +740,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
-/// ABI root signature with its static samplers): the driver keeps what it compiled in its own
-/// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
-/// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
+/// ABI root signature with its static samplers). Save the driver's compiled blob in the same
+/// cache the runtime reads at startup. Nothing runs on the GPU.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
+    reused: AtomicUsize,
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
@@ -761,7 +767,7 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
         }
     }
 
@@ -785,7 +791,7 @@ impl Pipelines {
                 },
             }
         };
-        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
@@ -797,7 +803,30 @@ impl Pipelines {
             }
             *n += 1;
         }
-        let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
+        use crate::hle::d3d12x::real::driver_cache;
+        let path = driver_cache::path(&c.dxil, desc.Flags.0);
+        let cached = path.as_deref().and_then(driver_cache::load);
+        let from_cache = cached.as_ref().and_then(|bytes| {
+            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
+            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
+        });
+        let r = if let Some(pso) = from_cache {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            Ok(pso)
+        } else {
+            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
+                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                    let len = unsafe { blob.GetBufferSize() };
+                    if !bytes.is_null() && len != 0 {
+                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+                    }
+                }
+            }
+            pso
+        };
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -837,9 +866,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
-        "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
+        "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
+        windows & !recomp::HEAP_WINDOWS,
+        if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     std::thread::scope(|s| {
@@ -934,6 +965,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     );
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
@@ -1292,4 +1324,131 @@ fn name_hash(name: &str) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+/// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
+/// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
+/// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
+/// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
+fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std::time::Instant) -> i32 {
+    use crate::gpu::dxil::coverage::{self, Report, Sample};
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
+    let want = opt("--sample").map(|v| v as usize).unwrap_or(200);
+    let want = if want == 0 { usize::MAX } else { want };
+    let seed = opt("--seed").unwrap_or(1);
+    let validate = args.iter().any(|a| a == "--validate");
+    let compare = args.iter().any(|a| a == "--compare");
+    let windows = opt("--windows").unwrap_or(4) as u32;
+    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    // records hold one or more programs: sample records, stop at `want` programs
+    let order = coverage::sample_indices(input.len(), want, seed);
+    let next = AtomicUsize::new(0);
+    let taken = AtomicUsize::new(0);
+    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    let trace = args.iter().any(|a| a == "--trace");
+    // big programs translate slowly (SSA over every guarded access): skip above the cap,
+    // give up on one after the timeout (its thread is left to finish; the process ends soon)
+    let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
+    let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
+    let skipped = AtomicUsize::new(0);
+    // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
+    // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
+    // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
+    let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    if let Some(d) = &dump_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let (order, want, max_bytes) = if only_hash.is_some() { ((0..input.len()).collect(), usize::MAX, 0) } else { (order, want, max_bytes) };
+    // translator panics are counted, not printed (`--trace` keeps the messages)
+    if !trace {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+    let results: Mutex<Vec<(String, Sample)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&ri) = order.get(i) else { break };
+                if taken.load(Ordering::Relaxed) >= want {
+                    break;
+                }
+                let (name, Some(blob)) = input.get(ri) else { continue };
+                let blob_hash = crate::gpu::shader::fnv64(&blob);
+                if only_hash.is_some_and(|h| h != blob_hash) {
+                    continue;
+                }
+                let Some(sh) = xbox::parse(&blob) else { continue };
+                for (fi, f) in sh.fssm.iter().enumerate() {
+                    let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    for p in &f.programs {
+                        if taken.fetch_add(1, Ordering::Relaxed) >= want {
+                            return;
+                        }
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        if max_bytes > 0 && code.len() > max_bytes {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let wave64 = recomp::detect_wave64(code);
+                        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows: windows, sampler_base: 0 };
+                        if trace {
+                            eprintln!("direct: {name} FSSM#{fi} ({} B, {})", code.len(), coverage::stage_name(&mode));
+                        }
+                        let t = std::time::Instant::now();
+                        let r = {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (c, m) = (code.to_vec(), mode.clone());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                            });
+                            rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
+                        };
+                        let time = t.elapsed();
+                        let dump = |suffix: &str, bytes: &[u8]| {
+                            if let Some(d) = &dump_dir {
+                                let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
+                            }
+                        };
+                        dump("guest.bin", code);
+                        match &r {
+                            Ok(dxil) => dump("direct.dxil", dxil),
+                            Err(e) => dump("direct.err.txt", e.as_bytes()),
+                        }
+                        let hlsl_size = (compare && r.is_ok())
+                            .then(|| {
+                                let profile = match mode {
+                                    recomp::Mode::Vertex(_) => "vs_6_6",
+                                    recomp::Mode::Pixel(_) => "ps_6_6",
+                                    _ => "cs_6_6",
+                                };
+                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
+                                let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
+                                dump("hlsl", t.hlsl.as_bytes());
+                                let d = recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok()?;
+                                dump("hlsl.dxil", &d);
+                                Some(d.len())
+                            })
+                            .flatten();
+                        let sample = Sample { stage: coverage::stage_name(&mode), result: r.map(|d| d.len()), time, hlsl_size };
+                        results.lock().unwrap().push((format!("{name} FSSM#{fi}"), sample));
+                    }
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut rep = Report::default();
+    for (name, s) in &results {
+        rep.add(name, s);
+    }
+    if json {
+        println!("{}", rep.json(top));
+    } else {
+        println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
+        print!("{}", rep.text(top));
+        println!("time {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    0
 }

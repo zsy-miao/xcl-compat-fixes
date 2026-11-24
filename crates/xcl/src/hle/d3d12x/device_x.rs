@@ -686,6 +686,18 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d
 }
 
+/// The PC initial state of a resource the console creates in `state` with resource flags
+/// `flags`: the PC's state bits only (console-only ones made the PC refuse it, E_INVALIDARG),
+/// and a depth buffer created for unordered access – no longer one on the PC
+/// (`pc_resource_desc`), which refuses UNORDERED_ACCESS without the flag – written as depth.
+pub fn pc_initial_state(flags: u32, state: u32) -> u32 {
+    let state = state & real::PC_RESOURCE_STATES;
+    if flags & 2 != 0 && state & 0x8 != 0 {
+        return (state & !0x8) | 0x10;
+    }
+    state
+}
+
 /// The PC format of a view, pipeline or clear value in the console's D16_UNORM_S8_UINT family:
 /// D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT (`pc_resource_desc` makes such
 /// resources R24G8_TYPELESS).
@@ -766,10 +778,9 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
     let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
     type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
     let pc: F = std::mem::transmute(real::orig_fn(this, 25));
-    let (mut size, mut align) = (0u64, 0u64);
-    for k in 0..n as usize {
+    let parts = (0..n as usize).map(|k| {
         let x = if descs.is_null() { [0u8; 0x38] } else { descs.add(k).read_unaligned() };
-        let (s, a) = match crate::hle::xg::Texture::new(&x).ok().filter(|_| u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32) {
+        match crate::hle::xg::Texture::new(&x).ok().filter(|_| u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32) {
             Some(t) => (t.size(), t.alignment()),
             None => {
                 let d = pc_resource_desc(&x);
@@ -777,18 +788,37 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
                 pc(this, &mut r, mask, 1, &d);
                 (r[0], r[1])
             }
-        };
-        if s == u64::MAX || a == 0 {
-            size = u64::MAX;
-            break;
         }
-        size = size.div_ceil(a) * a + s;
-        align = align.max(a);
-    }
+    });
+    let (size, align) = allocation_of(parts, |_, _, _, _| {});
     if !ret.is_null() {
         *ret = [size, align];
     }
     ret
+}
+
+/// The {size, alignment} of resources of these {size, alignment}s laid out one after another,
+/// as GetResourceAllocationInfo does for several: each at a multiple of its own alignment, the
+/// whole padded to the largest – a C++ structure's layout (the PC's docs: 64 KiB-, 4 MiB- and
+/// 64 KiB-aligned resources take 12 MiB). `placed(index, offset, size, alignment)` for each; a
+/// size u64::MAX (or no alignment) stops there with size u64::MAX.
+fn allocation_of(parts: impl IntoIterator<Item = (u64, u64)>, mut placed: impl FnMut(usize, u64, u64, u64)) -> (u64, u64) {
+    let (mut size, mut align, mut n) = (0u64, 0u64, 0);
+    for (k, (s, a)) in parts.into_iter().enumerate() {
+        if s == u64::MAX || a == 0 {
+            return (u64::MAX, align);
+        }
+        let offset = size.next_multiple_of(a);
+        placed(k, offset, s, a);
+        size = offset + s;
+        align = align.max(a);
+        n += 1;
+    }
+    // (one resource: its own size, as the driver or XG gives it)
+    if n > 1 {
+        size = size.next_multiple_of(align);
+    }
+    (size, align)
 }
 
 /// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
@@ -797,23 +827,18 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
 pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
     real::note_newer_device_method(108);
     let ret = if real::this_first(a, b) { b } else { a } as *mut [u64; 2];
-    let (mut size, mut align) = (0u64, 0u64);
-    for k in 0..n as usize {
+    let parts = (0..n as usize).map(|k| {
         let mut r = [0u64; 2];
         let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
         let (x, y) = if real::this_first(a, b) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
         get_resource_allocation_info_x(x, y, mask, 1, d);
-        if r[0] == u64::MAX || r[1] == 0 {
-            size = u64::MAX;
-            break;
-        }
-        let offset = size.next_multiple_of(r[1]);
+        (r[0], r[1])
+    });
+    let (size, align) = allocation_of(parts, |k, offset, s, a| {
         if !infos.is_null() {
-            *infos.add(k) = [offset, r[1], r[0]];
+            *infos.add(k) = [offset, a, s];
         }
-        size = offset + r[0];
-        align = align.max(r[1]);
-    }
+    });
     if !ret.is_null() {
         *ret = [size, align];
     }
@@ -866,11 +891,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
-    let mut state = state & real::PC_RESOURCE_STATES;
-    // (a depth buffer placed for unordered access – no longer one on the PC: written as depth)
-    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 && state & 0x8 != 0 {
-        state = (state & !0x8) | 0x10;
-    }
+    let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
     let mut clear_buf = [0u8; 24];
     let clear = pc_clear(clear, &mut clear_buf);
     if buffer {
@@ -1042,6 +1063,61 @@ mod tests {
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
     }
 
+    /// A depth buffer the console also lets shaders write loses ALLOW_UNORDERED_ACCESS on the PC
+    /// (`pc_resource_desc`), so it cannot start in UNORDERED_ACCESS there: it starts as depth.
+    #[test]
+    fn depth_buffers_created_for_unordered_access_start_as_depth() {
+        assert_eq!(pc_initial_state(0x6, 0x8), 0x10); // DEPTH_STENCIL | UNORDERED_ACCESS
+        assert_eq!(pc_initial_state(0x8030_0006, 0x8), 0x10); // with console flag bits
+        assert_eq!(pc_initial_state(0x2, 0x10_0008), 0x10); // console state bits dropped
+        assert_eq!(pc_initial_state(0x4, 0x8), 0x8); // not a depth buffer: a UAV stays one
+        assert_eq!(pc_initial_state(0x2, 0x20), 0x20); // depth read: as it is
+        assert_eq!(pc_initial_state(0x2, 0x10_0000), 0);
+        assert_eq!(pc_initial_state(0, 0x10_0004), 0x4);
+    }
+
+    /// GPU: a 256x256 D16 depth buffer the console creates for unordered access too, in
+    /// UNORDERED_ACCESS, is placed on the PC as its description and initial state say; the state
+    /// with only the console's bits dropped is refused (the depth buffer has no UAV flag there).
+    #[test]
+    fn gpu_depth_buffer_created_for_unordered_access_is_placed() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&3u32.to_le_bytes()); // texture 2D
+            x[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&256u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&55u32.to_le_bytes()); // D16_UNORM
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&6u32.to_le_bytes()); // DEPTH_STENCIL | UNORDERED_ACCESS
+            let d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(pc_resource_desc(&x).as_ptr() as *const _);
+            let info = dev.GetResourceAllocationInfo(0, &[d]);
+            assert_ne!(info.SizeInBytes, u64::MAX);
+            let heap_desc = D3D12_HEAP_DESC {
+                SizeInBytes: info.SizeInBytes.next_multiple_of(info.Alignment),
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: info.Alignment,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&heap_desc, &mut heap).expect("heap");
+            let heap = heap.unwrap();
+            let place = |state: u32| {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreatePlacedResource(&heap, 0, &d, D3D12_RESOURCE_STATES(state as i32), None, &mut r).map(|_| r)
+            };
+            assert!(place(0x8 & real::PC_RESOURCE_STATES).is_err(), "UNORDERED_ACCESS without the UAV flag");
+            let state = pc_initial_state(6, 0x8);
+            assert_eq!(state, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+            let r = place(state).unwrap_or_else(|e| panic!("placed in {state:#x}: {e}"));
+            assert!(r.is_some());
+        }
+    }
+
     /// Console depth buffers become PC ones a shader can view: typeless, the D16S8 family as
     /// D24S8, no UAV flag; views get the family's readable formats (stencil from plane 1).
     #[test]
@@ -1159,5 +1235,26 @@ mod tests {
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), S_OK);
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), E_FAIL);
         }
+    }
+
+    /// Several resources' allocation info: each at its alignment, the total padded to the largest
+    /// (the PC's docs: the 4 MiB-aligned one in the middle takes 12 MiB, first 8 MiB).
+    #[test]
+    fn allocation_info_of_several_is_padded_to_the_largest_alignment() {
+        const K64: u64 = 0x1_0000;
+        const M4: u64 = 0x40_0000;
+        let mut offsets = Vec::new();
+        assert_eq!(allocation_of([(K64, K64), (M4, M4), (K64, K64)], |k, o, s, a| offsets.push((k, o, s, a))), (3 * M4, M4));
+        assert_eq!(offsets, [(0, 0, K64, K64), (1, M4, M4, M4), (2, 2 * M4, K64, K64)]);
+        assert_eq!(allocation_of([(M4, M4), (K64, K64), (K64, K64)], |_, _, _, _| {}), (2 * M4, M4));
+        assert_eq!(allocation_of([(K64, K64), (K64, K64), (M4, M4)], |_, _, _, _| {}), (2 * M4, M4));
+        // one resource: its own info, as the PC driver or XG gives it
+        assert_eq!(allocation_of([(0x1000, K64)], |_, _, _, _| {}), (0x1000, K64));
+        assert_eq!(allocation_of([(M4, M4)], |_, _, _, _| {}), (M4, M4));
+        // one that fails: u64::MAX, nothing after it placed
+        let mut placed = 0;
+        assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, K64));
+        assert_eq!(placed, 1);
+        assert_eq!(allocation_of(std::iter::empty(), |_, _, _, _| {}), (0, 0));
     }
 }

@@ -1,0 +1,1 @@
+float4 main(nointerpolation uint a : A, bool ff : SV_IsFrontFace, nointerpolation uint b : B, float c : C, float2 d : D, nointerpolation float e : E, uint si : SV_SampleIndex, float4 p : SV_Position, nointerpolation int h : H, uint4 rest : REST) : SV_Target { return a + ff + b + c + d.x + e + si + p.x + h; }
