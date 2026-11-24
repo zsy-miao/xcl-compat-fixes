@@ -4463,11 +4463,12 @@ unsafe fn unsupported_console_mesh_stream(desc: *const c_void) -> Option<String>
     let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
     if !crate::gpu::shader::readable(base, size) { return None; }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1))?;
+    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    if ms_slot.is_none() && is_console(as_slot) && crate::gpu::xbox::parse(as_slot).is_some_and(|sh| sh.stage == "MS") {
-        return Some(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(as_slot)));
-    }
+    // #541 handles a sole console MS in the AS slot. Keep the earlier guard only for
+    // the genuinely combined layout, before a stand-in could discard its AS.
+    let (ms_slot, as_slot) = mesh_shader_slots(ms_slot, as_slot);
+    let as_slot = as_slot?;
     if let Some(ms) = ms_slot.filter(|ms| is_console(ms)) {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
         return Some(format!("mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}", crate::gpu::shader::fnv64(as_slot), crate::gpu::shader::fnv64(ms)));

@@ -2897,6 +2897,35 @@ fn gpu_mesh_mode_two_passes() {
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
     let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
+
+    // #304's wide-output boundary, including one compact group: run the same actual NGG
+    // compute program, compare every pixel and every record word to the narrow control.
+    let wide_inputs: Vec<crate::gpu::dxbc::SigElement> = (0..21).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
+    let fields: String = (0..21).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
+    let wide_ps = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t20; }}\n"), "main", "ps_6_6", &[]).unwrap();
+    for (shape, expected_groups, declaration) in [
+        (ms.clone(), 7, "verts[57]"),
+        (MsInterface { max_vertices: 80, max_primitives: 1, ..ms.clone() }, 1, "verts[3]"),
+    ] {
+        let groups = super::emit::passthrough_split(&shape, super::emit::passthrough_elements(&shape, Some(&wide_inputs)));
+        assert_eq!(groups, expected_groups);
+        let pass = super::emit::mesh_passthrough_for(&shape, Some(&wide_inputs));
+        assert!(pass.contains(declaration), "wide compact declaration: {pass}");
+        let mesh = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap();
+        let tr = translate(&code, &on_gpu(Options { mode: Mode::Mesh(shape.clone()), wave64: true, ..Default::default() })).unwrap();
+        assert!(tr.complete(), "{:?}", tr.unsupported_why);
+        let compute = dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let (pixels, records) = runner::mesh_draw_split(&compute, &mesh, &wide_ps, 2, groups, shape.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+        assert_eq!(pixels, px, "all 1024 pixels match, including both triangles and background");
+        let mut expected = Vec::new();
+        for g in 0..2 {
+            let old = &rec[g * rd..(g + 1) * rd];
+            expected.extend_from_slice(&old[..MESH_HEADER + shape.max_vertices as usize * vd]);
+            let prim = MESH_HEADER + ms.max_vertices as usize * vd;
+            expected.extend_from_slice(&old[prim..prim + shape.max_primitives as usize]);
+        }
+        assert_eq!(records, expected, "all compute record words survive the wide mesh pass");
+    }
 }
 
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
