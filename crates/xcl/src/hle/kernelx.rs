@@ -69,6 +69,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         UnregisterAppConstrainedChangeNotification,
         // threads / system
         SetUnhandledExceptionFilter,
+        Sleep,
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
@@ -1459,6 +1460,43 @@ fn hresult_to_win32(hr: i32) -> u32 {
     }
 }
 
+/// a sleep is taken in steps of at most this, so that time held from then on is not counted
+const SLEEP_STEP_MS: u32 = 20;
+/// how often a sleep looks whether the title is still held
+const SLEEP_HELD_POLL_MS: u32 = 5;
+
+/// Sleep(ms): `ms` of the title's time. The time XCL holds one of the title's threads in a bind
+/// for a pipeline still being built (`pso_async::title_held`) is not the title's: a console
+/// title never waits there. A retail title's own stall check – a thread that ticks once a second
+/// with Sleep and ends the process after 30 ticks without a sign of its main thread – ended it
+/// while the driver built the pipelines of its world (#505, #232). `XCL_SLEEP_HOLD=0`: the PC's
+/// Sleep as it is.
+pub unsafe extern "system" fn Sleep(ms: u32) {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*HOLD.get_or_init(|| std::env::var("XCL_SLEEP_HOLD").map_or(true, |v| v.trim() != "0")) {
+        return thr::Sleep(ms);
+    }
+    title_sleep(ms, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
+}
+
+/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield and an endless
+/// sleep as they are).
+fn title_sleep(ms: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
+    if ms == 0 || ms == thr::INFINITE {
+        return sleep(ms);
+    }
+    let mut left = std::time::Duration::from_millis(ms as u64);
+    while !left.is_zero() {
+        if held() {
+            sleep(SLEEP_HELD_POLL_MS);
+            continue;
+        }
+        let t = std::time::Instant::now();
+        sleep((left.as_millis() as u32).clamp(1, SLEEP_STEP_MS));
+        left = left.saturating_sub(t.elapsed());
+    }
+}
+
 pub unsafe extern "system" fn SetThreadName(h: HANDLE, name: *const u16) -> BOOL {
     if let Some(n) = from_wide_ptr(name) {
         crate::xlog_debug!("SetThreadName({n})");
@@ -1977,6 +2015,74 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn real_sleep(ms: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+
+    /// A title's Sleep does not count the time the title is held (a bind waiting for a pipeline
+    /// still being built): it returns once that is over and its own time has gone by after it.
+    #[test]
+    fn a_sleep_does_not_count_the_time_the_title_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(60, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(355), "back after {took:?}: the 300 ms held were counted");
+    }
+
+    /// Time held from the middle of a sleep on is not counted either (but for the step under way).
+    #[test]
+    fn a_sleep_stops_counting_when_the_title_gets_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(50);
+                held.store(true, Ordering::Release);
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(200, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        // 200 ms of its own, less at most one step counted while held, and the 300 ms held
+        assert!(took >= std::time::Duration::from_millis(200 + 300 - SLEEP_STEP_MS as u64 - 15), "back after {took:?}");
+    }
+
+    /// With the title not held a sleep takes its time, in steps; a yield and an endless sleep
+    /// are passed on as they are.
+    #[test]
+    fn a_sleep_of_a_title_not_held_takes_its_time() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| {
+            calls.borrow_mut().push(ms);
+            if ms != 0 && ms != thr::INFINITE {
+                real_sleep(ms);
+            }
+        };
+        title_sleep(0, sleep, || false);
+        title_sleep(thr::INFINITE, sleep, || false);
+        assert_eq!(*calls.borrow(), [0, thr::INFINITE]);
+        calls.borrow_mut().clear();
+        let t = std::time::Instant::now();
+        title_sleep(50, sleep, || false);
+        let took = t.elapsed();
+        assert!(took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_millis(400), "took {took:?}");
+        assert!(calls.borrow().iter().all(|&ms| (1..=SLEEP_STEP_MS).contains(&ms)), "{:?}", calls.borrow());
+        // a sleep shorter than a step is one sleep, as before
+        calls.borrow_mut().clear();
+        title_sleep(1, sleep, || false);
+        assert_eq!(*calls.borrow(), [1]);
+    }
 
     #[test]
     fn fine_timer_makes_short_sleeps_short() {
