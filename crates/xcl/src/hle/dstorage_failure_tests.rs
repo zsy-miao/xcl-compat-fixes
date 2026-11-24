@@ -47,7 +47,7 @@ fn failure_diagnostics_keep_unreadable_sources_and_destinations_unchanged() {
 #[test]
 fn failure_diagnostics_follow_the_actual_batch_submission_origin() {
     unsafe {
-        for (capacity, expected) in [(2u16, Origin::HalfFull), (32, Origin::TitleSubmit)] {
+        for (capacity, page, expected) in [(2u16, 1usize, Origin::HalfFull), (2, 0, Origin::TitleSubmit), (32, 0, Origin::TitleSubmit)] {
             let mut desc = [0u8; 0x18];
             desc[..4].copy_from_slice(&1u32.to_le_bytes());
             desc[8..10].copy_from_slice(&capacity.to_le_bytes());
@@ -56,8 +56,8 @@ fn failure_diagnostics_follow_the_actual_batch_submission_origin() {
             assert_eq!(factory_create_queue(std::ptr::null_mut(), desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
             let diagnostics = queue(q).diagnostics.get_or_init(Diagnostics::new);
             let status = Arc::new(StatusInner { slots: vec![AtomicI32::new(E_PENDING)].into_boxed_slice() });
-            // A page array still unready when the worker executes: the #549 distinction.
-            let table = [0usize];
+            // A filled but invalid entry can submit automatically. A missing entry waits for Submit.
+            let table = [page];
             let source = [0x5Au8; 16];
             let mut req = [0u8; REQUEST_BYTES];
             req[..8].copy_from_slice(&(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT).to_le_bytes());
@@ -76,9 +76,9 @@ fn failure_diagnostics_follow_the_actual_batch_submission_origin() {
             let events = diagnostics.events.lock().unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!((events[0].origin, events[0].trace.stage), (expected, Stage::DestinationPages));
-            assert_eq!(events[0].trace.destination, Some(Counts { total: 1, zero: 1 }));
+            assert_eq!(events[0].trace.destination, Some(Counts { total: 1, zero: usize::from(page == 0) }));
             assert_eq!(events[0].trace.used, events[0].trace.destination);
-            assert_eq!(events[0].trace.reread, Reread::Read);
+            assert_eq!(events[0].trace.reread, if page == 0 { Reread::Read } else { Reread::NotNeeded });
             drop(events);
             let mut record = [0u8; ERROR_RECORD_BYTES];
             queue_retrieve_error_record(q, record.as_mut_ptr());
