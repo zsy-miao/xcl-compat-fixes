@@ -252,13 +252,7 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
 }
 
 fn is_writable(va: usize, bytes: usize) -> bool {
-    if bytes == 0 || va.checked_add(bytes).is_none() { return false; }
     crate::hle::kernelx::lazy::ensure(va, bytes);
-    // Preserve the official coherent-window fast path; elsewhere keep the local
-    // current-protection check across every native region in the write span.
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
-        return true;
-    }
     crate::gpu::shader::writable(va, bytes)
 }
 

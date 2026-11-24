@@ -234,14 +234,30 @@ pub fn readable(p: usize, len: usize) -> bool {
 /// validate every region before writing a batch, including guard and read-only pages.
 /// Query the OS afresh so decommit/free/protection changes cannot leave a stale proof.
 pub(crate) fn writable(p: usize, len: usize) -> bool {
+    if p == 0 || len == 0 || len > 256 << 20 {
+        return false;
+    }
+    writable_range(p, len)
+}
+
+/// DirectStorage accepts an empty destination and has no shader-sized range cap.
+/// A resident page's current protection proves access without VirtualQuery's region walk.
+/// Never infer the protection of a nonresident page, even in XCL's coherent window.
+pub(crate) fn writable_range(p: usize, len: usize) -> bool {
+    let Some(end) = p.checked_add(len) else { return false };
+    if len == 0 { return true; }
+    if p == 0 { return false; }
+    match resident_access(p, end, true) {
+        Some(writable) => writable,
+        None => writable_os(p, end),
+    }
+}
+
+fn writable_os(p: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
         PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
     };
-    if p == 0 || len == 0 || len > 256 << 20 {
-        return false;
-    }
-    let Some(end) = p.checked_add(len) else { return false };
     let mut cur = p;
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -258,36 +274,46 @@ pub(crate) fn writable(p: usize, len: usize) -> bool {
     true
 }
 
-/// Whether each page of `[p, end)` (up to 16 pages) is in the working set with a readable
-/// protection, asked of the kernel for all the pages in one call that touches none of them.
-/// `readable` asks this first because `VirtualQuery` sizes the whole region around an address by
-/// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a retail game's
-/// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
-/// of the world load there. `false` for a page that is not resident (never touched, paged out,
-/// guard, reserved, no access): the `VirtualQuery` walk answers for those.
+/// Preserve the readable check's existing small-query policy.
 fn resident_and_readable(p: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
+    let pages = ((end - 1) >> 12) - (p >> 12) + 1;
+    pages <= 16 && resident_access(p, end, false) == Some(true)
+}
+
+/// Fresh working-set proof, adapted from mrp1no's PR #501 (c73b0c8) and the existing
+/// readable fast path. Unlike #501, EVERY page must be resident: an invalid entry has
+/// no usable Win32Protection. It is unknown, not writable, and falls back to VirtualQuery.
+/// No proof is cached across calls; protect/decommit/recommit cannot retain a stale yes.
+fn resident_access(p: usize, end: usize, write: bool) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+        PAGE_READWRITE, PAGE_WRITECOPY,
+    };
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    const MAX_PAGES: usize = 16;
-    let first = p >> 12;
-    let pages = ((end - 1) >> 12) - first + 1;
-    if pages > MAX_PAGES {
-        return false;
+    const BATCH: usize = 64; // an unaligned 64 KiB destination occupies 17 pages
+    let (mut page, last) = (p >> 12, (end - 1) >> 12);
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; BATCH] = unsafe { std::mem::zeroed() };
+    while page <= last {
+        let count = (last - page + 1).min(BATCH);
+        for (i, e) in ws[..count].iter_mut().enumerate() {
+            *e = unsafe { std::mem::zeroed() };
+            e.VirtualAddress = ((page + i) << 12) as *mut std::ffi::c_void;
+        }
+        let size = (count * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+        if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
+            return None;
+        }
+        for e in &ws[..count] {
+            let flags = unsafe { e.VirtualAttributes.Flags };
+            if flags & 1 == 0 { return None; }
+            let protect = ((flags >> 4) & 0x7FF) as u32;
+            let allowed = protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+                && (!write || matches!(protect & 0xff, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+            if !allowed { return Some(false); }
+        }
+        page += count;
     }
-    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
-    for (k, e) in ws[..pages].iter_mut().enumerate() {
-        e.VirtualAddress = ((first + k) << 12) as *mut std::ffi::c_void;
-    }
-    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
-    if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
-        return false;
-    }
-    // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
-    ws[..pages].iter().all(|e| {
-        let flags = unsafe { e.VirtualAttributes.Flags };
-        let protect = ((flags >> 4) & 0x7FF) as u32;
-        flags & 1 != 0 && protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
-    })
+    Some(true)
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
@@ -515,6 +541,118 @@ mod tests {
         assert!(!readable(0x10, 10));
         let v = vec![1u8; 100];
         assert!(readable(v.as_ptr() as usize, 100));
+    }
+
+    #[test]
+    fn writable_resident_proof_covers_unaligned_destinations_and_batch_edges() {
+        use windows_sys::Win32::System::Memory::*;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 80 * 4096, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            for i in 0..80 { std::ptr::write_volatile((p + i * 4096) as *mut u8, 1); }
+            assert_eq!(resident_access(p + 17, p + 17 + 65536, true), Some(true), "unaligned64KiB spans17pages");
+            assert_eq!(resident_access(p + 17, p + 70 * 4096 + 17, true), Some(true), "cross64-page query boundary");
+            assert!(writable_range(p + 17, 65536));
+            let mut old = 0;
+            assert_ne!(VirtualProtect((p + 64 * 4096) as *const _, 4096, PAGE_READONLY, &mut old), 0);
+            assert!(!writable_range(p + 17, 70 * 4096));
+            assert_ne!(VirtualFree(p as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn writable_proof_is_fresh_and_does_not_touch_cold_or_guard_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 3 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            let cold = p + 4096;
+            assert_eq!(resident_access(cold, cold + 4096, true), None);
+            assert!(writable_range(cold, 4096), "nonresident RW uses the OS fallback");
+            assert_eq!(resident_access(cold, cold + 4096, true), None, "asking must not fault the page in");
+            for _ in 0..32 {
+                let mut old = 0;
+                std::ptr::write_volatile(p as *mut u8, 1);
+                assert!(writable_range(p, 4096));
+                for protect in [PAGE_READONLY, PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD] {
+                    assert_ne!(VirtualProtect(p as *const _, 4096, protect, &mut old), 0);
+                    assert_ne!(resident_access(p, p + 4096, true), Some(true));
+                    assert!(!writable_range(p, 4096));
+                    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    assert_ne!(VirtualQuery(p as *const _, &mut m, std::mem::size_of_val(&m)), 0);
+                    assert_eq!(m.Protect, protect, "a guard must not be consumed");
+                    assert_ne!(VirtualProtect(p as *const _, 4096, PAGE_READWRITE, &mut old), 0);
+                }
+                assert_ne!(VirtualFree(p as *mut _, 4096, MEM_DECOMMIT), 0);
+                assert!(!writable_range(p, 4096), "a prior yes cannot survive decommit");
+                assert!(!VirtualAlloc(p as *const _, 4096, MEM_COMMIT, PAGE_READONLY).is_null());
+                assert_eq!(resident_access(p, p + 4096, true), None);
+                assert!(!writable_range(p, 4096), "a cold read-only page is not assumed RW");
+                assert_ne!(VirtualProtect(p as *const _, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+                assert!(!writable_range(p, 4096));
+                assert_ne!(VirtualProtect(p as *const _, 4096, PAGE_READWRITE, &mut old), 0);
+                assert!(writable_range(p, 4096));
+            }
+            assert_ne!(VirtualFree(p as *mut _, 0, MEM_RELEASE), 0);
+        }
+        assert!(writable_range(0, 0), "retain DirectStorage's empty-range contract");
+        assert!(!writable_range(0, 1));
+        assert!(!writable_range(usize::MAX, 2));
+    }
+
+    #[test]
+    #[ignore = "explicit CPU benchmark: commits2GiB coherent+2GiB sparse, noGPU"]
+    fn benchmark_writable_runtime_windows() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        use windows_sys::Win32::System::Memory::*;
+        const GIB: usize = 1 << 30;
+        let u = crate::gpu::uma::Uma::for_runtime_with(2 * GIB, 2 * GIB).expect("2GiB coherent runtime window");
+        let coherent = u.window(3).0;
+        let sparse = u.window(0).0;
+        unsafe { assert!(!VirtualAlloc(sparse as *const _, 2 * GIB, MEM_COMMIT, PAGE_READWRITE).is_null()); }
+        let measure = |name: &str, p: usize, len: usize, expected: bool| {
+            assert_eq!(writable_os(p, p + len), expected);
+            assert_eq!(writable_range(p, len), expected);
+            let mut old = Vec::new();
+            let mut fast = Vec::new();
+            for sample in 0..7 {
+                for which in if sample % 2 == 0 { [false, true] } else { [true, false] } {
+                    let t = Instant::now();
+                    for _ in 0..8 {
+                        let answer = if which { writable_range(black_box(p), black_box(len)) } else { writable_os(black_box(p), black_box(p + len)) };
+                        assert_eq!(black_box(answer), expected);
+                    }
+                    let ns = t.elapsed().as_nanos() / 8;
+                    if which { fast.push(ns); } else { old.push(ns); }
+                }
+            }
+            old.sort_unstable(); fast.sort_unstable();
+            println!("writable-benchmark {}", serde_json::json!({"case":name,"address":format!("{p:#x}"),"bytes":len,"pages":((p+len-1)>>12)-(p>>12)+1,"expected":expected,"old_median_ns":old[3],"fast_median_ns":fast[3],"old_samples_ns":old,"fast_samples_ns":fast}));
+        };
+        for (name, base) in [("coherent", coherent), ("sparse", sparse)] {
+            let p = base + 65536 + 17;
+            unsafe { for page in (p & !4095..p + 65536).step_by(4096) { std::ptr::write_volatile(page as *mut u8, 1); } }
+            assert_eq!(resident_access(p, p + 65536, true), Some(true));
+            measure(&format!("{name}-resident-unaligned64KiB"), p, 65536, true);
+            let cold = base + GIB + 17;
+            assert_eq!(resident_access(cold, cold + 65536, true), None);
+            measure(&format!("{name}-cold64KiB"), cold, 65536, true);
+            unsafe {
+                let mut old = 0;
+                assert_ne!(VirtualProtect((p & !4095) as *const _, 4096, PAGE_READONLY, &mut old), 0);
+                measure(&format!("{name}-readonly-hole"), p, 65536, false);
+                assert_ne!(VirtualProtect((p & !4095) as *const _, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+                measure(&format!("{name}-guard-hole"), p, 65536, false);
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(p as *const _, &mut m, std::mem::size_of_val(&m)), 0);
+                assert_ne!(m.Protect & PAGE_GUARD, 0);
+                assert_ne!(VirtualProtect((p & !4095) as *const _, 4096, PAGE_READWRITE, &mut old), 0);
+                assert_ne!(VirtualFree((p & !4095) as *mut _, 4096, MEM_DECOMMIT), 0);
+                measure(&format!("{name}-decommitted-hole"), p, 65536, false);
+            }
+        }
     }
 
     mod clzero_batch_tests {
