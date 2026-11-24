@@ -1044,6 +1044,11 @@ fn reserved_page(a: usize) -> bool {
 
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted).
 unsafe fn unmap_away(away: &mut Away, at: usize) {
+    unmap_away_preserving(away, at, &(0..0));
+}
+
+/// Homes being restored in this call remain committed even if another page was mapped there.
+unsafe fn unmap_away_preserving(away: &mut Away, at: usize, restored: &std::ops::Range<usize>) {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
         note_mapping_at(at);
@@ -1054,11 +1059,12 @@ unsafe fn unmap_away(away: &mut Away, at: usize) {
         // (a home this call has not given back yet is still committed)
         let pending = away.gone.len();
         away.gone.retain(|&h| Some(h) != page_home(page));
-        let home = if away.gone.len() < pending { page_home(page) } else { page_home(page).and_then(|h| home_again(h)) };
+        let own = page_home(page);
+        let home = if away.gone.len() < pending || own.is_some_and(|h| restored.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
         if let Some(home) = home {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
         }
-        if !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
+        if !restored.contains(&at) && !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
             if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
                 crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
             }
@@ -1159,6 +1165,32 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     if pages.iter().any(|&p| p != 0 && page_home(p).is_none()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
+    }
+    // An explicit request for these pages' CPU homes must restore them in place, not
+    // self-copy/decommit them through the ordinary away path. NULL still chooses a
+    // GPU-visible range below, as required by the local physical-page ABI.
+    let base = va as usize;
+    let homes = if !va.is_null() && pages.iter().enumerate().all(|(i, &p)| {
+        p != 0 && i.checked_mul(PHYS_PAGE).and_then(|offset| base.checked_add(offset)) == page_home(p)
+    }) {
+        n.checked_mul(PHYS_PAGE).and_then(|len| base.checked_add(len)).map(|end| base..end)
+    } else {
+        None
+    };
+    if let Some(homes) = homes {
+        for home in (homes.start..homes.end).step_by(PHYS_PAGE) {
+            if home_again(home).is_none() {
+                fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+                return std::ptr::null_mut();
+            }
+        }
+        away.gone.retain(|home| !homes.contains(home));
+        for &p in &pages {
+            if let Some(&at) = away.page.get(&p) {
+                unmap_away_preserving(away, at, &homes);
+            }
+        }
+        return va;
     }
     let va = if va.is_null() {
         // no address chosen: consecutive pages get a sparse-window range of their own
@@ -2188,6 +2220,7 @@ mod tests {
     /// first page goes home and leaves that address committed, as the second one's home.
     #[test]
     fn a_page_away_at_another_home_goes_home_with_it() {
+        assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "initialize UMA before exercising physical pages");
         unsafe {
             let Some(_) = crate::gpu::uma::get() else { return };
             let mut n = 2usize;
@@ -2204,11 +2237,18 @@ mod tests {
             let mut one = [q as u64];
             assert_eq!(XMemMapPhysicalPagesScatter(&at, 1, one.as_mut_ptr()), 1);
             *(h as *mut u32) = 9;
-            let home = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize;
-            assert_eq!(home, page_home(q).unwrap());
+            let expected_home = page_home(q).unwrap();
+            let home = MapTitlePhysicalPages(expected_home as *mut c_void, 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_eq!(home, expected_home);
             assert_eq!(*(home as *const u32), 9);
             assert_eq!(*(h as *const u32), 7);
+            assert!(!physical_page_at(home) && !physical_page_at(h), "restored homes are not away mappings");
             assert!(!committed_page(r));
+            let mut bytes = [0u8; 4];
+            for (page, expected) in [(q, 9), (p, 7)] {
+                assert!(read_physical_pages(&[page], 0, &mut bytes));
+                assert_eq!(u32::from_le_bytes(bytes), expected);
+            }
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
