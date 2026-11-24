@@ -124,6 +124,8 @@ xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
+xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
+xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
@@ -138,6 +140,17 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Pipelines used in an earlier run are normally built ahead of first use. `XCL_PSO_PRELOAD=graphics`
   limits this to graphics pipelines; compute pipelines still build and wait at their first bind.
   `XCL_PSO_PRELOAD=0` disables preloading of both types. Unset or `1` retains the default.
+- Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
+  background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
+  at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
+  they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
+  ordinary ones. Gated compiles target 3 GB of free commit, retaining the fork's bounded five-second
+  admission grace. Smaller pipelines
+  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
+  ones with `record HASH`, the console record's hash that `--measure-pso` and
+  `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
+  `XCL_PSO_TRACE=1` logs every driver compile.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.

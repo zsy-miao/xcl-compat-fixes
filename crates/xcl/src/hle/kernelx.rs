@@ -69,6 +69,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         UnregisterAppConstrainedChangeNotification,
         // threads / system
         SetUnhandledExceptionFilter,
+        Sleep,
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
@@ -1459,6 +1460,56 @@ fn hresult_to_win32(hr: i32) -> u32 {
     }
 }
 
+/// a sleep is taken in steps of at most this, so that time held from then on is not counted
+const SLEEP_STEP_MS: u32 = 20;
+/// how often a sleep looks whether the title is still held
+const SLEEP_HELD_POLL_MS: u32 = 5;
+/// the shortest sleep that is a wait for time: a shorter one is a poll and is passed on as it is
+const SLEEP_HOLD_MIN_MS: u32 = 100;
+
+/// Sleep(ms): `ms` of the title's time. The time XCL holds one of the title's threads in a bind
+/// for a pipeline still being built (`pso_async::title_held`) is not the title's: a console
+/// title never waits there. A retail title's own stall check – a thread that ticks once a second
+/// with Sleep and ends the process after 30 ticks without a sign of its main thread – ended it
+/// while the driver built the pipelines of its world (#505, #232). Only a sleep of
+/// `SLEEP_HOLD_MIN_MS` or more is taken so: a thread that polls with short sleeps (streaming,
+/// sound) goes on while a bind waits. `XCL_SLEEP_HOLD=<ms>` sets that length, `0`: the PC's
+/// Sleep as it is.
+pub unsafe extern "system" fn Sleep(ms: u32) {
+    static MIN: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(min) = *MIN.get_or_init(|| sleep_hold_min(std::env::var("XCL_SLEEP_HOLD").ok().as_deref())) else {
+        return thr::Sleep(ms);
+    };
+    title_sleep(ms, min, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
+}
+
+/// `XCL_SLEEP_HOLD`: the shortest sleep whose held time is not counted (`None`: no sleep).
+fn sleep_hold_min(v: Option<&str>) -> Option<u32> {
+    match v.map(str::trim) {
+        None => Some(SLEEP_HOLD_MIN_MS),
+        Some("0") => None,
+        Some(v) => Some(v.parse().unwrap_or(SLEEP_HOLD_MIN_MS)),
+    }
+}
+
+/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield, an endless
+/// sleep and one shorter than `min` as they are).
+fn title_sleep(ms: u32, min: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
+    if ms == 0 || ms == thr::INFINITE || ms < min {
+        return sleep(ms);
+    }
+    let mut left = std::time::Duration::from_millis(ms as u64);
+    while !left.is_zero() {
+        if held() {
+            sleep(SLEEP_HELD_POLL_MS);
+            continue;
+        }
+        let t = std::time::Instant::now();
+        sleep((left.as_millis() as u32).clamp(1, SLEEP_STEP_MS));
+        left = left.saturating_sub(t.elapsed());
+    }
+}
+
 pub unsafe extern "system" fn SetThreadName(h: HANDLE, name: *const u16) -> BOOL {
     if let Some(n) = from_wide_ptr(name) {
         crate::xlog_debug!("SetThreadName({n})");
@@ -1977,6 +2028,88 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn real_sleep(ms: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+
+    /// A title's Sleep does not count the time the title is held (a bind waiting for a pipeline
+    /// still being built): it returns once that is over and its own time has gone by after it.
+    #[test]
+    fn a_sleep_does_not_count_the_time_the_title_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(60, 60, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(355), "back after {took:?}: the 300 ms held were counted");
+    }
+
+    /// Time held from the middle of a sleep on is not counted either (but for the step under way).
+    #[test]
+    fn a_sleep_stops_counting_when_the_title_gets_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(50);
+                held.store(true, Ordering::Release);
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(200, SLEEP_HOLD_MIN_MS, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        // 200 ms of its own, less at most one step counted while held, and the 300 ms held
+        assert!(took >= std::time::Duration::from_millis(200 + 300 - SLEEP_STEP_MS as u64 - 15), "back after {took:?}");
+    }
+
+    /// With the title not held a sleep takes its time, in steps; a yield and an endless sleep
+    /// are passed on as they are.
+    #[test]
+    fn a_sleep_of_a_title_not_held_takes_its_time() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| {
+            calls.borrow_mut().push(ms);
+            if ms != 0 && ms != thr::INFINITE {
+                real_sleep(ms);
+            }
+        };
+        title_sleep(0, 1, sleep, || false);
+        title_sleep(thr::INFINITE, 1, sleep, || false);
+        assert_eq!(*calls.borrow(), [0, thr::INFINITE]);
+        calls.borrow_mut().clear();
+        let t = std::time::Instant::now();
+        title_sleep(50, 1, sleep, || false);
+        let took = t.elapsed();
+        assert!(took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_millis(400), "took {took:?}");
+        assert!(calls.borrow().iter().all(|&ms| (1..=SLEEP_STEP_MS).contains(&ms)), "{:?}", calls.borrow());
+        // a sleep shorter than a step is one sleep, as before
+        calls.borrow_mut().clear();
+        title_sleep(1, 1, sleep, || false);
+        assert_eq!(*calls.borrow(), [1]);
+    }
+
+    /// A sleep shorter than the shortest one held is a poll: it is passed on as it is, also
+    /// while the title is held. `XCL_SLEEP_HOLD` sets that length, `0` takes no sleep.
+    #[test]
+    fn a_short_sleep_is_passed_on_while_the_title_is_held() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| calls.borrow_mut().push(ms);
+        title_sleep(SLEEP_HOLD_MIN_MS - 1, SLEEP_HOLD_MIN_MS, sleep, || true);
+        assert_eq!(*calls.borrow(), [SLEEP_HOLD_MIN_MS - 1]);
+        assert_eq!(sleep_hold_min(None), Some(SLEEP_HOLD_MIN_MS));
+        assert_eq!(sleep_hold_min(Some("0")), None);
+        assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
+        assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
 
     #[test]
     fn fine_timer_makes_short_sleeps_short() {

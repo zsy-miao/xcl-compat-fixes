@@ -579,6 +579,12 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// The HLSL and profile a console program compiles from at pipeline creation (for
+/// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
+pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {
+    console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
+}
+
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
 /// (`stage=… reason=…`, the reason with operands stripped) and the live summary counter
 /// (`XCL_DIRECT_DXIL_STATS=1`, `gpu::dxil::coverage`).
@@ -637,7 +643,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
 
-fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());

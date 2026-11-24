@@ -15,7 +15,7 @@ use super::cfg::{Cfg, Term};
 use super::container::Stage;
 use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
-use super::shader::Shader;
+use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
 use crate::gpu::recomp::{CsInterface, MsInterface, PsInterface, VsInterface, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 
@@ -26,7 +26,8 @@ pub struct KernelOptions {
     /// the GPU runs only 32-lane waves: a wave64 program runs as two halves
     pub split: bool,
     /// 4 GiB memory windows the program may address (`recomp::Options::mem_windows`):
-    /// `mem` at u2, then `mem1`.. at u3..
+    /// `mem` at u2, then `mem1`.. at u3.. (with `recomp::HEAP_WINDOWS`: descriptors
+    /// `MEM_HEAP_BASE`.. of the resource heap)
     pub mem_windows: u32,
     /// first register (space 1) of the static samplers (another stage may come first)
     pub sampler_base: u32,
@@ -35,7 +36,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 4;
+pub const TRANSLATOR_VERSION: u32 = 5;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -100,11 +101,6 @@ pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Res
 }
 
 fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
-    // memory windows through the descriptor heap (`recomp::HEAP_WINDOWS` in the count,
-    // `XCL_HEAP_WINDOWS=1`) are not translated yet: the caller falls back to HLSL
-    if o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0 {
-        return Err("unsupported: heap memory windows (XCL_HEAP_WINDOWS)".into());
-    }
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
@@ -118,6 +114,20 @@ fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             format!("the direct DXIL translator panicked: {msg}")
         })?
+}
+
+/// The memory windows of `mem_windows` and whether they come from the descriptor heap
+/// (`recomp::HEAP_WINDOWS` in the count, `XCL_HEAP_WINDOWS=1`; Some(globallycoherent), and
+/// `mems` then only counts them). Compute work across groups relies on coherent memory
+/// (as the HLSL compute mode's `globallycoherent` windows).
+fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
+    let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, 4);
+    if heap && n > 1 {
+        let z = s.m.i32c(0);
+        return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
+    }
+    ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
 fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
@@ -142,9 +152,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     let mut s = Shader::new(stage, (6, 6));
     let io = s.raw_uav(0, 0);
     let res = if kernel || ms.is_some() { Some(s.raw_uav(1, 0)) } else { None };
-    // compute work across groups relies on coherent memory (as the HLSL compute mode's
-    // `globallycoherent` windows)
-    let mems: Vec<_> = (0..o.mem_windows.clamp(1, 4)).map(|k| if cs.is_some() { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect();
+    let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
     let i32 = s.m.i32();
     let z = s.m.i32c(0);
     let mut lw = Lw {
@@ -158,6 +166,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         upper: z,
         half: z,
         mems,
+        heap_mem,
         res,
         fmt_table: None,
         ntmp: 0,

@@ -229,6 +229,24 @@ pub(super) fn note_root_changing_signature(sig: usize) {
     ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
 }
 
+/// command signatures with a Dispatch argument (noted at every creation, so a signature made
+/// at a freed one's address does not keep its kind)
+static DISPATCH_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(super) fn note_signature_dispatches(sig: usize, dispatches: bool) {
+    let mut s = DISPATCH_SIGNATURES.lock().unwrap();
+    let s = s.get_or_insert_with(Default::default);
+    if dispatches {
+        s.insert(sig);
+    } else {
+        s.remove(&sig);
+    }
+}
+
+fn signature_dispatches(sig: usize) -> bool {
+    DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -249,6 +267,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+            }
+            return;
+        }
+        // a console compute program without a translation (its build failed): nothing to run,
+        // as for Dispatch. The PC call would run it with the list's compute root signature, which
+        // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
+        // A native PC compute pipeline is not one of these and still goes to the PC call.
+        if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+            count(DISPATCHES_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
             }
             return;
         }
@@ -1187,10 +1217,43 @@ mod tests {
             "failed async compute stand-in must not enter translated ExecuteIndirect path"
         );
 
+        // 3. The same failed stand-in (made from a console shader) with a Dispatch signature:
+        // nothing to run, as for Dispatch – the PC call would pair the stand-in with the list's
+        // compute root signature (XCL's ABI one after a translated dispatch: debug layer 953)
+        let sig_dispatch = 0x7200_00F8usize;
+        real::register_console_compute_for_test(standin_fail);
+        note_signature_dispatches(sig_dispatch, true);
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1, "a dispatch of an untranslated console compute pipeline must not reach the PC ExecuteIndirect");
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+
+        // 4. A native PC compute pipeline (not made from a console shader) with the same Dispatch
+        // signature still goes to the PC call, as on main
+        let native = 0x7200_0004usize;
+        reset(list_ptr, 0x7200_0100, native);
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 2, "a native PC compute pipeline must still reach the PC ExecuteIndirect");
+
+        // a signature made later at the same address without a Dispatch argument goes to the PC
+        reset(list_ptr, 0x7200_0100, standin_fail);
+        note_signature_dispatches(sig_dispatch, false);
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 3);
+
         forget(list_ptr);
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+        real::forget_pso_for_test(standin_fail);
+        assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
     }
 
     #[test]

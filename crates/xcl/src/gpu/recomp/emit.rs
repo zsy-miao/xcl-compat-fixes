@@ -5287,9 +5287,16 @@ uint4 ld_raw(uint a) {
 }
 // format helpers: no loops, no branches (inlined at every buffer access; `?:` and `if`
 // on scalars become control flow in HLSL 2021, which DXC is slow to clean up)
+uint pick4(uint4 v, uint i) {
+    return select(i == 0u, v.x, select(i == 1u, v.y, select(i == 2u, v.z, v.w)));
+}
+void or_at4(inout uint4 r, uint i, uint v) {
+    r.x |= select(i == 0u, v, 0u); r.y |= select(i == 1u, v, 0u);
+    r.z |= select(i == 2u, v, 0u); r.w |= select(i == 3u, v, 0u);
+}
 uint bits_at(uint4 r, uint off, uint w) {
     uint i = off >> 5; uint s = off & 31u;
-    uint lo = r[i]; uint hi = select(i < 3u, r[min(i + 1u, 3u)], 0u);
+    uint lo = pick4(r, i); uint hi = select(i < 3u, pick4(r, min(i + 1u, 3u)), 0u);
     uint v = select(s == 0u, lo, (lo >> s) | (hi << ((32u - s) & 31u)));
     return select(w >= 32u, v, v & ((1u << (w & 31u)) - 1u));
 }
@@ -5362,9 +5369,9 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
         bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
-        float bc[4] = { det - i - j, i, j, 0.0f };
+        uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);
-        return hit ? uint4(asuint(t), asuint(det), asuint(bc[tid & 3u]), asuint(bc[(tid >> 2) & 3u])) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+        return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
@@ -5372,8 +5379,8 @@ uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;
-    r[i] |= v << s;
-    if (s != 0u && s + w > 32u && i < 3u) r[i + 1u] |= v >> (32u - s);
+    or_at4(r, i, v << s);
+    if (s != 0u && s + w > 32u && i < 3u) or_at4(r, i + 1u, v >> (32u - s));
 }
 uint fmt_encode(uint x, uint info, uint c) {
     uint ty = (info >> 3) & 7u; uint w = (info >> (8u + 6u * c)) & 63u; float f = asfloat(x);
@@ -5403,7 +5410,7 @@ void st_bytes(uint a, uint4 r, uint n) {
     st_part(b, m << s, r.x << s);
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
-uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
+uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
@@ -5896,3 +5903,18 @@ uint fclass64(double f) {
     return n ? 3u : 8u;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::PRELUDE_MEM;
+
+    #[test]
+    fn format_helpers_select_uint4_components_without_runtime_indexing() {
+        for indexed in ["r[i]", "r[i + 1u]", "c[(sel - 4u) & 3u]"] {
+            assert!(!PRELUDE_MEM.contains(indexed), "runtime vector index remains: {indexed}");
+        }
+        assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
+        assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
+        assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+}

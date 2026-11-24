@@ -312,7 +312,7 @@ impl Lw {
                 let off = self.bin(BinOp::Shl, off, k3);
                 let full = self.add(b64, off);
                 let (_, hi) = self.unpack64(full);
-                self.window(hi);
+                self.window_hi(hi, false);
             }
             let ty = self.andc(node, 7);
             let sort = {

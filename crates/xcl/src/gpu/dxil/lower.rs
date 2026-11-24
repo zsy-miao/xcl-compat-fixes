@@ -145,6 +145,9 @@ pub struct Lw {
     pub half: Value,
     /// the memory windows `mem`, `mem1`.. (u2..)
     pub mems: Vec<RawUav>,
+    /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
+    /// Some(globallycoherent)
+    pub heap_mem: Option<bool>,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,

@@ -6,6 +6,7 @@
 use super::lower::{err, Dst, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, RmwOp, Value};
 use super::ops::AtomicOp;
+use super::lower_window::Ea;
 use super::shader::RawUav;
 use crate::gpu::rdna2::{self, Decoded};
 use crate::gpu::recomp::emit::buf_format_info;
@@ -118,6 +119,9 @@ impl Lw {
     /// a switch over the windows when the program may address several, as the HLSL kernel's
     /// `xcl_m*` accessors; returns `f`'s value (i32 or i64).
     fn with_mem(&mut self, f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>) -> Option<Value> {
+        if let Some(coherent) = self.heap_mem {
+            return self.with_heap_mem(coherent, f);
+        }
         if self.mems.len() <= 1 {
             let m = self.mems[0];
             return f(self, m);
@@ -130,17 +134,9 @@ impl Lw {
         let mut kind = 0u8; // 0 none, 1 i32, 2 i64
         let mems = self.mems.clone();
         for (k, &m) in mems.iter().enumerate() {
-            // window 0 is the default (`switch` default: any value but 1..)
-            let is = if k == 0 {
-                let mut any = self.b(false);
-                for j in 1..mems.len() as u32 {
-                    let e = self.cmpc(Pred::Eq, w, j);
-                    any = self.lor(any, e);
-                }
-                self.lnot(any)
-            } else {
-                self.cmpc(Pred::Eq, w, k as u32)
-            };
+            // a window outside them matches none (the `switch` default: reads 0, stores
+            // and atomics dropped)
+            let is = self.cmpc(Pred::Eq, w, k as u32);
             let _ = self.guarded(is, &mut |lw| {
                 if let Some(v) = f(lw, m) {
                     let t = lw.s.m.type_of(v);
@@ -164,13 +160,6 @@ impl Lw {
                 let (l, h) = (self.rd(tl), self.rd(th));
                 Some(self.pack64(l, h))
             }
-        }
-    }
-    /// `xcl_w = hi & 3` (several memory windows only).
-    pub fn window(&mut self, hi: Value) {
-        if self.mems.len() > 1 {
-            let v = self.andc(hi, 3);
-            self.wr(super::lower::VAR_WIN, v);
         }
     }
     fn mraw_atomic(&mut self, op: AtomicOp, a: Value, v: Value) -> Value {
@@ -659,9 +648,9 @@ impl Lw {
         let mut vals = Vec::new();
         if name.starts_with("s_buffer_load") {
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.window(d1);
             let k = self.c(imm);
             let off = self.add(k, soff);
+            self.buffer_window(d0, d1, &[Ea::U(k), Ea::U(soff)], false);
             let st = self.lshrc(d1, 16);
             let st = self.andc(st, 0x3FFF);
             let sz = self.cmpc(Pred::Eq, st, 0);
@@ -679,8 +668,8 @@ impl Lw {
             let imm = ((imm << 11) as i32 >> 11) as u32;
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
-            self.window(hi);
             let k = self.c(imm);
+            self.window_at(hi, b, &[Ea::S(k), Ea::U(soff)], false);
             let a = self.add(b, k);
             let a = self.add(a, soff);
             for i in 0..count {
@@ -734,7 +723,6 @@ impl Lw {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        self.window(d1);
         let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let stride = self.lshrc(d1, 16);
@@ -744,6 +732,7 @@ impl Lw {
         let a = self.add(a, off);
         let si = self.mul(stride, index);
         let a = self.add(a, si);
+        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], name.contains("store"));
         let act = self.act();
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let idx_ok = self.cmp(Pred::ULt, index, d2);
@@ -1206,7 +1195,6 @@ impl Lw {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(d1);
         let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let x2 = op.ends_with("_x2");
@@ -1219,6 +1207,7 @@ impl Lw {
         let a = self.add(a, off);
         let si = self.mul(stride, index);
         let a = self.add(a, si);
+        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], true);
         let a = self.andc(a, !(bytes - 1));
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let e = self.addc(off, bytes);
@@ -1260,11 +1249,11 @@ impl Lw {
 
     // ------------------------------------------------------------ FLAT / global
 
-    fn flat_base(&mut self, d: &Decoded) -> (Value, bool) {
+    fn flat_base(&mut self, d: &Decoded, write: bool) -> (Value, bool) {
         let global = d.enc.name == "ENC_FLAT_GLBL";
         let addr = self.vreg(Self::fv(d, "ADDR"));
         let saddr = Self::fv(d, "SADDR");
-        self.flat_window(d);
+        self.flat_window(d, write);
         let base = if global && saddr != 0x7D && saddr != 0x7F {
             let s = self.sreg(saddr);
             self.add(s, addr)
@@ -1274,16 +1263,6 @@ impl Lw {
         let raw = Self::fv(d, "OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         (self.addc(base, off), global)
-    }
-
-    /// `flat_window`: the window of a FLAT / global address (SADDR pair or the 64-bit VGPR address).
-    fn flat_window(&mut self, d: &Decoded) {
-        if self.mems.len() > 1 {
-            let global = d.enc.name == "ENC_FLAT_GLBL";
-            let saddr = Self::fv(d, "SADDR");
-            let hi = if global && saddr != 0x7D && saddr != 0x7F { self.sreg(saddr + 1) } else { self.vreg(Self::fv(d, "ADDR") + 1) };
-            self.window(hi);
-        }
     }
 
     pub fn flat(&mut self, d: &Decoded, name: &str) -> LResult<()> {
@@ -1296,7 +1275,7 @@ impl Lw {
         }
         let act = self.act();
         if let Some((n, signed, store, half)) = flat_small(op) {
-            let (a, _) = self.flat_base(d);
+            let (a, _) = self.flat_base(d, store);
             if store {
                 let v = self.vreg(Self::fv(d, "DATA"));
                 let data = self.d16_data(v, half);
@@ -1325,7 +1304,7 @@ impl Lw {
             _ => return err(d, "FLAT"),
         };
         let a = if op.ends_with("_addtid") {
-            self.flat_window(d);
+            self.addtid_window(d, store);
             let saddr = Self::fv(d, "SADDR");
             let lane = self.lane;
             let l4 = self.shlc(lane, 2);
@@ -1340,7 +1319,7 @@ impl Lw {
             let off = if d.enc.name == "ENC_FLAT_GLBL" { (((raw << 20) as i32) >> 20) as u32 } else { raw };
             self.addc(base, off)
         } else {
-            self.flat_base(d).0
+            self.flat_base(d, store).0
         };
         if store {
             let vals: Vec<Value> = (0..count).map(|i| self.vreg(Self::fv(d, "DATA") + i)).collect();
@@ -1365,7 +1344,7 @@ impl Lw {
     }
 
     fn flat_atomic(&mut self, d: &Decoded, op: &str) -> LResult<()> {
-        let (a, _) = self.flat_base(d);
+        let (a, _) = self.flat_base(d, true);
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
         let a = self.andc(a, if x2 { !7 } else { !3 });

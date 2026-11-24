@@ -34,6 +34,10 @@ Usage:
       for the recompiler). RPF9 packages are scanned for shader records.
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
+      --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic
+          compute HLSL for investigation; an exact hash bypasses the size threshold.
+      --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact
+          compute record with XCL's real root signature and static samplers.
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
