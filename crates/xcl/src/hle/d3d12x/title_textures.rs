@@ -394,6 +394,9 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
+        // #504: remapped/unmapped textures must not keep a content hash – their VRAM tiles
+        // are gone and need a fresh upload even if the CPU bytes did not change.
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
@@ -492,6 +495,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
     if retired > 0 {
@@ -510,6 +514,8 @@ pub fn forget(res: usize) {
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
+        // #504: a texture remapped after its shadower is released must upload again.
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         unsafe {
             super::vram::remap_if_unmapped(r);
         }
@@ -782,10 +788,23 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
+/// Whether texture `res` was last *successfully* uploaded from memory with hash `h` (#504).
+fn last_upload_matches(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().get(&res) == Some(&h)
+}
+
+/// Remember a successful upload of `res` from memory with hash `h`.
+fn remember_upload(res: usize, h: u64) {
+    LAST_CONTENT.lock().unwrap().insert(res, h);
+}
+
+/// Test helper: check-then-remember (matches the old `same_as_last_upload` contract for unit tests).
+#[cfg(test)]
 fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+    let mut g = LAST_CONTENT.lock().unwrap();
+    let same = g.get(&res) == Some(&h);
+    g.insert(res, h);
+    same
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -828,27 +847,25 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            // The same bytes as at this texture's last upload: nothing to do. The write watch is
-            // per page and a title writes next to its textures (and rewrites what it wrote): a
-            // retail title's video planes and UI targets went up again for every submit, ~25 MB
-            // a presented frame where ~3 MB had changed, and the submits waited here.
-            if unchanged_skip() {
-                let h = content_hash(&read_committed(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
-                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
-                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
-                    }
-                    continue;
+            // Read once: hash and detile from the same snapshot (#504 TOCTOU / double-read).
+            let mem = read_committed(va, tex.size() as usize);
+            let h = content_hash(&mem);
+            let res_key = r.as_raw() as usize;
+            // The same bytes as at this texture's last *successful* upload: nothing to do.
+            if unchanged_skip() && last_upload_matches(res_key, h) {
+                let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                    crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
                 }
+                continue;
             }
             device = dev;
             bytes += tex.size() as usize;
-            let subs = subresources(va, &tex);
+            let subs = subresources_from(&mem, &tex);
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
-            batch.push((r, subs, states));
+            batch.push((r, subs, states, res_key, h));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
@@ -859,13 +876,21 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
+        let upload_items: Vec<_> = batch.iter().map(|(r, subs, states, _, _)| (r.clone(), subs.clone(), states.clone())).collect();
+        let keys: Vec<_> = batch.iter().map(|(_, _, _, res, h)| (*res, *h)).collect();
         match own_work(|| {
             super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            texture::upload_batch(dev, &queue, &upload_items)
         }) {
             Ok(failed) => {
-                for (_, e) in failed {
-                    warn(&e);
+                let failed_idx: std::collections::BTreeSet<usize> = failed.iter().map(|(i, _)| *i).collect();
+                for (_, e) in &failed {
+                    warn(e);
+                }
+                for (i, (res, h)) in keys.iter().enumerate() {
+                    if !failed_idx.contains(&i) {
+                        remember_upload(*res, *h);
+                    }
                 }
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
@@ -1052,18 +1077,40 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
+    let mem = read_committed(va, tex.size() as usize);
+    subresources_from(&mem, tex)
+}
+
+/// Detile subresources from an already-read memory snapshot (one read + one hash in `upload_all`).
+fn subresources_from(mem: &[u8], tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = read_committed(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        return c
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Subresource {
+                depth: l.depth,
+                rows: l.height,
+                row_bytes: l.width * bpe,
+                data: c.detile_volume(mem, i),
+            })
+            .collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+        let start = s * c.slice_bytes;
+        let end = (start + c.slice_bytes).min(mem.len());
+        let slice = if start < mem.len() { &mem[start..end] } else { &[] };
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
+            out.push(Subresource {
+                depth: 1,
+                rows: l.height,
+                row_bytes: l.width * bpe,
+                data: c.detile_level(slice, i, s),
+            });
         }
     }
     out
@@ -1073,6 +1120,20 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #504: a hash check must not record success; only `remember_upload` after a good batch.
+    #[test]
+    fn last_content_is_not_poisoned_by_a_hash_check_alone() {
+        let res = 0x7E57_0000_3000usize;
+        let h = content_hash(&[1, 2, 3, 4]);
+        assert!(!last_upload_matches(res, h));
+        assert!(!last_upload_matches(res, h), "check alone must not insert");
+        remember_upload(res, h);
+        assert!(last_upload_matches(res, h));
+        assert!(!last_upload_matches(res, h ^ 1));
+        forget(res);
+        assert!(!last_upload_matches(res, h));
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
