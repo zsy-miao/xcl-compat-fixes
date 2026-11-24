@@ -722,11 +722,27 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     Ok(pages)
 }
 
+fn read_prepared(mut read: impl FnMut() -> bool, prepare: impl FnOnce() -> bool) -> bool {
+    if read() { return true; }
+    // Another thread may have committed the page before preparation gets its lock.
+    // Retry the read itself even when this caller did not materialize a page.
+    prepare();
+    read()
+}
+
+fn readable_source(at: usize, len: usize) -> bool {
+    len <= 256 << 20 && read_prepared(|| crate::gpu::shader::readable(at, len), || crate::hle::kernelx::lazy::prepare_read(at, len))
+}
+
 unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0usize;
-    at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
+    if at == 0 { return false; }
+    read_prepared(
+        || ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len,
+        || crate::hle::kernelx::lazy::prepare_read(at, len),
+    )
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.
@@ -791,7 +807,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+            if !readable_source(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             if !b.is_empty() {
@@ -1441,6 +1457,10 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
     info[0x1A..0x1C].copy_from_slice(&until.to_le_bytes());
     std::ptr::copy_nonoverlapping(info.as_ptr(), out, info.len());
 }
+
+#[cfg(test)]
+#[path = "dstorage_lazy_input_tests.rs"]
+mod lazy_input_tests;
 
 #[cfg(test)]
 mod tests {

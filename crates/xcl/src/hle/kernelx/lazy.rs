@@ -107,9 +107,25 @@ pub fn ensure(p: usize, len: usize) {
     for page in pages { unsafe { commit(page); } }
 }
 
+/// Commit fully reserved, tracked pages for a native read that cannot invoke the fault handler.
+pub fn prepare_read(p: usize, len: usize) -> bool {
+    let Some(end) = p.checked_add(len) else { return false };
+    if len == 0 { return false; }
+    let mut pages = PAGES.write().unwrap_or_else(|e| e.into_inner());
+    let mut committed = false;
+    for (&page, state) in pages.range_mut((p & !(PAGE - 1))..end) {
+        if *state == PageState::Reserved && unsafe { query_page(page).is_some_and(|m| m.State == MEM_RESERVE) }
+            && !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            *state = PageState::Committed;
+            committed = true;
+        }
+    }
+    committed
+}
+
 /// After a successful release, forget tracked pages in the now-free region. Windows
 /// can coalesce adjacent free regions; removing stale metadata there is safe too.
-pub(super) fn forget_released(at: usize) {
+pub(crate) fn forget_released(at: usize) {
     if PAGES.read().unwrap_or_else(|e| e.into_inner()).is_empty() { return; }
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.State != MEM_FREE { return; }
