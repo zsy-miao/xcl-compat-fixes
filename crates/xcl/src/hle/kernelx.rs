@@ -989,14 +989,16 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
 
 /// A page's data went from `home` to another address: a home in a sparse window is
 /// decommitted at the end of the call or every 256 MB (`give_back_homes`; its GPU tiles go too: the GPU does
-/// not see the page while it is away).
-unsafe fn move_home_away(away: &mut Away, home: usize) {
+/// not see the page while it is away). True if homes were given back now.
+unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
     away.gone.push(home);
     // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
     // it ends)
     if away.gone.len() >= 4096 {
         give_back_homes(away);
+        return true;
     }
+    false
 }
 
 /// The homes `move_home_away` collected, decommitted in runs of neighbouring pages.
@@ -1027,42 +1029,73 @@ unsafe fn home_again(home: usize) -> Option<usize> {
 }
 
 fn committed_page(a: usize) -> bool {
-    // Upstream 2c5fe3f (Kalmarv): a resident page is committed. Query one working-set
-    // entry first, instead of repeatedly walking a large homogeneous VirtualQuery region.
+    committed_page_in(a, &mut StateRun::default())
+}
+
+/// The run of pages around an address that one VirtualQuery found in one state. `map_pages`
+/// asks about the pages of a range one after the other and nothing it does in between (a page
+/// left lazy) changes that state: a run answers them without asking again (VirtualQuery walks
+/// the run to its end, and under Wine 98,304 fresh pages took 13 s).
+#[derive(Default)]
+struct StateRun {
+    start: usize,
+    end: usize,
+    committed: bool,
+    reserved: bool,
+}
+
+/// `committed_page`, remembering in `run` the state of the pages around `a`.
+fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
+    if (run.start..run.end).contains(&a) {
+        return run.committed;
+    }
+    // A page in the working set is committed: asking for that is one entry, where VirtualQuery
+    // walks the page table to the end of the committed range the page is in (gigabytes of
+    // homes: 0.25 ms a page, and a scatter of pages from their homes grew with its square).
     let mut ws = windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION { VirtualAddress: a as *mut c_void, ..Default::default() };
     if unsafe { windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(thr::GetCurrentProcess(), &mut ws as *mut _ as *mut c_void, std::mem::size_of_val(&ws) as u32) } != 0
         && unsafe { ws.VirtualAttributes.Flags } & 1 != 0
     {
         return true;
     }
+    #[cfg(test)]
+    VIRTUAL_QUERIES.with(|n| n.set(n.get() + 1));
     let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
+    if unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return false;
+    }
+    let start = m.BaseAddress as usize;
+    *run = StateRun { start, end: start + m.RegionSize, committed: m.State == mem::MEM_COMMIT, reserved: m.State == mem::MEM_RESERVE };
+    run.committed
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The VirtualQuery calls `committed_page_in` made on this thread.
+    static VIRTUAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Deferral must not turn an invalid address (or a partially committed page) into
-/// a successful physical mapping. The whole destination page must be reserved.
-fn reserved_page(a: usize) -> bool {
-    let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    unsafe {
-        mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
-            && m.State == mem::MEM_RESERVE
-            && a.checked_add(PHYS_PAGE).is_some_and(|end| (m.BaseAddress as usize).checked_add(m.RegionSize).is_some_and(|limit| end <= limit))
-    }
+/// a successful physical mapping. Share #556's query, but require the whole page reserved.
+fn reserved_page_in(a: usize, run: &mut StateRun) -> bool {
+    !committed_page_in(a, run) && run.reserved && (run.start..run.end).contains(&a)
+        && a.checked_add(PHYS_PAGE).is_some_and(|end| end <= run.end)
 }
 
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted).
-unsafe fn unmap_away(away: &mut Away, at: usize) {
-    unmap_away_preserving(away, at, &(0..0));
+unsafe fn unmap_away(away: &mut Away, at: usize) -> bool {
+    unmap_away_preserving(away, at, &(0..0))
 }
 
 /// Homes being restored in this call remain committed even if another page was mapped there.
-unsafe fn unmap_away_preserving(away: &mut Away, at: usize, restored: &std::ops::Range<usize>) {
+/// True if memory was committed or decommitted, invalidating the caller's query runs.
+unsafe fn unmap_away_preserving(away: &mut Away, at: usize, restored: &std::ops::Range<usize>) -> bool {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
         note_mapping_at(at);
         // Never touched: the page still consists of zeros at its uncommitted home.
         if lazy::unmark(at) {
-            return;
+            return false;
         }
         // (a home this call has not given back yet is still committed)
         let pending = away.gone.len();
@@ -1078,6 +1111,9 @@ unsafe fn unmap_away_preserving(away: &mut Away, at: usize, restored: &std::ops:
         if !restored.contains(&at) {
             release_at(at);
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -1272,15 +1308,29 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         return std::ptr::null_mut();
     }
     let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
+    // the state of the addresses and homes asked about: dropped when `unmap_away` commits or
+    // decommits and when `move_home_away` gives homes back. The rest of a step changes only an
+    // address, or a home not asked about again (the addresses rise; a page mapped twice is
+    // unmapped first) – bar an address that is another page's home (a home in plain memory):
+    // that answer was wrong before the runs too.
+    let (mut at_run, mut home_run) = (StateRun::default(), StateRun::default());
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
-        unmap_away(away, at);
+        if unmap_away(away, at) {
+            (at_run, home_run) = Default::default();
+        }
         if p == 0 {
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
+            // (a move commits `at` and decommits `old`, which may lie in a run already answered:
+            // both runs go – #556)
             match move_away(away, old, at, p, in_uma(at)) {
-                Ok(true) => continue,
+                Ok(true) => {
+                    (at_run, home_run) = Default::default();
+                    continue;
+                }
+                // a lazy page is only unmarked: memory is as it was, the runs stay
                 Ok(false) => {}
                 Err(()) => {
                     fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
@@ -1288,11 +1338,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
                 }
             }
         }
-        let fresh = !in_uma(at) && !committed_page(at);
+        let fresh = !in_uma(at) && !committed_page_in(at, &mut at_run);
         let home = page_home(p).unwrap();
         // Only CPU-only reservations may defer backing. Sparse UMA needs its GPU tiles now.
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
-        if fresh && plain && reserved_page(at) && !committed_page(home) && lazy::mark(at) {
+        if fresh && plain && reserved_page_in(at, &mut at_run) && !committed_page_in(home, &mut home_run) && lazy::mark(at) {
             away.at.insert(at, p);
             away.page.insert(p, at);
             note_mapping_at(at);
@@ -1304,7 +1354,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
-            move_home_away(away, home);
+            if move_home_away(away, home) {
+                (at_run, home_run) = Default::default();
+            }
         } else if !fresh {
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
@@ -2271,6 +2323,135 @@ mod tests {
             let mut none = [0u64; 1];
             assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, std::ptr::null_mut()), XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, none.as_mut_ptr()));
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn state_runs_keep_whole_page_reservation_checks_without_extra_queries() {
+        unsafe {
+            const N: usize = 8;
+            let r = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            let mut run = StateRun::default();
+            let before = VIRTUAL_QUERIES.with(|q| q.get());
+            for i in 0..N {
+                assert!(!committed_page_in(r + i * PHYS_PAGE, &mut run));
+                assert!(reserved_page_in(r + i * PHYS_PAGE, &mut run));
+            }
+            assert_eq!(VIRTUAL_QUERIES.with(|q| q.get()) - before, 1, "the fork's deferral guard shares the reserved-run query");
+            assert!(!mem::VirtualAlloc((r + 0x1000) as *const c_void, 0x1000, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            // A native state change requires a fresh run, as the map loop's own changes do.
+            run = StateRun::default();
+            assert!(!reserved_page_in(r, &mut run), "a reserved prefix is not a whole reserved physical page");
+            assert!(!reserved_page_in(r + 0x1000, &mut run), "a committed subpage is not deferred");
+            assert!(reserved_page_in(r + PHYS_PAGE, &mut run), "a later whole reserved page remains eligible");
+            assert_ne!(mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 0);
+            assert!(!reserved_page_in(usize::MAX, &mut StateRun::default()), "an invalid address never becomes deferred");
+        }
+    }
+
+    /// Fresh pages mapped into a reservation in one call are left lazy with a few VirtualQuery
+    /// calls, not two per page (13 s under Wine for a title's 98,304 pages); a committed page
+    /// among them is still told from the reserved ones.
+    #[test]
+    fn mapping_fresh_pages_does_not_query_each_page() {
+        const N: usize = 64;
+        unsafe {
+            let mut n = N;
+            let mut pages = [0usize; N];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = page_home(pages[0]).unwrap();
+            assert!(!committed_page(home), "the fork's CPU-only home starts reserved");
+            let r = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let used = r + 3 * PHYS_PAGE;
+            assert!(!mem::VirtualAlloc(used as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            *(used as *mut u32) = 0xABAB_ABAB;
+            let before = VIRTUAL_QUERIES.with(|q| q.get());
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r);
+            let queries = VIRTUAL_QUERIES.with(|q| q.get()) - before;
+            assert!(queries <= 8, "{queries} VirtualQuery calls for {N} pages");
+            assert_eq!(*(used as *const u32), 0, "a committed page is told from the reserved ones: it is not left lazy");
+            assert!(!committed_page(r + 2 * PHYS_PAGE) && !committed_page(r + 4 * PHYS_PAGE), "the others are left lazy");
+            assert!(!committed_page(page_home(pages[N - 1]).unwrap()), "and their homes stay reserved");
+            assert_eq!(*((r + 4 * PHYS_PAGE) as *const u32), 0);
+            // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
+            // is another test's later)
+            assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The fork keeps fresh homes in CPU-only reservations. These #556 tests check native
+    /// queries and CPU bytes; sparse tile side effects remain covered by sparse.rs's tests.
+    unsafe fn fresh_pages(n: usize) -> Vec<usize> {
+        let (mut num, mut pages) = (n, vec![0usize; n]);
+        assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut num, pages.as_mut_ptr()), 1);
+        assert!(!committed_page(page_home(pages[0]).unwrap()));
+        pages
+    }
+
+    /// Pages mapped, half of them written, then all mapped again in one call – at another
+    /// address or the same one: the written ones keep their contents. The first pages of the
+    /// call are never-used (nothing to move), the ones after them are moved: what a run of
+    /// the pages asked about before says is no longer true (the home they moved to is committed
+    /// by now, the address they left decommitted).
+    unsafe fn remap_keeps_what_was_written(same_address: bool) {
+        const N: usize = 8;
+        let mut pages = fresh_pages(N);
+        let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+        let r2 = if same_address { r1 } else { mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize };
+        assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r1);
+        for i in N / 2..N {
+            *((r1 + i * PHYS_PAGE) as *mut u32) = 0x100 + i as u32;
+        }
+        assert_eq!(MapTitlePhysicalPages(r2 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r2);
+        for i in 0..N {
+            let want = if i >= N / 2 { 0x100 + i as u32 } else { 0 };
+            assert_eq!(*((r2 + i * PHYS_PAGE) as *const u32), want, "page {i} (same address: {same_address})");
+        }
+        // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
+        // is another test's later)
+        assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
+        assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+        mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
+        if !same_address {
+            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn pages_mapped_again_at_another_address_keep_what_was_written() {
+        unsafe { remap_keeps_what_was_written(false) }
+    }
+
+    #[test]
+    fn pages_mapped_again_at_the_same_address_keep_what_was_written() {
+        unsafe { remap_keeps_what_was_written(true) }
+    }
+
+    /// Pages never used, mapped again (they are only unmarked: memory is as it was) cost no
+    /// more queries than the first time.
+    #[test]
+    fn mapping_lazy_pages_again_does_not_query_each_page() {
+        const N: usize = 64;
+        unsafe {
+            let mut pages = fresh_pages(N);
+            let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let r2 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r1);
+            for to in [r1, r2] {
+                let before = VIRTUAL_QUERIES.with(|q| q.get());
+                assert_eq!(MapTitlePhysicalPages(to as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, to);
+                let queries = VIRTUAL_QUERIES.with(|q| q.get()) - before;
+                assert!(queries <= 8, "{queries} VirtualQuery calls for {N} pages mapped again");
+            }
+            // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
+            // is another test's later)
+            assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 
