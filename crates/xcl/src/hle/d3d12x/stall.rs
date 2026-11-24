@@ -121,18 +121,22 @@ pub(crate) fn start() {
     });
 }
 
+fn wait_queue_label(q: usize) -> String {
+    super::list_x::try_queue_id(q).map_or_else(|| "unavailable".into(), |id| format!("q{id}"))
+}
+
 fn snapshot(idle: Duration, frames: u64) {
     crate::xlog_warn!("stall snapshot: no shown frame for {} ms ({frames} shown); this alone does not establish a GPU hang", idle.as_millis());
     let records = SUBMISSIONS.try_lock().ok().map(|g| g.as_ref().map(|m| m.iter().map(|(&k, v)| (k, v.clone())).collect::<Vec<_>>()).unwrap_or_default());
     match records {
         Some(records) => for ((q, thread), s) in records {
-            crate::xlog_warn!("stall submit: queue {q:#x}, thread {thread}, stage '{}', age {} ms, last recorded (list, PSO) {:x?}", s.stage, s.since.elapsed().as_millis(), s.lists);
+            crate::xlog_warn!("stall submit: queue {q:#x}, thread {thread}, stage '{}', age {} ms, last recorded (list, PSO) {:x?}, wait-graph queue {}", s.stage, s.since.elapsed().as_millis(), s.lists, wait_queue_label(q));
         },
         None => crate::xlog_warn!("stall submit: tracker busy; unavailable"),
     }
     match super::alloc_pool::diagnostic_progress() {
         Some(queues) => for (q, submitted, completed) in queues {
-            crate::xlog_warn!("stall fence: queue {q:#x}, submitted {submitted}, completed {completed}, removed {}", completed == u64::MAX);
+            crate::xlog_warn!("stall fence: queue {q:#x}, submitted {submitted}, completed {completed}, removed {}, wait-graph queue {}", completed == u64::MAX, wait_queue_label(q));
         },
         None => crate::xlog_warn!("stall fence: allocator tracker busy; unavailable"),
     }

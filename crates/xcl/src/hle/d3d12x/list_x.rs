@@ -1111,12 +1111,24 @@ static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RELEASES: AtomicU64 = AtomicU64::new(0);
 
 fn queue_id(q: usize) -> usize {
-    let mut g = QUEUE_IDS.lock().unwrap();
-    if let Some(pos) = g.iter().position(|&x| x == q) {
+    queue_id_in(&mut QUEUE_IDS.lock().unwrap(), q)
+}
+
+/// The same process-local number used by the wait graph, without blocking a stall snapshot.
+pub(super) fn try_queue_id(q: usize) -> Option<usize> {
+    try_queue_id_in(&QUEUE_IDS, q)
+}
+
+fn try_queue_id_in(ids: &Mutex<Vec<usize>>, q: usize) -> Option<usize> {
+    ids.try_lock().ok().map(|mut ids| queue_id_in(&mut ids, q))
+}
+
+fn queue_id_in(ids: &mut Vec<usize>, q: usize) -> usize {
+    if let Some(pos) = ids.iter().position(|&x| x == q) {
         pos
     } else {
-        let id = g.len();
-        g.push(q);
+        let id = ids.len();
+        ids.push(q);
         id
     }
 }
@@ -4078,6 +4090,19 @@ mod tests {
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
     static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn stall_queue_numbers_match_the_wait_graph_in_either_order() {
+        let ids = Mutex::new(Vec::new());
+        let (wait_first, snapshot_first) = (0xa001, 0xb002);
+        let waiter = queue_id_in(&mut ids.lock().unwrap(), wait_first);
+        assert_eq!(try_queue_id_in(&ids, wait_first), Some(waiter));
+        let sampled = try_queue_id_in(&ids, snapshot_first).unwrap();
+        assert_ne!(waiter, sampled);
+        let mut locked = ids.lock().unwrap();
+        assert_eq!(queue_id_in(&mut locked, snapshot_first), sampled);
+        assert_eq!(try_queue_id_in(&ids, snapshot_first), None, "a busy registry cannot block the snapshot");
+    }
 
     unsafe extern "system" fn reset_test_native(this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
         *(this as *mut usize) = RESET_TEST_REPLACEMENT_VT.load(Ordering::SeqCst) as usize;
