@@ -165,7 +165,7 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// video was its colour of zero luma and chroma, a green screen. `source` names the CPU view
 /// behind an address of such a GPU view, which `d3d12x::title_textures` reads and watches.
 pub mod mirrors {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     /// MEM_LARGE_PAGES | MEM_PHYSICAL: the console's 64 KiB pages
@@ -208,10 +208,12 @@ pub mod mirrors {
         for (g, n) in gone {
             s.gpu.remove(&g);
             let mut pages = PAGES.lock().unwrap();
-            let keys: Vec<usize> = pages.range(g..g + n).map(|(&k, _)| k).collect();
+            let keys: Vec<usize> = pages.at.range(g..g + n).map(|(&k, _)| k).collect();
             for k in keys {
-                pages.remove(&k);
+                pages.set(k, None);
+                pages.at.remove(&k);
             }
+            pages.changed.retain(|&(a, _)| a < g || a >= g + n);
         }
     }
 
@@ -229,17 +231,70 @@ pub mod mirrors {
     }
 
     /// Pages of GPU views the title pointed somewhere else with the queue's page-mapping
-    /// method (`CopyPageMappingsBatchX`, `apply_batches`): GPU-view page → what it shows, or
-    /// `None` for a page left unmapped. A page not listed shows its CPU view (`source`).
-    static PAGES: Mutex<BTreeMap<usize, Option<Shown>>> = Mutex::new(BTreeMap::new());
+    /// method (`CopyPageMappingsBatchX`, `apply_batches`).
+    struct Pages {
+        /// GPU-view page → what it shows, or `None` for a page left unmapped. A page not
+        /// listed shows its CPU view (`source`).
+        at: BTreeMap<usize, Option<Shown>>,
+        /// physical page → the GPU-view pages that show it
+        by_page: BTreeMap<usize, BTreeSet<usize>>,
+        /// GPU-view ranges whose bytes are elsewhere since the last `take_changed`: mapped or
+        /// unmapped, or their physical page was moved
+        changed: Vec<(usize, usize)>,
+    }
+    static PAGES: Mutex<Pages> = Mutex::new(Pages { at: BTreeMap::new(), by_page: BTreeMap::new(), changed: Vec::new() });
+
+    impl Pages {
+        /// GPU-view page `va` shows `to` from now on: `by_page` follows.
+        fn set(&mut self, va: usize, to: Option<Shown>) {
+            let old = self.at.insert(va, to);
+            if let Some(p) = old.flatten().and_then(|s| s.page) {
+                if let Some(set) = self.by_page.get_mut(&p) {
+                    set.remove(&va);
+                    if set.is_empty() {
+                        self.by_page.remove(&p);
+                    }
+                }
+            }
+            if let Some(p) = to.and_then(|s| s.page) {
+                self.by_page.entry(p).or_default().insert(va);
+            }
+            self.note(va);
+        }
+
+        /// The page at `va` changed (runs of pages kept together).
+        fn note(&mut self, va: usize) {
+            match self.changed.last_mut() {
+                Some((_, end)) if *end == va => *end += PAGE,
+                _ => self.changed.push((va, va + PAGE)),
+            }
+        }
+    }
 
     /// What the page-mapping method put under `va`: `Some(Some(a))` – `va` shows the bytes at
     /// `a` (where XCL keeps the physical page now, else the pool page itself), `Some(None)` –
     /// nothing (unmapped), `None` – the method never mapped that page.
     pub fn mapped_source(va: usize) -> Option<Option<usize>> {
         let off = va & (PAGE - 1);
-        let shown = *PAGES.lock().unwrap().get(&(va - off))?;
+        let shown = *PAGES.lock().unwrap().at.get(&(va - off))?;
         Some(shown.map(|s| s.page.and_then(super::page_now).unwrap_or(s.pool) + off))
+    }
+
+    /// Physical page `page` was mapped, unmapped, moved or freed: the GPU-view pages that show
+    /// it read it elsewhere now (`take_changed`).
+    pub(super) fn page_moved(page: usize) {
+        let mut g = PAGES.lock().unwrap();
+        let Some(vas) = g.by_page.get(&page) else { return };
+        let vas: Vec<usize> = vas.iter().copied().collect();
+        for va in vas {
+            g.note(va);
+        }
+    }
+
+    /// The GPU-view ranges whose bytes are elsewhere since the last call (`d3d12x::title_textures`
+    /// reads the textures there again).
+    pub fn take_changed() -> Vec<(usize, usize)> {
+        std::mem::take(&mut PAGES.lock().unwrap().changed)
     }
 
     /// One call of the queue's page-mapping method, `CopyPageMappingsBatchX(count, batches,
@@ -317,7 +372,7 @@ pub mod mirrors {
                 }
                 None => out.unmapped += 1,
             }
-            pages.insert(va, to);
+            pages.set(va, to);
         }
         Some(out)
     }
@@ -1258,6 +1313,7 @@ unsafe fn unmap_away(away: &mut Away, at: usize) -> bool {
 unsafe fn unmap_away_preserving(away: &mut Away, at: usize, restored: &std::ops::Range<usize>) -> bool {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
+        mirrors::page_moved(page);
         note_mapping_at(at);
         // Never touched: the page still consists of zeros at its uncommitted home.
         if lazy::unmark(at) {
@@ -1376,6 +1432,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         let away = g.get_or_insert_with(Away::default);
         for i in 0..n {
             let page = *arr.add(i);
+            mirrors::page_moved(page);
             if let Some(at) = away.page.remove(&page) {
                 away.at.remove(&at);
                 note_mapping_at(at);
@@ -1501,6 +1558,10 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
         away.title.remove(&at);
+        if p != 0 {
+            // (read where it lands, by the GPU views that show it)
+            mirrors::page_moved(p);
+        }
         if unmap_away(away, at) {
             (at_run, home_run) = Default::default();
         }
