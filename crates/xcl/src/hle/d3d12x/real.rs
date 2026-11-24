@@ -5700,6 +5700,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        29 => q_copy_page_mappings(a1 as u32, a2, a3, a4 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -5745,6 +5746,34 @@ macro_rules! queue_slots {
     };
 }
 queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
+
+/// command queue #29 (#31 in the newer layout) `CopyPageMappingsBatchX(count, batches, pool,
+/// pool pages, flags)`: the title maps pages of its memory into GPU views – a retail game the
+/// pages its texture streaming fills (a 6 GB pool) into the GPU views its textures are in,
+/// tens of thousands of them while its world loads. Recorded per page (`kernelx::mirrors`);
+/// as a stub every mapping was dropped (#1031).
+unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pages: u32) -> HRESULT {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static MAPPED: AtomicU64 = AtomicU64::new(0);
+    static UNMAPPED: AtomicU64 = AtomicU64::new(0);
+    static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+    static PHYSICAL: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
+        Some(d) => {
+            let add = |total: &AtomicU64, k: u64| total.fetch_add(k, Ordering::Relaxed) + k;
+            let (m, p, u, e) = (add(&MAPPED, d.mapped), add(&PHYSICAL, d.physical), add(&UNMAPPED, d.unmapped), add(&ELSEWHERE, d.elsewhere));
+            if n == 1 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {m} mapped ({p} to a physical page the title mapped there), {u} unmapped; {e} pages elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB)");
+            }
+        }
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue CopyPageMappingsBatchX({count}, {batches:#x}, {pool:#x}, {pool_pages}): a batch or range is unreadable or leaves the pool – the call is ignored"));
+        }
+    }
+    S_OK
+}
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
