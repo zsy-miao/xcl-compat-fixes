@@ -26,6 +26,12 @@ $pr195Revision = 'bf26412d368fcf6aecf7cc9ba9804aaf2ad3fc92'
 $pr203Revision = '7cbd0088cc40a6456ffa3939c5bb307a23105cc1'
 $textureAllocatorRevision = '38b05b7b6954cfa5bd21cec72f68823603ca2227'
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+$syncRegressionFilters = @(
+    'writable_resident_proof_covers_unaligned_destinations_and_batch_edges',
+    'writable_proof_is_fresh_and_does_not_touch_cold_or_guard_pages',
+    'commitment_probe_preserves_resident_cold_reserved_and_guarded_states',
+    'placed_title_textures_share_vram_and_preserve_pixels'
+)
 $testPassed = 0
 $testIgnored = 0
 $testSkips = @()
@@ -396,7 +402,7 @@ try {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::xg::tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'untranslated_stream_rect_lists_get_the_pcs_topology_type', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'gpu_mesh_mode_two_passes', '--', '--test-threads=1', '--nocapture') -CountTests
-        foreach ($filter in @('wait64_', 'bvh_source::tests', 'clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start', 'a_page_away_at_another_home_goes_home_with_it', 'clwb', 'real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
+        foreach ($filter in $syncRegressionFilters + @('wait64_', 'bvh_source::tests', 'clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start', 'a_page_away_at_another_home_goes_home_with_it', 'clwb', 'real::this_first_tests', 'gpu::tiling::tests', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io')) {
             Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', $filter, '--', '--test-threads=1', '--nocapture') -CountTests
         }
     }
@@ -549,6 +555,13 @@ try {
         $info.test_suites += @('connectivity_hint (XCL_NETWORK=0)', 'hle::netoff::tests')
         $info.test_suites = @('wait64_ (recording and submission controls)', 'bvh_source::tests', 'clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start', 'a_page_away_at_another_home_goes_home_with_it', 'clwb (includes eh::clwb_batch_tests)', 'real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
         $info.test_suites = @('console_depth_buffers_and_their_views_are_the_pcs', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'untranslated_stream_rect_lists_get_the_pcs_topology_type', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
+        $info.applied_patches += @(
+            [ordered]@{ pull_request = 218; url = 'https://github.com/ivall/xcl/pull/218'; upstream_commit = 'd4f17ca3246b6013bfa39ea2bed543cbe52309a6'; scope = 'Upstream scalar Wait64 comparison with the local wait-flag and command-submission regressions.' },
+            [ordered]@{ pull_request = 447; url = 'https://github.com/ivall/xcl/pull/447'; source_revision = '48e7434f5fa51934c3cd225eed4336a0bf9b0747'; scope = 'Verify cubemap reuse by per-resource tile identity.' },
+            [ordered]@{ pull_request = 508; url = 'https://github.com/ivall/xcl/pull/508'; source_revision = '61ee2a280184ba22995ef306609dc18aa975e981'; scope = 'Refresh remapped title textures and remember only successful uploads. Includes local GPU readback coverage.' },
+            [ordered]@{ pull_request = 509; url = 'https://github.com/ivall/xcl/pull/509'; source_revision = '3724b07170bd2ad3f689cbcfa2006a718b4443ea'; scope = 'Guard late physical-page array reads and test decommit races.' }
+        )
+        $info.test_suites = $syncRegressionFilters + $info.test_suites
         $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
         if ($bc5HelperTests -gt 0) { $info.test_suites += 'bc5_external_ (separate reference helper)' }
         $patchNote += "`r`nIncludes PR #163 depth fixes ($pr163Revision) and PR #170 mesh pipeline fixes ($pr170Revision)."
