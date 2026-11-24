@@ -924,9 +924,9 @@ mod tests {
     fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
         let (building, built, failed) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize);
         // lazy submits: no worker starts them, so the states stay under the test's control
-        pso_async::submit_lazy(building, false, Box::new(|| 0x1234));
-        pso_async::submit_lazy(built, false, Box::new(|| 0x1235));
-        pso_async::submit_lazy(failed, false, Box::new(|| 0));
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234), 0);
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235), 0);
+        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
         assert!(pso_async::is_pending(building));
         assert_eq!(pso_async::resolve_wait(built), 0x1235);
         assert_eq!(pso_async::resolve_wait(failed), failed);

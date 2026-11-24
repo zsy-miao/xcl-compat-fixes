@@ -551,7 +551,10 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
-            *STATE.lock().unwrap() = Some(s);
+            // a state this replaces (the windows set up again) goes after the lock: the release of
+            // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            let old = STATE.lock().unwrap().replace(s);
+            drop(old);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
@@ -1158,10 +1161,12 @@ pub unsafe fn free(p: usize) -> bool {
     if !u.is_sparse(p) {
         return false;
     }
-    let Some(len) = u.sparse_release(p) else { return false };
-    decommitted(p, len);
+    // decommitted before the address goes back: once released, another thread may get it,
+    // commit it and write there
+    let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+    decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
-    true
+    u.sparse_release(p).is_some()
 }
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
@@ -1494,6 +1499,32 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block freed on one thread while another allocates: its address goes back to the
+    /// windows only once it is decommitted (released first, the decommit came after another
+    /// thread had the same address again: that thread's writes faulted).
+    #[test]
+    fn a_freed_block_is_decommitted_before_its_address_is_reused() {
+        if crate::gpu::uma::get().is_none_or(|u| !u.has_sparse()) {
+            return;
+        }
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| unsafe {
+                    for i in 0..2000u64 {
+                        let Some((p, n)) = alloc(TILE, TILE) else { continue };
+                        std::ptr::write_volatile(p as *mut u64, i);
+                        std::ptr::write_volatile((p + n - 8) as *mut u64, i);
+                        assert_eq!(std::ptr::read_volatile(p as *const u64), i);
+                        assert!(free(p));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
 
     #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {

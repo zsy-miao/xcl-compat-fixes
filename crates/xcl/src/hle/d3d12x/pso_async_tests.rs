@@ -29,7 +29,7 @@ fn lazy_pipeline_waits_for_its_first_bind() {
         job_calls.fetch_add(1, Ordering::SeqCst);
         finished.send(()).unwrap();
         0
-    }));
+    }), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0, "creation must not run the build");
     assert!(is_pending(key.0));
     assert!(matches!(completion.try_recv(), Err(mpsc::TryRecvError::Empty)));
@@ -48,7 +48,7 @@ fn concurrent_waiting_binds_build_a_lazy_pipeline_once() {
     submit_lazy(key.0, false, Box::new(move || {
         job_calls.fetch_add(1, Ordering::SeqCst);
         0
-    }));
+    }), 0);
     const CALLERS: usize = 8;
     let ready = Arc::new(Barrier::new(CALLERS + 1));
     std::thread::scope(|scope| {
@@ -87,7 +87,7 @@ fn releasing_an_unused_lazy_pipeline_drops_its_job_without_building() {
         job_calls.fetch_add(1, Ordering::SeqCst);
         drop(captured);
         0
-    }));
+    }), 0);
     assert_eq!(released(key.0), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1, "releasing before use must release captured build data");

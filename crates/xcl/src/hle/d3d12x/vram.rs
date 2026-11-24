@@ -182,6 +182,39 @@ struct Page {
     idle_since: Option<std::time::Instant>,
 }
 
+/// A page of `Pages::pages` (its title address) or of `Pages::extra_pages` (its key there).
+#[derive(Clone, Copy)]
+enum PageKey {
+    Own(usize),
+    Extra(usize, usize),
+}
+
+/// The pages of `idle` – those whose last user went, oldest first, each with when – that no
+/// resource has used for `IDLE` go back to the pools: out of their map, their tile to `cooling`.
+/// An entry whose page was used again since (in use now, or idle again from a later moment, with
+/// a later entry) is dropped. Only the queue is looked at: every page of both maps, looked at at
+/// every placement, grew with the square of what a title streams.
+fn sweep_idle(
+    idle: &mut std::collections::VecDeque<(PageKey, std::time::Instant)>,
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    while idle.front().is_some_and(|&(_, since)| now.duration_since(since) >= IDLE) {
+        let Some((key, since)) = idle.pop_front() else { break };
+        let still_idle = |p: &Page| p.idle_since == Some(since);
+        let page = match key {
+            PageKey::Own(a) if pages.get(&a).is_some_and(still_idle) => pages.remove(&a),
+            PageKey::Extra(va, i) if extra_pages.get(&(va, i)).is_some_and(still_idle) => extra_pages.remove(&(va, i)),
+            _ => None,
+        };
+        if let Some(p) = page {
+            cooling.push_back((p.tile, now));
+        }
+    }
+}
+
 struct Target {
     va: usize,
     console_bytes: Option<u64>,
@@ -206,6 +239,8 @@ struct Pages {
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
     /// address share them without aliasing unrelated addresses
     extra_pages: std::collections::HashMap<(usize, usize), Page>,
+    /// pages of both maps whose last user went, oldest first, with when (`sweep_idle`)
+    idle: std::collections::VecDeque<(PageKey, std::time::Instant)>,
     /// resource → its mapping metadata and currently held pages / extra keys
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
@@ -239,24 +274,15 @@ impl Pages {
             cooling: std::collections::VecDeque::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
+            idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
         })
     }
 
-    fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
-        let old: Vec<K> = map.iter().filter(|(_, p)| p.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)).map(|(&k, _)| k).collect();
-        for k in old {
-            if let Some(p) = map.remove(&k) {
-                cooling.push_back((p.tile, now));
-            }
-        }
-    }
-
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
-        Self::sweep_map(&mut self.pages, &mut self.cooling, now);
-        Self::sweep_map(&mut self.extra_pages, &mut self.cooling, now);
+        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.cooling, now);
     }
 
     unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
@@ -346,6 +372,7 @@ impl Pages {
                         }
                     } else {
                         p.idle_since = Some(now);
+                        self.idle.push_back((PageKey::Own(a), now));
                     }
                 }
             }
@@ -360,6 +387,7 @@ impl Pages {
                         }
                     } else {
                         p.idle_since = Some(now);
+                        self.idle.push_back((PageKey::Extra(k.0, k.1), now));
                     }
                 }
             }
@@ -685,6 +713,60 @@ mod tests {
         assert_eq!(heap_ranges(1, &tiles), [(false, 0, 2), (true, 0, 2), (false, 0, 3)]);
         // shared pages out of order: runs break where the tiles do
         assert_eq!(heap_ranges(0, &[(0, 3), (0, 1), (0, 2)]), [(true, 3, 1), (true, 1, 2)]);
+    }
+
+    /// Idle pages go back after `IDLE`, and a sweep looks at the queue of idle pages alone: one
+    /// used again stays, one idle again later goes when that is `IDLE` ago, and the sweeps of
+    /// 20 000 placements beside 200 000 pages in use take no time to speak of (a look at every
+    /// page at each of them: 4 000 000 000 looks).
+    #[test]
+    fn idle_pages_are_swept_from_their_queue() {
+        use std::collections::{HashMap, VecDeque};
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut idle: VecDeque<(PageKey, Instant)> = VecDeque::new();
+        let mut pages: HashMap<usize, Page> = (0..200_000usize).map(|i| (i * PAGE, Page { tile: (0, i as u32), users: 1, idle_since: None })).collect();
+        let mut extra: HashMap<(usize, usize), Page> = HashMap::from([((7 * PAGE, 3), Page { tile: (1, 0), users: 1, idle_since: None })]);
+        let mut cooling: VecDeque<(Tile, Instant)> = VecDeque::new();
+        // what `release_tiles` and `bind` do to a page
+        fn release(p: &mut Page, idle: &mut VecDeque<(PageKey, Instant)>, key: PageKey, when: Instant) {
+            (p.users, p.idle_since) = (0, Some(when));
+            idle.push_back((key, when));
+        }
+        fn use_again(p: &mut Page) {
+            (p.users, p.idle_since) = (1, None);
+        }
+        // pages 1, 2, 3 idle at 0 ms and an extra page at 100 ms; page 2 is used again at
+        // 500 ms; page 3 too, and is idle again at 1500 ms
+        for a in [PAGE, 2 * PAGE, 3 * PAGE] {
+            release(pages.get_mut(&a).unwrap(), &mut idle, PageKey::Own(a), at(0));
+        }
+        release(extra.get_mut(&(7 * PAGE, 3)).unwrap(), &mut idle, PageKey::Extra(7 * PAGE, 3), at(100));
+        use_again(pages.get_mut(&(2 * PAGE)).unwrap());
+        use_again(pages.get_mut(&(3 * PAGE)).unwrap());
+        release(pages.get_mut(&(3 * PAGE)).unwrap(), &mut idle, PageKey::Own(3 * PAGE), at(1500));
+
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(1900));
+        assert!(cooling.is_empty() && pages.len() == 200_000 && idle.len() == 5, "nothing is idle for IDLE yet");
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(2050));
+        assert_eq!(cooling.iter().map(|c| c.0).collect::<Vec<_>>(), [(0, 1)], "page 1 alone: 2 is in use, 3 idle since 1500 ms");
+        assert!(!pages.contains_key(&PAGE) && pages.contains_key(&(2 * PAGE)) && pages.contains_key(&(3 * PAGE)) && extra.len() == 1);
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(2150));
+        assert_eq!(cooling.iter().map(|c| c.0).collect::<Vec<_>>(), [(0, 1), (1, 0)], "the extra page, idle since 100 ms");
+        assert!(extra.is_empty() && pages.len() == 199_999);
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(3499));
+        assert!(pages.contains_key(&(3 * PAGE)));
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(3500));
+        assert_eq!(cooling.iter().map(|c| c.0).collect::<Vec<_>>(), [(0, 1), (1, 0), (0, 3)]);
+        assert!(idle.is_empty() && pages.len() == 199_998 && pages[&(2 * PAGE)].users == 1);
+
+        // every placement sweeps: with nothing idle that is nothing, whatever is in use
+        let t = Instant::now();
+        for k in 0..20_000u64 {
+            sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(4000 + k));
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?} for 20 000 sweeps", t.elapsed());
+        assert_eq!(pages.len(), 199_998);
     }
 
     /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so
