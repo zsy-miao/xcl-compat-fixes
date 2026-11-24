@@ -9,6 +9,8 @@ experimental limits. Ongoing commits are published on `work-in-progress`;
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/xcl)
 **Discord: <https://discord.gg/xcl>**
 
+**PRIMES TEMP DISCORD: <https://discord.gg/gK3y7WRRY>**
+
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
 x64 code runs natively and XCL stands in for the console libraries the PC does not have
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
