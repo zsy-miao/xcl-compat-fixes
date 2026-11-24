@@ -27,6 +27,8 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// sent to the workers (a lazy pipeline is sent at its first use)
     queued: std::sync::atomic::AtomicBool,
+    /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
+    late: std::sync::atomic::AtomicBool,
 }
 
 impl Pending {
@@ -165,6 +167,7 @@ fn pending(standin: usize, compute: bool, job: Job, key: u64) -> Arc<Pending> {
         orphan: Default::default(),
         job: Mutex::new(Some(job)),
         queued: Default::default(),
+        late: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     p
@@ -382,6 +385,30 @@ mod used_tests {
         }
     }
 
+    /// A bind waits for a pipeline still being built no longer than its budget and goes on with
+    /// the stand-in; later binds do not wait for it again; once built it is the real one.
+    #[test]
+    fn a_bind_waits_for_a_slow_pipeline_no_longer_than_its_budget() {
+        let standin = 0x7E57_B001usize;
+        submit(standin, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            0x5151
+        }));
+        let budget = Some(std::time::Duration::from_millis(30));
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_for(standin, budget), standin, "not built within the budget: the stand-in");
+        assert!(t.elapsed() < std::time::Duration::from_millis(400), "waited {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_for(standin, budget), standin);
+        assert!(t.elapsed() < std::time::Duration::from_millis(20), "a late pipeline is not waited for again ({:?})", t.elapsed());
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
+        let _ = released(standin);
+    }
+
     #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
@@ -456,8 +483,16 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
+    resolve_wait_for(pso, wait_budget())
+}
+
+/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
+    if let Some(budget) = budget {
+        return resolve_within(&p, pso, budget);
+    }
     // not started yet: build it now instead of waiting behind the whole queue (thousands of
     // pipelines while a title loads – GTA VI's watchdog killed the game while a title thread
     // waited here), on a thread with the translator's stack, its compiles first
@@ -482,6 +517,44 @@ pub fn resolve_wait(pso: usize) -> usize {
         0 => pso,
         r => r,
     }
+}
+
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset: until it
+/// is built). A retail game builds compute programs on its own threads: the driver takes up to
+/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
+/// has been held 30 s.
+fn wait_budget() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(std::time::Duration::from_millis))
+}
+
+/// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
+/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
+/// dispatches are skipped) until a worker has built it.
+fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
+        0 => pso,
+        r => r,
+    };
+    if *p.done.lock().unwrap() {
+        return built(p);
+    }
+    send(p.clone());
+    if p.late.load(Ordering::Acquire) {
+        return pso;
+    }
+    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
+    if *done {
+        return built(p);
+    }
+    drop(done);
+    p.late.store(true, Ordering::Release);
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
+    }
+    pso
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
