@@ -42,6 +42,50 @@ impl Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
+/// Sample jobs already taken by a worker/bind. Never wait for a pipeline's mutex in a stall report.
+pub(super) fn diagnostic_builds() -> Option<(Vec<(usize, u64, bool)>, usize)> {
+    diagnostic_builds_in(&PENDING)
+}
+
+fn diagnostic_builds_in(pending: &Mutex<Option<HashMap<usize, Arc<Pending>>>>) -> Option<(Vec<(usize, u64, bool)>, usize)> {
+    let g = pending.try_lock().ok()?;
+    let mut busy = 0;
+    let builds = g.as_ref().map(|m| m.iter().filter_map(|(&id, p)| {
+        let Ok(done) = p.done.try_lock() else { busy += 1; return None };
+        if *done { return None; }
+        let Ok(job) = p.job.try_lock() else { busy += 1; return None };
+        if job.is_some() { return None; }
+        Some((id, p.key, p.compute))
+    }).take(16).collect()).unwrap_or_default();
+    Some((builds, busy))
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn stall_snapshot_distinguishes_queued_building_complete_and_busy_jobs() {
+        let p = Arc::new(Pending {
+            job: Mutex::new(Some(Box::new(|| 0))), sent: Default::default(), real: AtomicUsize::new(0),
+            done: Mutex::new(false), cv: Condvar::new(), compute: true, key: 123,
+            used: Default::default(), orphan: Default::default(), late: Default::default(),
+        });
+        let pending = Mutex::new(Some(HashMap::from([(42, p.clone())])));
+        assert_eq!(diagnostic_builds_in(&pending), Some((vec![], 0)), "queued is not building");
+        p.job.lock().unwrap().take();
+        assert_eq!(diagnostic_builds_in(&pending), Some((vec![(42, 123, true)], 0)));
+        {
+            let _held = p.job.lock().unwrap();
+            assert_eq!(diagnostic_builds_in(&pending), Some((vec![], 1)));
+        }
+        *p.done.lock().unwrap() = true;
+        assert_eq!(diagnostic_builds_in(&pending), Some((vec![], 0)));
+        let _held = pending.lock().unwrap();
+        assert!(diagnostic_builds_in(&pending).is_none(), "busy map is not waited for");
+    }
+}
+
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
     if real == 0 {

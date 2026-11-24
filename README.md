@@ -146,6 +146,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- `XCL_STALL_SECONDS=8` writes snapshots to `xcl.log` when shown frames stop after the first frame
+  (1–120 seconds; unset or 0 disables it). Each pause has at most three snapshots, one interval apart.
+  They sample submission stages, last recorded list/PSO pairs, existing allocator fence markers and
+  unfinished pipeline builds (at most 32 queue/thread records, 8 lists each, 32 fences and 16 builds).
+  Busy trackers are reported as unavailable; no GPU waits or signals
+  are added. A recorded PSO is not necessarily executing, an untracked queue can still be busy, and
+  a pause (including a minimized window) does not by itself establish a GPU hang.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).

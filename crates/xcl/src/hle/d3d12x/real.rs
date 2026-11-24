@@ -5532,8 +5532,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    let submission = super::stall::enter(this as usize);
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
+    submission.stage("map command lists");
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -5545,15 +5547,24 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    submission.lists(&mapped);
+    submission.stage("prepare waits and uploads");
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+        submission.stage("host ExecuteCommandLists");
         f(this, chunk.len() as u32, chunk.as_ptr());
+        submission.stage("allocator fence marker");
         super::alloc_pool::executed(this, chunk);
+        submission.stage("write64 signal");
         super::list_x::signal_write64_fences(this, chunk);
+        submission.stage("sparse write readback");
         super::list_x::readback_sparse_writes(this, chunk);
+        submission.stage("CPU writeback");
         super::list_x::cpu_writes_after(this, chunk);
     });
+    submission.stage("submitted texture state");
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
+    submission.stage("presentation after submit");
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }
