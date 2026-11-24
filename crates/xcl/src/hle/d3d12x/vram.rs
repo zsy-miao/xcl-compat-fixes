@@ -591,6 +591,19 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
 }
 
+/// Pool/tile identities used by one mapped resource: title pages, then extra pages.
+/// Unlike device-wide byte counts, these cannot shrink when unrelated idle targets expire.
+#[cfg(test)]
+pub(super) fn tile_mappings_for(device: usize, resource: usize) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
+    let g = PAGES.lock().unwrap();
+    let p = g.get(&device)?.as_ref()?;
+    let target = p.targets.get(&resource)?;
+    if !target.mapped { return None; }
+    let used = target.used.iter().map(|key| p.pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
+    let extra = target.used_extra.iter().map(|key| p.extra_pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
+    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+}
+
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();

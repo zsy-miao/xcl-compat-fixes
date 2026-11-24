@@ -1777,9 +1777,16 @@ mod tests {
                 }
                 // Placing a second cubemap at the same va must reuse every tile including extra_pages.
                 if label.contains("cubemap") {
-                    let p0 = dev_pages();
+                    // Binding sweeps unrelated targets idle for two seconds, so a device-wide
+                    // byte count can fall here even when every tile of this cube is shared.
+                    let mappings = super::super::vram::tile_mappings_for(dev.as_raw() as usize, res.as_raw() as usize).expect("cube is mapped");
+                    assert!(!mappings.0.is_empty() || !mappings.1.is_empty(), "cube must have mapped tiles");
                     let res2 = place_tex(base, &d);
-                    assert_eq!(dev_pages(), p0, "cubemap extra_pages must be reused at same va");
+                    assert_eq!(super::super::vram::tile_mappings_for(dev.as_raw() as usize, res2.as_raw() as usize).as_ref(), Some(&mappings),
+                        "the second cube must reuse every title-page and extra-page tile");
+                    assert_eq!(super::super::vram::tile_mappings_for(dev.as_raw() as usize, res.as_raw() as usize).as_ref(), Some(&mappings),
+                        "the original cube must keep the same tile mappings");
+                    println!("{label}: reused {} title-page tiles and {} extra-page tiles", mappings.0.len(), mappings.1.len());
                     drop(res2);
                 }
                 drop(res);
