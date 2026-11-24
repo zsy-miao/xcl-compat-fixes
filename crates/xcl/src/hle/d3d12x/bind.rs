@@ -38,6 +38,12 @@ struct State {
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
 
+/// A bounded, non-blocking snapshot; these are recorded PSOs, not proof of GPU execution.
+pub(super) fn diagnostic_pipelines(lists: &[*mut c_void]) -> Option<Vec<(usize, usize)>> {
+    let g = STATES.try_lock().ok()?;
+    Some(lists.iter().take(8).map(|&l| (l as usize, g.as_ref().and_then(|m| m.get(&(l as usize))).map_or(0, |s| s.pso))).collect())
+}
+
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 

@@ -55,6 +55,17 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Sample existing queue markers without holding the allocator lock across a driver call.
+/// No waits or extra GPU signals; a missing marker is not evidence that a queue is idle.
+pub(super) fn diagnostic_progress() -> Option<Vec<(usize, u64, u64)>> {
+    diagnostic_progress_in(&STATE)
+}
+
+fn diagnostic_progress_in(state: &Mutex<Option<State>>) -> Option<Vec<(usize, u64, u64)>> {
+    let marks: Vec<_> = state.try_lock().ok()?.as_ref().map(|s| s.fences.iter().take(32).map(|(&q, (f, v))| (q, f.clone(), *v)).collect()).unwrap_or_default();
+    Some(marks.into_iter().map(|(q, f, v)| (q, v, unsafe { f.GetCompletedValue() })).collect())
+}
+
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -261,6 +272,37 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_snapshot_reads_pending_and_completed_gpu_markers_without_waiting() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let marker: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            struct Unblock(ID3D12Fence);
+            impl Drop for Unblock { fn drop(&mut self) { unsafe { let _ = self.0.Signal(1); } } }
+            let _unblock = Unblock(gate.clone());
+            queue.Wait(&gate, 1).unwrap();
+            queue.Signal(&marker, 7).unwrap();
+            let mut s = State::default();
+            s.fences.insert(queue.as_raw() as usize, (marker.clone(), 7));
+            let state = Mutex::new(Some(s));
+            assert_eq!(diagnostic_progress_in(&state), Some(vec![(queue.as_raw() as usize, 7, 0)]));
+            {
+                let _held = state.lock().unwrap();
+                assert!(diagnostic_progress_in(&state).is_none(), "busy state is skipped, not waited for");
+            }
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while marker.GetCompletedValue() < 7 && start.elapsed().as_secs() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(diagnostic_progress_in(&state), Some(vec![(queue.as_raw() as usize, 7, 7)]));
+        }
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
