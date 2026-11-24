@@ -585,6 +585,8 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// upload buffers for `CopyMemoryToMemoryX` from CPU memory outside unified memory, filled at submit
+    pending_uploads: Vec<PendingUpload>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -806,6 +808,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.pending_uploads.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -1917,14 +1920,28 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
-/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+/// After `lists` went to `queue`: their writes into memory the GPU does not see.
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {
         let g = LISTS.lock().unwrap();
         let Some(m) = g.as_ref() else { return };
-        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+        lists
+            .iter()
+            .filter_map(|&l| m.get(&(l as usize)))
+            .flat_map(|s| s.cpu_writes.iter().cloned())
+            .collect()
     };
     super::cpu_writes::after(queue, writes);
+}
+
+/// Fill the buffers just before submission and keep the references through ExecuteCommandLists.
+pub(super) unsafe fn fill_uploads(lists: &[*mut c_void]) -> Vec<ID3D12Resource> {
+    let uploads: Vec<PendingUpload> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return Vec::new() };
+        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.pending_uploads.iter().cloned()).collect()
+    };
+    uploads.into_iter().map(|u| u.fill()).collect()
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -1973,6 +1990,24 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 // memory copy / fill / immediate write / timestamp
 // ---------------------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct PendingUpload {
+    src: usize,
+    size: usize,
+    mapped: usize,
+    buf: ID3D12Resource,
+}
+
+impl PendingUpload {
+    unsafe fn fill(self) -> ID3D12Resource {
+        let dst = self.mapped as *mut u8;
+        if !super::title_textures::copy_gpu_view(self.src, dst, self.size) && crate::gpu::shader::readable(self.src, self.size) {
+            std::ptr::copy_nonoverlapping(self.src as *const u8, dst, self.size);
+        }
+        self.buf
+    }
+}
+
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -1980,9 +2015,32 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    let Some((d, doff)) = real::uma_window_buffer(dst as usize, size as usize) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+    };
+    let Some((s, soff)) = real::uma_window_buffer(src as usize, size as usize) else {
+        if !crate::gpu::shader::readable(src as usize, size as usize)
+            && crate::hle::kernelx::mirrors::source_range(src as usize, size as usize).is_none() {
+            note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+            return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+        }
+        let Some((buf, mapped)) = create_mapped_upload(this, size) else {
+            note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+            return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes): no upload buffer"));
+        };
+        let buf_raw = buf.as_raw() as usize;
+        note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+        note_write(this as usize, dst, size);
+        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, buf_raw, 0, size));
+        if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            st.pending_uploads.push(PendingUpload { src: src as usize, size: size as usize, mapped: mapped as usize, buf });
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            crate::xlog_info!("D3D12.X: CopyMemoryToMemoryX from memory outside unified memory goes through an upload buffer ({size:#x} bytes)");
+        });
+        return;
     };
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     if d == s && dst < src + size && src < dst + size {
@@ -2038,10 +2096,16 @@ impl CopyScratch {
     }
 }
 
+struct SubmittedUploads {
+    mark: Option<(ID3D12Fence, u64)>,
+    _buffers: Vec<ID3D12Resource>,
+}
+
 #[derive(Default)]
 struct CopyScratchCache {
     active: HashMap<usize, CopyScratch>,
     released: Vec<CopyScratch>,
+    uploads: Vec<SubmittedUploads>,
     fences: HashMap<usize, (ID3D12Fence, u64)>,
     bytes: u64,
     reaping: bool,
@@ -2056,6 +2120,10 @@ impl CopyScratchCache {
             self.bytes -= scratch.bytes;
             false
         });
+    }
+
+    fn needs_reaper(&self) -> bool {
+        self.released.iter().any(|s| !s.untracked_submission) || self.uploads.iter().any(|batch| batch.mark.is_some())
     }
 
     fn release(&mut self, list: usize) {
@@ -2098,19 +2166,26 @@ static COPY_SCRATCH: LazyLock<Mutex<CopyScratchCache>> = LazyLock::new(|| Mutex:
 fn release_copy_scratch(list: usize) {
     let mut cache = COPY_SCRATCH.lock().unwrap();
     cache.release(list);
-    if cache.reaping || !cache.released.iter().any(|s| !s.untracked_submission) {
+    reap_copy_buffers(&mut cache);
+}
+
+fn reap_copy_buffers(cache: &mut CopyScratchCache) {
+    if cache.reaping || !cache.needs_reaper() {
         return;
     }
-    // A title can stop submitting work after releasing the list. Reclaim its scratch when
-    // the GPU finishes even if no call touches the cache again.
+    // A title can stop submitting after releasing its list. Reclaim completed buffers then too.
     cache.reaping = std::thread::Builder::new().name("xcl-copy-scratch".into()).spawn(|| loop {
-        {
-            let mut cache = COPY_SCRATCH.lock().unwrap();
-            cache.collect_released();
-            if !cache.released.iter().any(|s| !s.untracked_submission) {
-                cache.reaping = false;
-                return;
-            }
+        let mut cache = COPY_SCRATCH.lock().unwrap();
+        cache.collect_released();
+        let completed: Vec<_> = cache.uploads.extract_if(.., |batch| {
+            batch.mark.as_ref().is_some_and(|(fence, value)| unsafe { fence.GetCompletedValue() >= *value })
+        }).collect();
+        let more = cache.needs_reaper();
+        cache.reaping = more;
+        drop(cache);
+        drop(completed); // a resource's final Release can call back into XCL
+        if !more {
+            return;
         }
         std::thread::sleep(Duration::from_millis(16));
     }).is_ok();
@@ -2130,11 +2205,11 @@ fn reset_copy_scratch(list: *mut c_void) {
     }
 }
 
-/// Mark GPU ownership on the queue that actually submitted each PC list or split segment.
-pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_void]) {
+/// Scratch and staged uploads share a completion mark on the queue that submitted this segment.
+pub(super) unsafe fn copy_buffers_submitted(queue: *mut c_void, lists: &[*mut c_void], uploads: Vec<ID3D12Resource>) {
     let mut cache = COPY_SCRATCH.lock().unwrap();
     cache.collect_released();
-    if !lists.iter().any(|l| cache.active.get(&(*l as usize)).is_some_and(|s| s.recorded)) {
+    if uploads.is_empty() && !lists.iter().any(|l| cache.active.get(&(*l as usize)).is_some_and(|s| s.recorded)) {
         return;
     }
     let mark = (|| {
@@ -2147,19 +2222,28 @@ pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_
         }
         let (fence, value) = cache.fences.get_mut(&key)?;
         let next = *value + 1;
-        q.Signal(&*fence, next).ok()?;
-        *value = next;
-        Some((fence.clone(), next))
+        let signaled = q.Signal(&*fence, next).is_ok();
+        if signaled {
+            *value = next;
+        }
+        Some((fence.clone(), next, signaled))
     })();
     for list in lists {
         if let Some(scratch) = cache.active.get_mut(&(*list as usize)).filter(|s| s.recorded) {
-            if let Some((fence, value)) = &mark {
+            if let Some((fence, value, true)) = &mark {
                 scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), *value));
             } else {
                 // Without a completion mark the GPU could still access this buffer.
                 scratch.untracked_submission = true;
             }
         }
+    }
+    if !uploads.is_empty() {
+        // If Signal failed, a later successful signal on this queue can still reach its value.
+        // With no fence at all there is no safe completion point for these references.
+        let mark = mark.map(|(fence, value, _)| (fence, value));
+        cache.uploads.push(SubmittedUploads { mark, _buffers: uploads });
+        reap_copy_buffers(&mut cache);
     }
 }
 
@@ -2187,21 +2271,8 @@ unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
     dev
 }
 
-/// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
-static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
-
-/// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
-unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
-    let mut cache = PATTERNS.lock().unwrap();
-    if let Some((_, b, _)) = cache.iter().find(|(p, _, len)| *p == pat && *len >= n) {
-        return Some(b.as_raw() as usize);
-    }
-    // a larger one replaces an older pattern buffer only when nothing may still read it: kept
-    if cache.len() >= 32 {
-        return None;
-    }
+unsafe fn create_mapped_upload(list: *mut c_void, len: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let dev = device_of(list)?;
-    let len = n.next_power_of_two().max(0x1_0000);
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: len,
@@ -2225,7 +2296,25 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
     let b = b?;
     let mut p: *mut c_void = std::ptr::null_mut();
     b.Map(0, None, Some(&mut p)).ok()?;
-    for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
+    Some((b, p as *mut u8))
+}
+
+/// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
+static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
+unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
+    let mut cache = PATTERNS.lock().unwrap();
+    if let Some((_, b, _)) = cache.iter().find(|(p, _, len)| *p == pat && *len >= n) {
+        return Some(b.as_raw() as usize);
+    }
+    // a larger one replaces an older pattern buffer only when nothing may still read it: kept
+    if cache.len() >= 32 {
+        return None;
+    }
+    let len = n.next_power_of_two().max(0x1_0000);
+    let (b, p) = create_mapped_upload(list, len)?;
+    for chunk in std::slice::from_raw_parts_mut(p, len as usize).chunks_exact_mut(16) {
         chunk.copy_from_slice(&pat);
     }
     b.Unmap(0, None);
@@ -2940,11 +3029,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let write64_signals = s.clear_write64_signals();
         s.written_ranges.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let uploads = std::mem::take(&mut s.pending_uploads);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes, uploads))
     };
-    let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
+    let (sparse_writes, write64_signals, cpu_writes, uploads) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -2974,8 +3064,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
+                let uploads = fill_uploads(chunk);
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
-                copy_scratch_submitted(q_raw, chunk);
+                copy_buffers_submitted(q_raw, chunk, uploads);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
@@ -2991,10 +3082,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if !waits.is_empty() {
         wait_all_on(q_raw, &waits, &write64_signals);
     }
+    let uploads = uploads.into_iter().map(|u| u.fill()).collect();
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
-    copy_scratch_submitted(q_raw, &one);
+    copy_buffers_submitted(q_raw, &one, uploads);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -3036,6 +3128,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.clear_write64_signals();
             s.clear_waits();
             s.cpu_writes.clear();
+            s.pending_uploads.clear();
             s.bindings = bindings_copy;
         }
         primary
@@ -3647,6 +3740,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.pending_uploads.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -4125,6 +4219,95 @@ mod tests {
         assert_eq!(cell.recorded_last_queue, Some(2));
     }
 
+
+    #[test]
+    fn staged_copy_waits_for_its_own_queue_without_blocking_cpu_writes() {
+        use std::io::Write;
+        use windows::core::IUnknown;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        // Other tests use the process's default D3D12 device and expect its queues to be idle.
+        const CHILD: &str = "XCL_TEST_HELD_COPY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let thread = std::thread::current();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", thread.name().unwrap(), "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            std::io::stderr().write_all(&result.stderr).unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+            return;
+        }
+
+        unsafe fn refs(buffer: &ID3D12Resource) -> u32 {
+            let raw = buffer.clone().into_raw();
+            (IUnknown::from_raw_borrowed(&raw).unwrap().vtable().Release)(raw)
+        }
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let desc = D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() };
+            let held: ID3D12CommandQueue = dev.CreateCommandQueue(&desc).unwrap();
+            let free: ID3D12CommandQueue = dev.CreateCommandQueue(&desc).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let (upload, mapped) = create_mapped_upload(list.as_raw(), 4).unwrap();
+            let mut readback: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &upload.GetDesc(), D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+            let readback = readback.unwrap();
+            list.CopyBufferRegion(&readback, 0, &upload, 0, 4);
+            list.Close().unwrap();
+            let source = 0x1234_abcdu32;
+            let initial = refs(&upload); // keep our reference even if XCL releases its own too early
+            on_create(list.as_raw(), alloc.as_raw() as usize, 0, ty);
+            LISTS.lock().unwrap().as_mut().unwrap().get_mut(&(list.as_raw() as usize)).unwrap().pending_uploads.push(
+                PendingUpload { src: &source as *const u32 as usize, size: 4, mapped: mapped as usize, buf: upload.clone() });
+            real::adopt(held.as_raw(), real::Kind::CommandQueue);
+            held.Wait(&gate, 1).unwrap();
+            held.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            held.Signal(&done, 1).unwrap();
+            on_release(list.as_raw() as usize);
+
+            static WRITTEN: AtomicU32 = AtomicU32::new(0);
+            let start = Instant::now();
+            use super::super::cpu_writes;
+            cpu_writes::after(free.as_raw(), vec![cpu_writes::Write::Immediate(&WRITTEN as *const _ as usize, vec![7])]);
+            while WRITTEN.load(Ordering::Acquire) == 0 && start.elapsed() < Duration::from_secs(12) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let independent_write = start.elapsed();
+            // The old CPU-write worker relinquished the buffer after its ten-second watchdog.
+            std::thread::sleep(Duration::from_millis(10_250).saturating_sub(start.elapsed()));
+            let pending = done.GetCompletedValue();
+            let held_refs = refs(&upload);
+            gate.Signal(1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).unwrap();
+            let mut data = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let actual = data.cast::<u32>().read();
+            readback.Unmap(0, None);
+            let release = Instant::now();
+            while refs(&upload) > initial && release.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let final_refs = refs(&upload);
+            eprintln!("independent write {independent_write:?}, held fence {pending}, upload refs {initial}/{held_refs}/{final_refs}, readback {actual:#010x}");
+            assert_eq!(pending, 0);
+            assert_eq!(actual, source);
+            assert!(held_refs > initial, "the blocked queue still needs the upload");
+            assert_eq!(final_refs, initial);
+            assert_eq!(WRITTEN.load(Ordering::Acquire), 7);
+            assert!(independent_write < Duration::from_secs(5), "an unrelated upload delayed the write");
+        }
+    }
 
     #[test]
     fn copy_scratch_budget_counts_resources_until_gpu_completion() {

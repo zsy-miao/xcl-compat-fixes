@@ -408,13 +408,37 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
 /// before its first use too, while it is still reserved memory (`kernelx::physical_page_at`).
 fn mirror_source(va: usize) -> usize {
     let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
+    mirror_source_span(va, src).0
+}
+
+/// The address to read and how far the choice between the two views holds.
+fn mirror_source_span(va: usize, cpu: usize) -> (usize, usize) {
+    let page = crate::hle::kernelx::PHYS_PAGE_SIZE;
+    let remaining = page - va % page;
     if crate::hle::kernelx::physical_page_at(va) {
-        return va;
+        return (va, remaining);
     }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
-    if mapped { va } else { src }
+    if unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return (cpu, remaining);
+    }
+    let span = m.RegionSize - (va - m.BaseAddress as usize);
+    (if m.State == MEM_COMMIT { va } else { cpu }, remaining.min(span))
+}
+
+/// Fill a copy upload from a registered GPU view. Page mappings may have changed since recording.
+pub(super) unsafe fn copy_gpu_view(va: usize, dst: *mut u8, len: usize) -> bool {
+    let Some(cpu) = crate::hle::kernelx::mirrors::source_range(va, len) else { return false };
+    std::ptr::write_bytes(dst, 0, len);
+    let mut offset = 0;
+    while offset < len {
+        let (src, span) = mirror_source_span(va + offset, cpu + offset);
+        let bytes = span.min(len - offset);
+        copy_committed_into(src, dst.add(offset), bytes);
+        offset += bytes;
+    }
+    true
 }
 
 /// Physical pages were mapped or unmapped in a GPU view since the last look: textures there
@@ -1116,14 +1140,20 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
-    let Some(limit) = at.checked_add(len) else { return out };
+    copy_committed_into(at, out.as_mut_ptr(), len);
+    out
+}
+
+/// Copy readable spans into a pre-zeroed destination, leaving any gaps zero.
+unsafe fn copy_committed_into(at: usize, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let Some(limit) = at.checked_add(len) else { return };
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
-        return out;
+        std::ptr::copy_nonoverlapping(at as *const u8, dst, len);
+        return;
     }
     let mut p = at;
     while p < limit {
@@ -1137,11 +1167,10 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         }
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
+            copy_committed_region(p, dst.add(p - at), end - p);
         }
         p = end;
     }
-    out
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
@@ -1984,6 +2013,41 @@ mod tests {
                 drop(res);
             }
             uma.free(base);
+        }
+    }
+
+    #[test]
+    fn copy_gpu_view_reads_each_mapping_and_leaves_holes_zero() {
+        use crate::hle::kernelx::{mirrors, PHYS_PAGE_SIZE as PAGE};
+        use windows_sys::Win32::System::Memory as mem;
+        struct View(usize);
+        impl Drop for View {
+            fn drop(&mut self) {
+                mirrors::released(self.0);
+                unsafe { mem::VirtualFree(self.0 as *mut c_void, 0, mem::MEM_RELEASE); }
+            }
+        }
+        unsafe {
+            let reserve = |protect| {
+                let at = mem::VirtualAlloc(std::ptr::null(), 3 * PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+                assert!(!at.is_null());
+                mirrors::reserved(at as usize, 3 * PAGE, 0x2040_2000, protect);
+                View(at as usize)
+            };
+            let cpu = reserve(mem::PAGE_READWRITE);
+            let gpu = reserve(0x801);
+            let back = mem::VirtualAlloc(cpu.0 as *const _, 2 * PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            let direct = mem::VirtualAlloc((gpu.0 + PAGE) as *const _, 4096, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert!(!back.is_null() && !direct.is_null());
+            std::ptr::write_bytes(back.cast::<u8>(), 0x22, 2 * PAGE);
+            std::ptr::write_bytes(direct.cast::<u8>(), 0x33, 4096);
+            let mut bytes = [0xFF; 8];
+            for (boundary, left, right) in [(PAGE, 0x22, 0x33), (PAGE + 4096, 0x33, 0x22), (2 * PAGE, 0x22, 0)] {
+                assert!(copy_gpu_view(gpu.0 + boundary - 4, bytes.as_mut_ptr(), bytes.len()));
+                assert_eq!(bytes, [left, left, left, left, right, right, right, right]);
+            }
+            assert!(!copy_gpu_view(gpu.0 + 3 * PAGE - 4, bytes.as_mut_ptr(), bytes.len()));
+            assert_eq!(bytes, [0x22, 0x22, 0x22, 0x22, 0, 0, 0, 0]);
         }
     }
 

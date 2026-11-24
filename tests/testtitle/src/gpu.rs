@@ -494,13 +494,28 @@ pub fn console_list_methods() -> Result<(), String> {
         let kickoff: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(slot(93));
 
         // 1. Memory writes, timestamp, fill, copy, and same-list write-then-wait (must not deadlock)
+        let mut heap_src = vec![0u8; 64];
+        // Reserve address space larger than the sparse windows so these are paired CPU and GPU
+        // views outside unified memory. Only the first CPU page needs backing.
+        let view_size = 13usize << 30;
+        let cpu = crate::XMemVirtualAlloc(std::ptr::null(), view_size, 0x2040_2000, 0, 4);
+        let gpu = crate::XMemVirtualAlloc(std::ptr::null(), view_size, 0x2040_2000, 0, 0x801);
+        ensure!(!cpu.is_null() && !gpu.is_null(), "reserve graphics views");
+        ensure!(crate::XMemVirtualAlloc(cpu, 0x10000, 0x1000, 0, 4) == cpu, "commit the CPU view");
         write32_bottom(l, at(0), 0x1234_5678, 0, 0);
         write64_top(l, at(8), 0x1122_3344_5566_7788, 0);
         write64_bottom(l, at(0x10), 0, 0, 1); // GPU timestamp
         fill32(l, at(0x100), 0x100, 0xABCD_EF01);
         copy(l, at(0x2000), at(0x1000), 64, 0);
+        copy(l, at(0x2100), heap_src.as_ptr() as u64, 64, 0);
+        copy(l, at(0x2300), gpu as u64, 64, 0);
         wait32(l, at(0), 3, 0x1234_5678, u32::MAX, 0);
         list.Close().map_err(e)?;
+        // Write the title heap after recording and before submitting.
+        for (i, b) in heap_src.iter_mut().enumerate() {
+            *b = i as u8 ^ 0xA5;
+        }
+        std::ptr::copy_nonoverlapping(heap_src.as_ptr(), cpu.cast(), 64);
         queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
         wait(&queue, &fence, 1)?;
@@ -511,11 +526,23 @@ pub fn console_list_methods() -> Result<(), String> {
         ensure!(r64(0x10) != 0, "no GPU timestamp");
         ensure!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01) && r32(0x200) == 0 && r32(0xFC) == 0, "FillMemoryWith32BitValueX");
         ensure!((0..64).all(|i| *mem.add(0x2000 + i) == i as u8 ^ 0x5A) && *mem.add(0x2040) == 0, "CopyMemoryToMemoryX");
+        ensure!((0..64).all(|i| *mem.add(0x2100 + i) == i as u8 ^ 0xA5) && *mem.add(0x2140) == 0, "CopyMemoryToMemoryX from title heap");
+        let executed = (0..64).all(|i| *mem.add(0x2300 + i) == heap_src[i]) && *mem.add(0x2340) == 0;
 
         // 2. KickoffX (#93): flushes work to the GPU BEFORE Close() is called, then continues recording
         alloc.Reset().map_err(e)?;
         list.Reset(&alloc, None).map_err(e)?;
+        copy(l, at(0x2200), heap_src.as_ptr() as u64, 64, 0);
+        copy(l, at(0x2400), gpu as u64, 64, 0);
+        // A wait on a different, already-satisfied cell splits the list after this write.
+        write64_bottom(l, at(0x420), 1, 0, 0);
+        wait64(l, at(0x428), 3, 0, u64::MAX, 0);
+        copy(l, at(0x2480), gpu as u64, 64, 0);
         write32_bottom(l, at(0x400), 0x1111_2222, 0, 0);
+        for (i, b) in heap_src.iter_mut().enumerate() {
+            *b = i as u8 ^ 0x3C;
+        }
+        std::ptr::copy_nonoverlapping(heap_src.as_ptr(), cpu.cast(), 64);
         kickoff(l);
         // Wait for the kicked-off write on the GPU while the list is still open!
         let t0 = std::time::Instant::now();
@@ -525,6 +552,13 @@ pub fn console_list_methods() -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         ensure!(r32(0x400) == 0x1111_2222, "KickoffX did not flush work before Close ({:#x})", r32(0x400));
+        ensure!((0..64).all(|i| *mem.add(0x2200 + i) == i as u8 ^ 0x3C) && *mem.add(0x2240) == 0, "CopyMemoryToMemoryX from title heap before KickoffX");
+        let kicked = [0x2400, 0x2480].into_iter().all(|dest| {
+            (0..64).all(|i| *mem.add(dest + i) == heap_src[i]) && *mem.add(dest + 64) == 0
+        });
+        ensure!(crate::VirtualFree(gpu, 0, 0x8000) != 0, "release the GPU view");
+        ensure!(crate::VirtualFree(cpu, 0, 0x8000) != 0, "release the CPU view");
+        ensure!(executed && kicked, "GPU-view copy at ExecuteCommandLists={executed}, KickoffX={kicked}");
         // Continue recording on the same list and submit normally via Close + ExecuteCommandLists
         write32_bottom(l, at(0x404), 0x3333_4444, 0, 0);
         list.Close().map_err(e)?;
