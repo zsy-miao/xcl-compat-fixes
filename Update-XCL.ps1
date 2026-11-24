@@ -190,6 +190,7 @@ try {
     if ($branch -eq $patchBranch) {
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'clzero_batch', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'connectivity_hint', '--', '--test-threads=1', '--nocapture') -CountTests
+        Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'hle::netoff::tests', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'sse4a', '--', '--test-threads=1', '--nocapture') -CountTests
         Invoke-Checked -Command $cargoCommand -CommandArguments @('test', '--locked', '--release', '-p', 'xcl', '--lib', 'dstorage', '--', '--test-threads=1', '--nocapture', '--skip', 'external_pipe_parent', '--skip', 'external_pipe_descendant', '--skip', 'bc5_external_') -CountTests
         if ($savedExternalDecoder) {
@@ -335,7 +336,22 @@ try {
             url = 'https://github.com/ivall/xcl/issues/175#issuecomment-7118129089'
             scope = 'Report no title connectivity in offline mode, even on a connected Windows host.'
         }
-        $info.test_suites += 'connectivity_hint (XCL_NETWORK=0)'
+        $info.upstream_integrations += [ordered]@{
+            source_commit = 'db1ddb25f3ff0c1686eed8200d238ad35f895926'; prerequisite_commit = '38b05b7b6954cfa5bd21cec72f68823603ca2227'
+            url = 'https://github.com/ivall/xcl/issues/305'
+            scope = 'Apply offline mode to the process-wide Windows network entry points used by the title and its libraries.'
+        }
+        $info.applied_patches += [ordered]@{
+            pull_request = 462; url = 'https://github.com/ivall/xcl/pull/462'
+            source_revision = '17172b593ae1324591d43ace8192458934cca70e'
+            scope = 'Apply offline mode to the Winsock ConnectEx extension.'
+        }
+        $info.applied_patches += [ordered]@{
+            pull_request = 273; url = 'https://github.com/ivall/xcl/pull/273'
+            source_revision = '5f12643999939d07a234081dbc835c0d8a0497c2'
+            scope = 'Single-stage BC1 reconstruction using the existing bounded entropy decoder and estimated BC1 tables. Tests cover virtual and scattered physical destinations.'
+        }
+        $info.test_suites += @('connectivity_hint (XCL_NETWORK=0)', 'hle::netoff::tests')
         $info.test_suites = @('clwb', 'real::this_first_tests', 'gpu::tiling::tests') + $info.test_suites
         $info.test_suites = @('console_depth_buffers_become_pc_ones', 'real::depth_regression_tests', 'typeless_depth_resource_accepts_typed_dsv_and_shader_views', 'real::texture_regression_tests', 'real::mesh_refusal_tests', 'compute_first_use_is_a_persistent_per_title_opt_in', 'pso_async::scheduling_tests', 'hle::xg::tests', 'console_mesh_streams_become_pc_ones', 'gpu_mesh_mode_two_passes', 'gpu_memory_windows_from_the_heap', 'gpu_memory_windows_above_4_gib', 'gpu_raw_window_view_reaches_its_top', 'sparse::tests', 'vram::tests', 'vram::gpu_regression_tests', 'kernelx::lazy::tests', 'physical_pages_in_plain_reservations_are_lazy_and_round_trip', 'physical_pages_reject_an_unreserved_plain_destination', 'read_file_commits_a_lazy_destination_before_kernel_io', 'gpu_compute_e2e::console_wave64_compute_through_the_pso_hook_dispatch_and_read_back (XCL_LAZY_COMPUTE=1)') + $info.test_suites
         $info.test_suites = @('dstorage (subprocess fixture entry points excluded; inherited-pipe regression executed)', 'hle::d3d12x::title_textures::mirror_tests', 'bcpack_controls::independent_synthetic_corpus (2049 controls, 2066 blocks)') + $info.test_suites
