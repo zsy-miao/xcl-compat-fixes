@@ -3634,16 +3634,36 @@ mod driver_cache {
         }
     }
 
+    fn create_staging_file(p: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        create_staging_file_with(p, &NEXT)
+    }
+
+    fn create_staging_file_with(p: &Path, next: &AtomicU64) -> std::io::Result<(PathBuf, std::fs::File)> {
+        loop {
+            let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), next.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(file) => return Ok((tmp, file)),
+                // A prior process with this PID may have left a file behind. It is not ours.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
     pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        use std::io::Write;
         if bytes.is_empty() {
             return false;
         }
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        let Ok((tmp, mut file)) = create_staging_file(p) else { return false };
+        let written = file.write_all(bytes).is_ok();
+        drop(file);
+        let ok = written && std::fs::rename(&tmp, p).is_ok();
         if !ok {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -3663,6 +3683,11 @@ mod driver_cache {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
 
         #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
@@ -3691,6 +3716,44 @@ mod driver_cache {
             note(false, Some(&p));
             assert_eq!(load(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_overlapping_writer_cannot_modify_the_published_blob() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-overlap-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            // Another writer, paused after the production staging-file creation step.
+            let (_other_tmp, mut other) = create_staging_file(&p).unwrap();
+            let complete = b"complete second blob";
+            assert!(write(&p, complete));
+            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()));
+            // Resuming the older writer must not change a file already published by this
+            // invocation, even when the older payload is shorter than the newer one.
+            other.write_all(b"old").unwrap();
+            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()), "published bytes must not alias another writer's staging file");
+        }
+
+        #[test]
+        fn an_abandoned_staging_file_is_skipped_and_preserved() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-stale-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            let occupied = p.with_extension(format!("tmp{}-0", std::process::id()));
+            std::fs::write(&occupied, b"not ours").unwrap();
+            let next = AtomicU64::new(0);
+            let (tmp, mut file) = create_staging_file_with(&p, &next).unwrap();
+            assert_eq!(next.load(Ordering::Relaxed), 2, "the occupied candidate was passed over");
+            assert_ne!(tmp, occupied);
+            file.write_all(b"ours").unwrap();
+            drop(file);
+            std::fs::rename(&tmp, &p).unwrap();
+            assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
+            assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
         }
     }
 }
