@@ -4662,8 +4662,13 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(fill, "        o.p{k} = {v};");
     }
     let tri_base = MESH_HEADER + mv as usize * vd;
+    // The declaration is chosen by the vertex budget, the dispatch group count separately:
+    // a record over the budget in whole vertices can still fit one compact group (its few
+    // triangles' own copies fit) – declaring verts[mv] there is refused by DXC (80 vertices
+    // with 22 float4 rows are accounted as 96: 33792 B > 32768).
+    let cap = passthrough_max_vertices(16 * (1 + elems.len() as u32));
     let split = passthrough_split(ms, elems.len());
-    if split == 1 {
+    if mv <= cap {
         let _ = writeln!(
             h,
             "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
@@ -4717,9 +4722,12 @@ fn passthrough_max_vertices(vbytes: u32) -> u32 {
     (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
 }
 
-/// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
-/// mesh output limit as they are, else the triangles are split into runs whose own vertex
-/// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
+/// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
+/// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
+/// triangle) fit – whichever costs fewer groups. The layout choice in `mesh_passthrough_for`
+/// is by the vertex budget alone; this count is the dispatch's, and one compact group can
+/// carry a record whose whole declaration would be refused. `elements`: output elements
+/// besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
     let cap = passthrough_max_vertices(vbytes);

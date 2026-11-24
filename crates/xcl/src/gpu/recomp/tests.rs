@@ -2955,6 +2955,49 @@ fn mesh_split_accounts_vertex_chunks() {
     super::dxc::compile(&pass8, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass8}"));
 }
 
+/// The layout and the dispatch count are chosen separately: a record of 80 vertices with 22
+/// float4 rows does not fit the mesh output budget as a whole (DXC accounts 96 vertices:
+/// 33792 B > 32768 B), but its single triangle's copies fit one compact group. The pass-
+/// through must then declare the compact layout while `passthrough_split` returns 1, and DXC
+/// accepts it (the whole-record declaration is refused).
+#[test]
+fn mesh_layout_independent_of_group_count() {
+    use super::emit::{mesh_passthrough, passthrough_elements, passthrough_split};
+    use super::MsInterface;
+    if super::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    let sig = |name: &str, sv: u32, reg: u32, index: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let mut outputs = vec![sig("SV_Position", 1, 0, 0)];
+    for k in 0..20u32 {
+        outputs.push(sig("TEXCOORD", 0, k + 1, k));
+    }
+    outputs.push(sig("SV_ClipDistance", 2, 21, 0));
+    // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let elems = passthrough_elements(&ms, None);
+    assert_eq!(elems, 21);
+    // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
+    assert_eq!(passthrough_split(&ms, elems), 1, "one triangle fits one compact group");
+    let pass = mesh_passthrough(&ms);
+    assert!(pass.contains("verts[3]"), "the compact layout is chosen, not verts[80]:\n{pass}");
+    super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    // the whole-record form is what DXC refuses at this width (80 accounted as 96)
+    let refused = mesh_passthrough(&MsInterface { max_vertices: 80, max_primitives: 1, ..ms.clone() });
+    assert!(refused.contains("verts[3]"), "the compact form stays:\n{refused}");
+}
+
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
 #[test]
 #[ignore]
