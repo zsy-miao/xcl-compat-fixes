@@ -420,7 +420,9 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             if emulate_clwb_loop(ctx, code) { return -1; }
             use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
             let mut old = 0u32;
-            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
+            // A debugger must still see the original instruction on the next visit.
+            // Outside instruction stepping, retain upstream's generic NOP fallback.
+            if ctx.EFlags & 0x100 == 0 && unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
                 let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
                 code.fill(0x90);
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
@@ -1126,22 +1128,33 @@ mod clwb_batch_tests {
     const LOOP: [u8; 13] = [0x66, 0x0F, 0xAE, 0x30, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x3B, 0xC1, 0x76, 0xF3];
     const ARITHMETIC_FLAGS: u64 = 0x8D5; // CF/PF/AF/ZF/SF/OF, all overwritten by CMP.
 
-    fn test_code() -> usize {
-        static CODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CODE.get_or_init(|| {
-            let mut bytes = [0x90u8; 16];
-            bytes[..LOOP.len()].copy_from_slice(&LOOP);
-            // The mapped-module registry lives for the process: retain its tiny
-            // synthetic code allocation for exactly that lifetime too.
-            let code = Box::leak(Box::new(bytes)).as_ptr() as usize;
+    struct TestCode(usize);
+
+    impl TestCode {
+        fn new(bytes: &[u8]) -> Self {
+            use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+            let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+            assert_ne!(code, 0);
+            unsafe {
+                std::ptr::write_bytes(code as *mut u8, 0x90, 0x1000);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+            }
             modules::register_mapped(std::sync::Arc::new(modules::MappedModule {
                 name: "clwb_batch_test.dll".into(), path: "clwb_batch_test.dll".into(),
-                base: code, size: 16, entry_rva: 0, is_dll: true, exports: Default::default(),
+                base: code, size: 0x1000, entry_rva: 0, is_dll: true, exports: Default::default(),
                 tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: std::sync::atomic::AtomicBool::new(false),
                 initialized: std::sync::atomic::AtomicBool::new(true), stack_reserve: 0,
             }));
-            code
-        })
+            Self(code)
+        }
+    }
+
+    impl Drop for TestCode {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            modules::unregister_mapped(self.0);
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE); }
+        }
     }
 
     unsafe fn native_cmp_flags(left: u64, right: u64) -> u64 {
@@ -1163,7 +1176,8 @@ mod clwb_batch_tests {
 
     #[test]
     fn saved_context_reaches_native_compare_with_scalar_registers_and_flags() {
-        let code = test_code();
+        let owned_code = TestCode::new(&LOOP);
+        let code = owned_code.0;
         for (start, bound) in [(0x1000u64, 0), (0x1000, 0x1000), (0x1000, 0x1040), (0x1051, 0x1102)] {
             unsafe {
                 let mut ctx: CONTEXT = std::mem::zeroed();
@@ -1188,7 +1202,8 @@ mod clwb_batch_tests {
     #[test]
     fn equality_at_the_chunk_limit_runs_the_remaining_iteration() {
         unsafe {
-            let code = test_code();
+            let owned_code = TestCode::new(&LOOP);
+            let code = owned_code.0;
             let mut ctx: CONTEXT = std::mem::zeroed();
             ctx.Rip = code as u64;
             ctx.Rcx = 64 << 20;
@@ -1206,7 +1221,8 @@ mod clwb_batch_tests {
     #[test]
     fn stepping_unknown_loops_and_overflow_keep_single_instruction_semantics() {
         unsafe {
-            let code = test_code();
+            let owned_code = TestCode::new(&LOOP);
+            let code = owned_code.0;
             let mut ctx: CONTEXT = std::mem::zeroed();
             ctx.Rip = code as u64;
             ctx.Rax = 0x1000;
@@ -1214,6 +1230,8 @@ mod clwb_batch_tests {
             ctx.EFlags = 0x302; // TF: let the debugger observe every ADD/backedge.
             assert_eq!(emulate_console_only(&mut ctx), -1);
             assert_eq!((ctx.Rip, ctx.Rax, ctx.Rcx, ctx.EFlags), ((code + 4) as u64, 0x1000, 0x2000, 0x302));
+            assert_eq!(std::slice::from_raw_parts(code as *const u8, LOOP.len()), &LOOP,
+                "single stepping must neither batch nor patch the instruction");
 
             ctx.Rip = code as u64;
             ctx.Rax = u64::MAX - 63;
@@ -1221,6 +1239,9 @@ mod clwb_batch_tests {
             ctx.EFlags = 0x202;
             assert_eq!(emulate_console_only(&mut ctx), -1);
             assert_eq!((ctx.Rip, ctx.Rax, ctx.EFlags), ((code + 4) as u64, u64::MAX - 63, 0x202));
+            assert_eq!(std::slice::from_raw_parts(code as *const u8, 4), &[0x90; 4],
+                "a declined batch retains upstream's generic NOP fallback");
+            assert_eq!(std::slice::from_raw_parts((code + 4) as *const u8, LOOP.len() - 4), &LOOP[4..]);
 
             ctx.Rip = code as u64;
             ctx.Rax = 0x1000;
@@ -1231,6 +1252,14 @@ mod clwb_batch_tests {
             ctx.Rip = u64::MAX - 7;
             assert!(!emulate_clwb_loop(&mut ctx, &LOOP));
             assert_eq!((ctx.Rip, ctx.Rax), (u64::MAX - 7, 0x1000));
+
+            let unknown = TestCode::new(&changed);
+            (ctx.Rip, ctx.Rax, ctx.Rcx) = (unknown.0 as u64, 0x1000, 0x2000);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax, ctx.Rcx, ctx.EFlags), ((unknown.0 + 4) as u64, 0x1000, 0x2000, 0x202));
+            assert_eq!(std::slice::from_raw_parts(unknown.0 as *const u8, 4), &[0x90; 4]);
+            assert_eq!(std::slice::from_raw_parts((unknown.0 + 4) as *const u8, changed.len() - 4), &changed[4..],
+                "an unrecognized loop must not skip or rewrite its native arithmetic");
         }
     }
 }
@@ -1333,6 +1362,7 @@ mod tests {
     #[test]
     fn clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start() {
         use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         let alloc = || unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
         let (buf, code) = (alloc(), alloc());
@@ -1345,6 +1375,20 @@ mod tests {
         }));
         // clzero; add rax, 0x40; cmp rax, rdx; jb -12
         let loop_bytes: [u8; 12] = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4];
+        let finish_native_cmp = |ctx: &mut CONTEXT| {
+            // The bounded path leaves CMP/JB native. Check its checkpoint first,
+            // then use the host CPU, independently of cmp_eflags, to finish it.
+            assert_eq!(ctx.Rip, (code + 7) as u64);
+            let flags: u64;
+            unsafe {
+                std::arch::asm!("cmp {left}, {right}", "pushfq", "pop {flags}",
+                    left = in(reg) ctx.Rax, right = in(reg) ctx.Rdx, flags = lateout(reg) flags);
+            }
+            const ARITHMETIC: u32 = 0x8D5;
+            ctx.EFlags = (ctx.EFlags & !ARITHMETIC) | (flags as u32 & ARITHMETIC);
+            assert_eq!(ctx.EFlags & 1, 0, "these completed chunks must exit the native JB");
+            ctx.Rip = (code + 12) as u64;
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), code as *mut u8, loop_bytes.len());
 
@@ -1353,8 +1397,11 @@ mod tests {
             let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
             (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x40) as u64, (buf + 0x100) as u64, 0x202 | 0x001);
             assert_eq!(emulate_console_only(&mut ctx), -1);
-            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.Rip, code as u64 + 7);
             assert_eq!(ctx.Rax, (buf + 0x100) as u64);
+            assert_eq!(ctx.EFlags, 0x202 | 0x001, "the native CMP has not executed yet");
+            finish_native_cmp(&mut ctx);
+            assert_eq!(ctx.Rip, code as u64 + 12);
             assert_eq!(ctx.EFlags, 0x202 | 0x040 | 0x004);
             let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
             assert!(s[..0x40].iter().all(|&b| b == 0xA5));
@@ -1366,27 +1413,57 @@ mod tests {
             ctx = std::mem::zeroed();
             (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x50) as u64, (buf + 0xC0) as u64, 0x202 | 0x041);
             assert_eq!(emulate_console_only(&mut ctx), -1);
-            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.Rip, code as u64 + 7);
             assert_eq!(ctx.Rax, (buf + 0xD0) as u64);
+            assert_eq!(ctx.EFlags, 0x202 | 0x041);
+            finish_native_cmp(&mut ctx);
+            assert_eq!(ctx.Rip, code as u64 + 12);
             assert_eq!(ctx.EFlags, 0x202);
             let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
             assert!(s[..0x40].iter().all(|&b| b == 0xA5));
             assert!(s[0x40..0xC0].iter().all(|&b| b == 0));
             assert!(s[0xC0..0x140].iter().all(|&b| b == 0xA5));
 
-            // 3) end <= start: executes the single first clzero line [0x40..0x80) and steps only 3 bytes so add/cmp/jb runs natively
+            // 3) end <= start still executes one CLZERO/ADD iteration; CMP/JB remains native.
             for end in [buf + 0x40, buf] {
                 std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
                 ctx = std::mem::zeroed();
                 (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x53) as u64, end as u64, 0x202);
                 assert_eq!(emulate_console_only(&mut ctx), -1);
-                assert_eq!(ctx.Rip, code as u64 + 3);
-                assert_eq!(ctx.Rax, (buf + 0x53) as u64);
+                assert_eq!(ctx.Rip, code as u64 + 7);
+                assert_eq!(ctx.Rax, (buf + 0x93) as u64);
+                assert_eq!(ctx.EFlags, 0x202);
+                finish_native_cmp(&mut ctx);
                 let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
                 assert!(s[..0x40].iter().all(|&b| b == 0xA5));
                 assert!(s[0x40..0x80].iter().all(|&b| b == 0));
                 assert!(s[0x80..0x140].iter().all(|&b| b == 0xA5));
             }
+
+            // 4) TF executes only CLZERO, retaining every native ADD/CMP/backedge.
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            ctx = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x53) as u64, (buf + 0xC0) as u64, 0x302);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags), ((code + 3) as u64, (buf + 0x53) as u64, (buf + 0xC0) as u64, 0x302));
+            let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+            assert!(s[0x40..0x80].iter().all(|&b| b == 0));
+            assert!(s[..0x40].iter().chain(&s[0x80..]).all(|&b| b == 0xA5));
+            assert_eq!(std::slice::from_raw_parts(code as *const u8, loop_bytes.len()), &loop_bytes);
+
+            // 5) A harmless prefix uses the official generic loop implementation,
+            // which finishes CMP/JB itself rather than returning at the local checkpoint.
+            let mut prefixed = vec![0x66];
+            prefixed.extend_from_slice(&loop_bytes);
+            std::ptr::copy_nonoverlapping(prefixed.as_ptr(), code as *mut u8, prefixed.len());
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            ctx = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x50) as u64, (buf + 0xC0) as u64, 0x243);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax, ctx.EFlags), ((code + prefixed.len()) as u64, (buf + 0xD0) as u64, 0x202));
+            let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+            assert!(s[0x40..0xC0].iter().all(|&b| b == 0));
+            assert!(s[..0x40].iter().chain(&s[0xC0..]).all(|&b| b == 0xA5));
         }
         modules::unregister_mapped(code);
         unsafe {
