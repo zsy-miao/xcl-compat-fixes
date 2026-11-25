@@ -366,18 +366,18 @@ impl TilePool {
     }
 }
 
-/// Allocate one 64 MiB default heap for `Pages`.
-unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+/// Allocate one 64 MiB backing heap for `Pages`.
+unsafe fn alloc_pool_heap(dev: &ID3D12Device, properties: D3D12_HEAP_PROPERTIES) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
-        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Properties: properties,
         Alignment: 0,
         // every kind of texture (resource heap tier 2: the only flags for both)
         Flags: D3D12_HEAP_FLAG_NONE,
     };
     let mut heap: Option<ID3D12Heap> = None;
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-        crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
+        crate::xlog_warn!("D3D12.X: cannot allocate more title texture pages (heap type {}, memory pool {}): {e}", properties.Type.0, properties.MemoryPoolPreference.0);
         return None;
     }
     heap
@@ -389,6 +389,7 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    pool_properties: D3D12_HEAP_PROPERTIES,
     pools: Vec<ID3D12Heap>,
     pool: TilePool,
     /// title page address → its video memory
@@ -417,6 +418,19 @@ unsafe impl Send for Pages {}
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
+fn texture_pool_properties(system_memory: bool) -> D3D12_HEAP_PROPERTIES {
+    if system_memory {
+        D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        }
+    } else {
+        D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }
+    }
+}
+
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
@@ -429,11 +443,16 @@ impl Pages {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let system_memory = std::env::var("XCL_TEXTURE_PAGES_SYSTEM_MEMORY").is_ok_and(|value| value.trim() == "1");
+        if system_memory {
+            crate::xlog_info!("D3D12.X: title texture page pools use system memory (D3D12_MEMORY_POOL_L0)");
+        }
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
             fence,
             value: 0,
+            pool_properties: texture_pool_properties(system_memory),
             pools: Vec::new(),
             pool: TilePool::new(),
             pages: std::collections::HashMap::new(),
@@ -577,10 +596,11 @@ impl Pages {
             }
         }
 
+        let properties = self.pool_properties;
         let pools = &mut self.pools;
         let pool = &mut self.pool;
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
-            let heap = alloc_pool_heap(dev)?;
+            let heap = alloc_pool_heap(dev, properties)?;
             pools.push(heap);
             Some(pools.len() as u32 - 1)
         })?;
@@ -997,6 +1017,64 @@ mod tests {
         assert!(!console_has_packed_3d_mips(&single_mip_3d));
         let packed_2d = desc(3, 64, 64, 1, 7, 28, 0x105);
         assert!(!console_has_packed_3d_mips(&packed_2d));
+    }
+
+    #[test]
+    fn texture_pools_use_system_memory_only_when_requested() {
+        let default = texture_pool_properties(false);
+        assert_eq!(default.Type, D3D12_HEAP_TYPE_DEFAULT);
+        assert_eq!(default.MemoryPoolPreference, D3D12_MEMORY_POOL_UNKNOWN);
+
+        let system = texture_pool_properties(true);
+        assert_eq!(system.Type, D3D12_HEAP_TYPE_CUSTOM);
+        assert_eq!(system.CPUPageProperty, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+        assert_eq!(system.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
+    }
+
+    #[test]
+    fn texture_page_batch_uses_the_selected_heap() {
+        use crate::gpu::{adapter, agility, fence, recomp::runner::skip_test};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory6};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+
+        let _guard = VRAM_TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory6>() else { return skip_test("no DXGI factory") };
+            let selector = adapter::Selector::from_env_or("auto");
+            let Some((adapter, _)) = adapter::candidates(&factory, &selector).into_iter().next() else { return skip_test("no hardware adapter") };
+            let Ok(dev) = agility::create_device(&adapter, D3D_FEATURE_LEVEL_11_0) else { return skip_test("no D3D12 device") };
+            let Some(mut pages) = Pages::new(&dev) else { return skip_test("no tiled resources tier 2") };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 128, DepthOrArraySize: 1, MipLevels: 1,
+                Format: DXGI_FORMAT_R32_UINT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let res = res.unwrap();
+            let mut total = 0;
+            dev.GetResourceTiling(&res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            assert_eq!(total, 2);
+            let (used, extra) = pages.bind(&dev, &res, PAGE, Some(2 * PAGE as u64), total).expect("bind two tiles");
+            fence::wait(&pages.fence, pages.value, &dev, None, 10_000).unwrap();
+            assert_eq!(pages.pools.len(), 1);
+            assert_eq!((pages.pages[&PAGE].tile, pages.pages[&(2 * PAGE)].tile), ((0, 0), (0, 1)));
+            let properties = pages.pools[0].GetDesc().Properties;
+            if std::env::var("XCL_TEXTURE_PAGES_SYSTEM_MEMORY").is_ok_and(|value| value.trim() == "1") {
+                assert_eq!(properties.Type, D3D12_HEAP_TYPE_CUSTOM);
+                assert_eq!(properties.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
+                assert_eq!(properties.CPUPageProperty, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+            } else {
+                assert_eq!(properties.Type, D3D12_HEAP_TYPE_DEFAULT);
+            }
+            pages.unmap(&res, total);
+            fence::wait(&pages.fence, pages.value, &dev, None, 10_000).unwrap();
+            let now = Instant::now();
+            pages.release_tiles(used, extra, now, true);
+            pages.pool.drain_cooling(now + COOL);
+            assert_eq!(pages.pool.free_total, POOL_PAGES as usize);
+        }
     }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
