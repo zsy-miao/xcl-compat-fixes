@@ -500,7 +500,7 @@ pub fn init() -> Result<String, String> {
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
+        if dred_on() {
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
@@ -1333,6 +1333,9 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
         return None;
     }
     UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, size as usize, true));
+    if dred_on() {
+        name_resource(*ppv, &format!("xcl uma_tex p={p:#x}"));
+    }
     Some(hr)
 }
 
@@ -1389,6 +1392,9 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
     let (p, _) = super::sparse::alloc(bytes, 0x1_0000)?;
     if let Some((hr, delta)) = super::sparse::place_buffer(this, p, d, state, riid, ppv) {
         UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+        if dred_on() {
+            name_resource(*ppv, &format!("xcl sparse_buf p={p:#x} sz={bytes:#x}"));
+        }
         if delta != 0 {
             BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
         }
@@ -1455,6 +1461,9 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         return None;
     }
     UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+    if dred_on() {
+        name_resource(*ppv, &format!("xcl uma_buf p={p:#x} sz={bytes:#x}"));
+    }
     // Map must hand out the same memory the shaders read (checked once)
     static CHECKED: AtomicU64 = AtomicU64::new(0);
     if CHECKED.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -2488,6 +2497,9 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
             crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
         }
         r = std::ptr::null_mut();
+    }
+    if !r.is_null() && dred_on() {
+        name_resource(r, &format!("xcl resource_at va={va:#x}"));
     }
     MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
     r
@@ -7644,6 +7656,49 @@ pub fn drain_gpu() {
     }
 }
 
+/// Whether DRED diagnostics were requested via `XCL_DRED=1`.
+pub(super) fn dred_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some())
+}
+
+/// Name an `ID3D12Resource` when `XCL_DRED=1` so DRED allocation lists report which internal XCL
+/// allocation backed a faulting VA.
+pub(super) unsafe fn name_resource(res: *mut c_void, label: &str) {
+    if !dred_on() || res.is_null() {
+        return;
+    }
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+        let _ = r.SetName(&windows::core::HSTRING::from(label));
+    }
+}
+
+/// Name an `ID3D12Heap` when `XCL_DRED=1` so DRED allocation lists identify the backing heap pool.
+pub(super) unsafe fn name_heap(heap: *mut c_void, label: &str) {
+    if !dred_on() || heap.is_null() {
+        return;
+    }
+    if let Some(h) = ID3D12Heap::from_raw_borrowed(&heap) {
+        let _ = h.SetName(&windows::core::HSTRING::from(label));
+    }
+}
+
+/// Read a DRED allocation node's debug name, preferring `ObjectNameW` (populated by
+/// `ID3D12Object::SetName`) and falling back to `ObjectNameA`.
+unsafe fn format_dred_allocation_name(name_w: windows::core::PCWSTR, name_a: *const u8) -> String {
+    if !name_w.is_null() {
+        if let Ok(s) = name_w.to_string() {
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    if !name_a.is_null() {
+        return std::ffi::CStr::from_ptr(name_a as *const std::ffi::c_char).to_string_lossy().into_owned();
+    }
+    String::new()
+}
+
 /// DRED gives us a linked list in driver order. Keep the diagnostic bounded even on a
 /// long chain, with room in the log for work that the GPU had already started.
 unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report: impl FnMut(&D3D12_AUTO_BREADCRUMB_NODE, usize)) {
@@ -7687,6 +7742,18 @@ mod dred_tests {
             assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
+    #[test]
+    fn format_dred_allocation_name_prefers_wide_and_falls_back_to_ansi() {
+        let wide: Vec<u16> = "wide_name".encode_utf16().chain([0]).collect();
+        let empty_wide: [u16; 1] = [0];
+        let ansi = b"ansi_name\0";
+        unsafe {
+            assert_eq!(format_dred_allocation_name(windows::core::PCWSTR(wide.as_ptr()), ansi.as_ptr()), "wide_name");
+            assert_eq!(format_dred_allocation_name(windows::core::PCWSTR::null(), ansi.as_ptr()), "ansi_name");
+            assert_eq!(format_dred_allocation_name(windows::core::PCWSTR(empty_wide.as_ptr()), ansi.as_ptr()), "ansi_name");
+            assert_eq!(format_dred_allocation_name(windows::core::PCWSTR::null(), std::ptr::null()), "");
+        }
+    }
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
@@ -7701,21 +7768,43 @@ pub fn log_device_removed() {
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
     unsafe {
+        let mut pf_logged = false;
+        if let Ok(dred1) = dev.cast::<ID3D12DeviceRemovedExtendedData1>() {
+            if let Ok(pf) = dred1.GetPageFaultAllocationOutput1() {
+                let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE1| {
+                    let mut v = Vec::new();
+                    while !n.is_null() && v.len() < 8 {
+                        let a = &*n;
+                        let name = format_dred_allocation_name(a.ObjectNameW, a.ObjectNameA);
+                        let ptr = (&*a.pObject).as_ref().map(|obj| format!(" ptr={:#x}", obj.as_raw() as usize)).unwrap_or_default();
+                        v.push(format!("type {} {}{}", a.AllocationType.0, name, ptr));
+                        n = a.pNext;
+                    }
+                    v.join(", ")
+                };
+                let va = pf.PageFaultVA;
+                let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+                pf_logged = true;
+            }
+        }
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
-            let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
-                let mut v = Vec::new();
-                while !n.is_null() && v.len() < 8 {
-                    let a = &*n;
-                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
-                    v.push(format!("type {} {}", a.AllocationType.0, name));
-                    n = a.pNext;
-                }
-                v.join(", ")
-            };
-            let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+        if !pf_logged {
+            if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
+                let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
+                    let mut v = Vec::new();
+                    while !n.is_null() && v.len() < 8 {
+                        let a = &*n;
+                        let name = format_dred_allocation_name(a.ObjectNameW, a.ObjectNameA);
+                        v.push(format!("type {} {}", a.AllocationType.0, name));
+                        n = a.pNext;
+                    }
+                    v.join(", ")
+                };
+                let va = pf.PageFaultVA;
+                let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            }
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {

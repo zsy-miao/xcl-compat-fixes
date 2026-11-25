@@ -396,6 +396,9 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
         return None;
     }
     let b = b?;
+    if super::real::dred_on() {
+        super::real::name_resource(b.as_raw(), "xcl bind indirect_order");
+    }
     *g = Some((dev.as_raw() as usize, b.clone()));
     Some(b)
 }

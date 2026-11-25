@@ -1241,6 +1241,9 @@ pub unsafe fn probe_gpu_content(res: usize) {
         )
         .map_err(|e| e.to_string())?;
         let rb = rb.ok_or("no readback buffer")?;
+        if super::real::dred_on() {
+            super::real::name_resource(rb.as_raw(), "xcl title_tex readback");
+        }
         let barrier = |a: D3D12_RESOURCE_STATES, b: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
