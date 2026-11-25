@@ -537,11 +537,11 @@ mod tests {
         let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
             source_size: source.len() as u32, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
         assert_eq!(request.check(true),Ok(()));
-        assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) },Ok(()));
         assert_eq!(destination,BC5_EXPECTED);
         destination.fill(0xA5);
         request.source_size -= 1;
-        assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) },Err(E_DECOMPRESSION));
         assert_eq!(destination,[0xA5;16]);
 
         // This older MIT control is a valid legacy subset, but the official
@@ -553,7 +553,7 @@ mod tests {
         let rejected = Request { options: SOURCE_MEMORY_BIT | (7 << 1), source: legacy.as_ptr() as u64,
             source_size: legacy.len() as u32, destination: destination.as_mut_ptr() as u64,
             destination_size: 16, ..Default::default() };
-        assert_eq!(unsafe { execute(&rejected,None,None,None) },Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&rejected,None,None,false,None) },Err(E_DECOMPRESSION));
         assert_eq!(destination,[0xA5;16]);
         assert!(crate::gpu::uma::get().is_some(), "physical-page BC5 integration requires the local UMA reservation");
         unsafe {
@@ -566,7 +566,7 @@ mod tests {
             request.destination = scattered.as_ptr() as u64;
             request.destination_page_offset = offset as u16;
             let check = request.check(true);
-            let result = execute(&request,None,Some(&scattered),None);
+            let result = execute(&request,None,Some(&scattered),false,None);
             let mut readback = [0u8;16];
             let read = read_physical_pages(&scattered,offset,&mut readback);
             let freed = FreeTitlePhysicalPages(std::ptr::null_mut(),count,pages.as_mut_ptr());
@@ -589,15 +589,15 @@ mod tests {
         let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
             source_size: 84, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
         assert_eq!(request.check(true),Ok(()));
-        assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) },Ok(()));
         assert_eq!(destination,BC5_EXPECTED);
         // Official framing accepts this zero tail, unlike the strict research
         // helper above. Native success wins; truncation still writes nothing.
         destination.fill(0xA5); request.source_size = 83;
-        assert_eq!(unsafe { execute(&request,None,None,None) },Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) },Err(E_DECOMPRESSION));
         assert_eq!(destination,[0xA5;16]);
         request.source_size = 85;
-        assert_eq!(unsafe { execute(&request,None,None,None) },Ok(()));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) },Ok(()));
         assert_eq!(destination,BC5_EXPECTED);
     }
 
@@ -633,7 +633,7 @@ mod tests {
                 request.source_size = size;
                 reads.push(write_physical_pages(&scattered,offset,&[0xA5;16]));
                 checks.push(request.check(false));
-                results.push(execute(&request,Some(&file),Some(&scattered),None));
+                results.push(execute(&request,Some(&file),Some(&scattered),false,None));
                 let mut readback = [0u8;16];
                 reads.push(read_physical_pages(&scattered,offset,&mut readback)); outputs.push(readback);
             }
@@ -655,11 +655,11 @@ mod tests {
         let mut request = Request { options: SOURCE_MEMORY_BIT | (5 << 1), source: source.as_ptr() as u64,
             source_size: source.len() as u32, destination: destination.as_mut_ptr() as u64, destination_size: 16, ..Default::default() };
         assert_eq!(request.check(true), Ok(()));
-        assert_eq!(unsafe { execute(&request,None,None,None) }, Ok(()));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) }, Ok(()));
         assert_eq!(destination, expected);
         destination.fill(0xA5);
         request.source_size -= 1;
-        assert_eq!(unsafe { execute(&request,None,None,None) }, Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&request,None,None,false,None) }, Err(E_DECOMPRESSION));
         assert_eq!(destination, [0xA5;16]);
     }
 
@@ -687,7 +687,7 @@ mod tests {
                 source_size: source.len() as u32, destination: scattered.as_ptr() as u64, destination_page_offset: offset,
                 destination_size: 16, ..Default::default() };
             assert_eq!(request.check(false),Ok(()));
-            let result = execute(&request,Some(&file),Some(&scattered),None);
+            let result = execute(&request,Some(&file),Some(&scattered),false,None);
             let mut readback = [0u8;16];
             let read = read_physical_pages(&scattered,offset as usize,&mut readback);
             let freed = FreeTitlePhysicalPages(std::ptr::null_mut(),count,pages.as_mut_ptr());
