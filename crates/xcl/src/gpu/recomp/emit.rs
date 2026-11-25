@@ -4917,17 +4917,6 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 load_sgprs(&mut h);
-                // a program with a loop: the dispatch's share of loop passes for a group
-                // (`IO_LOOP_BUDGET`, 0 = not known) among its threads
-                if body.contains(super::LOOP_GUARD) {
-                    let _ = writeln!(
-                        h,
-                        "    {{ uint xcl_gb = io.Load({}u); if (xcl_gb != 0u) xcl_budget = clamp(xcl_gb / {}u, {}u, 1u << 16); }}",
-                        super::IO_LOOP_BUDGET * 4,
-                        x * y * z,
-                        super::DISPATCH_LOOP_PASSES_MIN
-                    );
-                }
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;
                 for (k, c) in ["x", "y", "z"].iter().enumerate() {

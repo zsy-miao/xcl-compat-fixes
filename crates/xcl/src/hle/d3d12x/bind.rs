@@ -312,7 +312,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx, None) {
+    match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
             // an indirect dispatch: its groups are in the argument buffer (`max` of them)
@@ -562,7 +562,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
-    match bind_abi(this, &list, pso, true, None) {
+    match bind_abi(this, &list, pso, true) {
         Ok(()) => {
             count(DRAWS);
             Some(list)
@@ -972,7 +972,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_abi(this, list, pso, false, Some([x, y, z]))?;
+    bind_abi(this, list, pso, false)?;
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     if mark != 0 {
         with(this, |s| {
@@ -988,9 +988,8 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
-/// memory, u1 res, u2… the memory windows; then the pipeline. `groups`: the thread groups of a
-/// dispatch whose counts are known here (`IO_LOOP_BUDGET`).
-unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, groups: Option<[u32; 3]>) -> Result<(), String> {
+/// memory, u1 res, u2… the memory windows; then the pipeline.
+unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -1015,9 +1014,6 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-    if let Some(groups) = groups {
-        io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget(groups);
-    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);

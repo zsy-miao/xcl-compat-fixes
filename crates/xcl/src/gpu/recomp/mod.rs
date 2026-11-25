@@ -203,10 +203,6 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
-/// io slot of a compute dispatch's loop budget (`dispatch_loop_budget`): the loop passes the
-/// lanes of one of its thread groups may run together, 0 = not known (an indirect dispatch,
-/// a test: every lane keeps the prelude's 65 536).
-pub const IO_LOOP_BUDGET: usize = 113;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -644,31 +640,11 @@ impl Conts {
 }
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: 65 536, fewer in a large compute dispatch: `dispatch_loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
+/// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
-
-/// The loop passes all the lanes of one compute dispatch may run together before `LOOP_GUARD`
-/// ends their loops. 65 536 passes a lane keep a small dispatch busy for a moment and a large
-/// one for far longer than Windows waits for the GPU (2 s, then the device is removed): a
-/// retail program of 4 x 4 x 4 threads given a loop count that never comes, dispatched as
-/// 16 x 16 x 16 groups on an RTX 3060 Ti, measured 0.47 ms a pass – 31 s for 65 536 of them,
-/// 0.5 s for the 1024 a lane that this many passes in all leave it.
-pub const DISPATCH_LOOP_PASSES: u64 = 1 << 28;
-/// A lane's loop passes however large its dispatch is: a working program's loops are not cut
-/// short because many threads run them.
-pub const DISPATCH_LOOP_PASSES_MIN: u32 = 1024;
-
-/// What a compute dispatch of `groups` thread groups puts into `IO_LOOP_BUDGET`: its share of
-/// `DISPATCH_LOOP_PASSES` for one group. The program divides it by its threads per group
-/// (between `DISPATCH_LOOP_PASSES_MIN` and the prelude's 65 536 a lane); never 0, which means
-/// "not known".
-pub fn dispatch_loop_budget(groups: [u32; 3]) -> u32 {
-    let n: u64 = groups.iter().map(|&g| g.max(1) as u64).product();
-    (DISPATCH_LOOP_PASSES / n).clamp(1, u32::MAX as u64) as u32
-}
 
 /// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
 /// Each guard of the structured form lists every pending skip flag, so it grows with the
