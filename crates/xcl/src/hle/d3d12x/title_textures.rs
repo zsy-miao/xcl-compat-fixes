@@ -337,6 +337,7 @@ fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool 
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     // (a new texture object, or the address of an old one again: its first upload is not left out)
     LAST_CONTENT.lock().unwrap().remove(&(res as usize));
+    STREAM_RECHECK.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -470,12 +471,19 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
-    let mut t = TEXTURES.lock().unwrap();
-    if let Some(e) = t.get_mut(res) {
-        if !e.gpu_written {
-            e.gpu_written = true;
-            GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    let mut marked = false;
+    {
+        let mut t = TEXTURES.lock().unwrap();
+        if let Some(e) = t.get_mut(res) {
+            if !e.gpu_written {
+                e.gpu_written = true;
+                GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                marked = true;
+            }
         }
+    }
+    if marked {
+        STREAM_RECHECK.lock().unwrap().remove(&res);
     }
 }
 
@@ -529,6 +537,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
+    STREAM_RECHECK.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -779,6 +788,11 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::vram::before_execute(q);
         });
     }
+    let recheck_frame = {
+        let (p, b) = super::present::counters();
+        p.max(b)
+    };
+    recheck_streamed_unwatched(&ranges, recheck_frame);
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -809,6 +823,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    seed_stream_recheck(&todo, &ranges, recheck_frame);
     upload_all(todo);
 }
 
@@ -858,6 +873,211 @@ fn content_hash(b: &[u8]) -> u64 {
         tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
     }
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
+/// Frame milestones (relative to last upload or detected content change) at which unwatched
+/// textures (e.g. physical-page / `MEM_MAPPED` views that `GetWriteWatch` cannot track) are
+/// re-fingerprinted to catch late streaming writes that land after an initial zeroed upload.
+const STREAM_RECHECK_MILESTONES: [u64; 5] = [4, 12, 40, 120, 400];
+/// Per-slice sample size (start, mid, end -> at most 48 KiB hashed per due texture).
+const STREAM_SAMPLE_SLICE: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamRecheck {
+    base_frame: u64,
+    stage: u8,
+    last_fp: u64,
+}
+
+static STREAM_RECHECK: Mutex<BTreeMap<usize, StreamRecheck>> = Mutex::new(BTreeMap::new());
+static LAST_RECHECK_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static STREAM_RECHECK_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_TEXTURE_STREAM_RECHECK=0` disables spaced-milestone fingerprinting for unwatched textures.
+fn stream_recheck_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_STREAM_RECHECK").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether every 4 KiB page of `[src, src + len)` is covered by the sorted, disjoint
+/// write-watched spans `watched` (`(base, size)` pairs from `cached_watch_ranges`).
+fn range_is_fully_watched(src: usize, len: usize, watched: &[(usize, usize)]) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut lo = src & !0xFFF;
+    let hi = src.saturating_add(len).saturating_add(0xFFF) & !0xFFF;
+    if lo >= hi {
+        return true;
+    }
+    let mut i = watched.partition_point(|&(b, s)| b.saturating_add(s) <= lo);
+    while lo < hi {
+        let Some(&(b, s)) = watched.get(i) else {
+            return false;
+        };
+        if b > lo || s == 0 {
+            return false;
+        }
+        lo = b.saturating_add(s);
+        i += 1;
+    }
+    true
+}
+
+/// Bounded (<= 48 KiB) start/mid/end fingerprint of a texture's backing memory, read via
+/// `read_committed` so uncommitted or concurrently decommitted pages read as zero without faulting.
+unsafe fn sample_fingerprint(src: usize, size: usize) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    if size <= 3 * STREAM_SAMPLE_SLICE {
+        let buf = read_committed(src, size);
+        return content_hash(&buf);
+    }
+    let mid = src.saturating_add((size - STREAM_SAMPLE_SLICE) / 2);
+    let end = src.saturating_add(size - STREAM_SAMPLE_SLICE);
+    let h0 = content_hash(&read_committed(src, STREAM_SAMPLE_SLICE));
+    let h1 = content_hash(&read_committed(mid, STREAM_SAMPLE_SLICE));
+    let h2 = content_hash(&read_committed(end, STREAM_SAMPLE_SLICE));
+    let mut mix = [0u8; 32];
+    mix[0..8].copy_from_slice(&h0.to_le_bytes());
+    mix[8..16].copy_from_slice(&h1.to_le_bytes());
+    mix[16..24].copy_from_slice(&h2.to_le_bytes());
+    mix[24..32].copy_from_slice(&(size as u64).to_le_bytes());
+    content_hash(&mix)
+}
+
+/// Record baseline fingerprints for unwatched textures queued into `todo` so late streaming writes
+/// into mapped physical pages are caught at subsequent frame milestones.
+unsafe fn seed_stream_recheck(todo: &[(ID3D12Resource, Upload)], watched: &[(usize, usize)], frame: u64) {
+    if !stream_recheck_enabled() || todo.is_empty() {
+        return;
+    }
+    let mut seeded = Vec::new();
+    for (r, (_, src, tex, _)) in todo {
+        let size = tex.size() as usize;
+        if size == 0 || range_is_fully_watched(*src, size, watched) {
+            continue;
+        }
+        let fp = sample_fingerprint(*src, size);
+        seeded.push((r.as_raw() as usize, StreamRecheck { base_frame: frame, stage: 0, last_fp: fp }));
+    }
+    if !seeded.is_empty() {
+        let mut g = STREAM_RECHECK.lock().unwrap();
+        for (res, state) in seeded {
+            g.insert(res, state);
+        }
+    }
+}
+
+/// At most once per presented frame, re-fingerprint due unwatched textures at spaced milestones.
+unsafe fn recheck_streamed_unwatched(watched: &[(usize, usize)], frame: u64) {
+    if !stream_recheck_enabled() {
+        return;
+    }
+    if LAST_RECHECK_FRAME.swap(frame, Ordering::AcqRel) == frame {
+        return;
+    }
+    recheck_streamed_unwatched_at(watched, frame);
+}
+
+/// Re-fingerprint due unwatched textures at `frame`, re-queuing changed entries and resetting
+/// their milestone schedule so subsequent higher-resolution mip streams are also caught.
+unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) {
+    let due: Vec<(usize, u64)> = {
+        let g = STREAM_RECHECK.lock().unwrap();
+        if g.is_empty() {
+            return;
+        }
+        g.iter()
+            .filter_map(|(&res, st)| {
+                let target = *STREAM_RECHECK_MILESTONES.get(st.stage as usize)?;
+                (frame.saturating_sub(st.base_frame) >= target).then_some((res, st.last_fp))
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+
+    let mut check = Vec::with_capacity(due.len());
+    let mut prune = Vec::new();
+    {
+        let t = TEXTURES.lock().unwrap();
+        for (res, prev_fp) in due {
+            match t.by_res.get(&res) {
+                Some(e) if e.gpu_written => prune.push(res),
+                Some(e) if e.pending => {}
+                Some(e) => {
+                    let size = e.tex.size() as usize;
+                    if range_is_fully_watched(e.src, size, watched) {
+                        prune.push(res);
+                    } else {
+                        check.push((res, e.src, size, prev_fp));
+                    }
+                }
+                None => {
+                    if !t.shadowed.contains_key(&res) {
+                        prune.push(res);
+                    }
+                }
+            }
+        }
+    }
+    if !prune.is_empty() {
+        let mut g = STREAM_RECHECK.lock().unwrap();
+        for res in prune {
+            g.remove(&res);
+        }
+    }
+    if check.is_empty() {
+        return;
+    }
+
+    let results: Vec<(usize, u64, u64)> = check
+        .into_iter()
+        .map(|(res, src, size, prev_fp)| (res, prev_fp, sample_fingerprint(src, size)))
+        .collect();
+
+    let mut changed = Vec::new();
+    {
+        let mut g = STREAM_RECHECK.lock().unwrap();
+        for (res, prev_fp, cur_fp) in results {
+            let Some(st) = g.get_mut(&res) else {
+                continue;
+            };
+            if cur_fp != prev_fp {
+                *st = StreamRecheck { base_frame: frame, stage: 0, last_fp: cur_fp };
+                changed.push(res);
+            } else {
+                st.stage = st.stage.saturating_add(1);
+                if st.stage as usize >= STREAM_RECHECK_MILESTONES.len() {
+                    g.remove(&res);
+                }
+            }
+        }
+    }
+    if !changed.is_empty() {
+        let mut queued = 0u64;
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            for res in changed {
+                if let Some(e) = t.by_res.get_mut(&res) {
+                    if !e.gpu_written && !e.pending {
+                        e.pending = true;
+                        PENDING.fetch_add(1, Ordering::Relaxed);
+                        queued += 1;
+                    }
+                }
+            }
+        }
+        if queued > 0 {
+            let total = STREAM_RECHECK_HITS.fetch_add(queued, Ordering::Relaxed) + queued;
+            if total == queued || (total.is_power_of_two() && total >= 16) {
+                crate::xlog_info!("D3D12.X: title textures: streamed unwatched re-uploads triggered: {total}");
+            }
+        }
+    }
 }
 
 /// staging bytes and texture count of one batch at most: bounds the persistent upload staging
@@ -2053,6 +2273,131 @@ mod tests {
             }
             uma.free(base);
         }
+    }
+
+    #[test]
+    fn range_is_fully_watched_handles_gaps_and_adjacent_spans() {
+        let watched = [(0x10_0000usize, 0x1_0000usize), (0x11_0000, 0x2_0000), (0x20_0000, 0x1_0000)];
+        assert!(range_is_fully_watched(0x10_0000, 0x8000, &watched));
+        // Spanning two adjacent watched ranges is fully watched.
+        assert!(range_is_fully_watched(0x10_F000, 0x4000, &watched));
+        assert!(range_is_fully_watched(0x10_0000, 0x3_0000, &watched));
+        // Crossing an unwatched gap or starting outside watched ranges is not fully watched.
+        assert!(!range_is_fully_watched(0x12_F000, 0x2000, &watched));
+        assert!(!range_is_fully_watched(0x13_0000, 0x1000, &watched));
+        assert!(!range_is_fully_watched(0x0F_F000, 0x2000, &watched));
+        assert!(!range_is_fully_watched(0x30_0000, 0x4000, &watched));
+        assert!(!range_is_fully_watched(0x10_0000, 0x1000, &[]));
+    }
+
+    #[test]
+    fn sample_fingerprint_detects_start_mid_and_end_changes_in_large_textures() {
+        let mut small = vec![0u8; 32 * 1024];
+        let h0 = unsafe { sample_fingerprint(small.as_ptr() as usize, small.len()) };
+        small[12345] = 0x5A;
+        let h1 = unsafe { sample_fingerprint(small.as_ptr() as usize, small.len()) };
+        assert_ne!(h0, h1, "small texture mutation must change fingerprint");
+
+        let mut large = vec![0u8; 256 * 1024];
+        let base = unsafe { sample_fingerprint(large.as_ptr() as usize, large.len()) };
+        // Start 16 KiB slice
+        large[1024] = 0x11;
+        let hs = unsafe { sample_fingerprint(large.as_ptr() as usize, large.len()) };
+        assert_ne!(base, hs, "start-slice write must change fingerprint");
+        // Middle 16 KiB slice
+        large[128 * 1024] = 0x22;
+        let hm = unsafe { sample_fingerprint(large.as_ptr() as usize, large.len()) };
+        assert_ne!(hs, hm, "mid-slice write must change fingerprint");
+        // End 16 KiB slice
+        let last = large.len() - 1;
+        large[last] = 0x33;
+        let he = unsafe { sample_fingerprint(large.as_ptr() as usize, large.len()) };
+        assert_ne!(hm, he, "end-slice write must change fingerprint");
+    }
+
+    #[test]
+    fn stream_recheck_schedule_catches_late_writes_and_resets_milestones() {
+        let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
+        let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
+        let size = tex.size() as usize;
+        let mut backing = vec![0u8; size];
+        let va = backing.as_ptr() as usize;
+        let res_id = 0x7410_0001usize;
+        let gpu_res_id = 0x7410_0002usize;
+
+        let e_stream = Entry {
+            device: 0,
+            va,
+            src: va,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        let e_gpu = Entry {
+            device: 0,
+            va: va + size,
+            src: va,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: true,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            let (d1, _) = t.insert(res_id, e_stream);
+            let (d2, _) = t.insert(gpu_res_id, e_gpu);
+            adjust_pending(d1 + d2);
+        }
+        let fp0 = unsafe { sample_fingerprint(va, size) };
+        {
+            let mut g = STREAM_RECHECK.lock().unwrap();
+            g.insert(res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: fp0 });
+            g.insert(gpu_res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: fp0 });
+        }
+
+        // Before first milestone (+4 frames -> frame 104), nothing is checked or re-queued.
+        backing[size - 16] = 0xAB;
+        unsafe { recheck_streamed_unwatched_at(&[], 103) };
+        assert!(!TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending);
+
+        // At milestone 0 (frame 104), late write is detected: pending becomes true, schedule resets
+        // to base_frame=104, stage=0, and the gpu_written entry is pruned without re-queuing.
+        unsafe { recheck_streamed_unwatched_at(&[], 104) };
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            let e = t.by_res.get_mut(&res_id).unwrap();
+            assert!(e.pending, "late write to unwatched texture must re-queue upload at milestone 0");
+            e.pending = false;
+            PENDING.fetch_sub(1, Ordering::Relaxed);
+            assert!(!t.by_res.get(&gpu_res_id).unwrap().pending, "gpu_written texture must not be re-queued");
+        }
+        {
+            let g = STREAM_RECHECK.lock().unwrap();
+            assert!(!g.contains_key(&gpu_res_id), "gpu_written texture must be pruned from STREAM_RECHECK");
+            let st = g.get(&res_id).copied().expect("schedule reset after change");
+            assert_eq!((st.base_frame, st.stage), (104, 0));
+            assert_ne!(st.last_fp, fp0);
+        }
+
+        // Advance through all 5 milestones with no further writes: entry must not re-queue and must
+        // clean itself up after milestone 4 (+400 frames -> frame 504).
+        for f in [108, 116, 144, 224, 504] {
+            unsafe { recheck_streamed_unwatched_at(&[], f) };
+            assert!(!TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending, "unchanged texture must not re-queue at frame {f}");
+        }
+        assert!(!STREAM_RECHECK.lock().unwrap().contains_key(&res_id), "entry must retire after final 400-frame milestone");
+
+        forget(res_id);
+        forget(gpu_res_id);
     }
 
     /// `read_committed` copies committed pages and leaves uncommitted gaps zeroed, including

@@ -142,10 +142,92 @@ static FAILED: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a bind is waiting for a pipeline still being built: one of the title's threads is
-/// held where a console title never waits (`kernelx::Sleep` does not count that time).
+/// The PC calls of the title's threads (`pc_call`): the ones going on, and how long the ones
+/// that ended took since the last frame was shown.
+struct PcCalls {
+    /// (id, when it began)
+    now: Vec<(u64, std::time::Instant)>,
+    /// the frames shown when `spent` began to count
+    frame: u64,
+    /// the time of the PC calls that ended since then
+    spent: std::time::Duration,
+}
+
+impl PcCalls {
+    const fn new() -> Self {
+        Self { now: Vec::new(), frame: 0, spent: std::time::Duration::ZERO }
+    }
+
+    /// `frame` frames have been shown: the calls before the last of them are not this wait's.
+    fn at(&mut self, frame: u64) {
+        if frame != self.frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+    }
+
+    fn begin(&mut self, id: u64, now: std::time::Instant) {
+        self.now.push((id, now));
+    }
+
+    fn end(&mut self, id: u64, frame: u64, now: std::time::Instant) {
+        self.at(frame);
+        if let Some(i) = self.now.iter().position(|c| c.0 == id) {
+            let (_, since) = self.now.swap_remove(i);
+            self.spent += now.saturating_duration_since(since);
+        }
+    }
+
+    /// Whether a call going on holds the title: the PC calls since the last frame, it included,
+    /// have taken `PC_CALL_HOLDS_AFTER`.
+    fn holds(&mut self, frame: u64, now: std::time::Instant) -> bool {
+        self.at(frame);
+        let spent = self.spent;
+        self.now.iter().any(|(_, since)| spent + now.saturating_duration_since(*since) >= PC_CALL_HOLDS_AFTER)
+    }
+}
+
+static PC_CALLS: Mutex<PcCalls> = Mutex::new(PcCalls::new());
+/// From this much time in PC calls since the last frame on, a PC call holds the title: the
+/// console's calls return at once.
+const PC_CALL_HOLDS_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether one of the title's threads is held where a console title never waits: a bind is
+/// waiting for a pipeline still being built, or a PC call is going on after such calls have
+/// kept the title's threads for long (`pc_call`). `kernelx::Sleep` does not count that time.
 pub fn title_held() -> bool {
-    HELD.load(Ordering::Acquire) != 0
+    HELD.load(Ordering::Acquire) != 0 || held_by_pc_call()
+}
+
+fn held_by_pc_call() -> bool {
+    PC_CALLS.lock().unwrap().holds(super::present::presents(), std::time::Instant::now())
+}
+
+/// A call of the title into D3D12 that XCL or the PC's driver can keep for long where the
+/// console's takes no time: a submission (XCL's uploads and tile mappings before the lists, the
+/// driver's compiling in them), a texture's placement, a pipeline built in the call. While it
+/// lasts the title is held (`title_held`), once the PC calls since the last frame shown, this
+/// one included, have taken `PC_CALL_HOLDS_AFTER`: one long call, or many short ones in a row
+/// (a retail title placed 16 384 textures in 29 s without a frame, 1 - 50 ms each). A title
+/// that shows its frames is not held by its submissions.
+pub struct PcCall(u64);
+
+pub fn pc_call() -> PcCall {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    PC_CALLS.lock().unwrap().begin(id, std::time::Instant::now());
+    PcCall(id)
+}
+
+impl Drop for PcCall {
+    fn drop(&mut self) {
+        PC_CALLS.lock().unwrap().end(self.0, super::present::presents(), std::time::Instant::now());
+    }
+}
+
+/// Whether this thread is building a pipeline for `build` (a worker, not one of the title's).
+pub(super) fn building_here() -> bool {
+    BUILDING.with(|b| b.borrow().is_some())
 }
 
 /// A bind's wait for a pipeline still being built (`title_held`).
@@ -492,6 +574,43 @@ mod used_tests {
             let output = child.output().unwrap();
             assert!(output.status.success(), "policy {value:?}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
+    }
+
+    /// A PC call that has kept one of the title's threads for long holds the title, a short one
+    /// does not, and the hold ends with the call.
+    #[test]
+    fn a_long_pc_call_holds_the_title() {
+        let mut calls = PcCalls::new();
+        let began = std::time::Instant::now();
+        calls.begin(1, began);
+        calls.begin(2, began + 2 * PC_CALL_HOLDS_AFTER);
+        assert!(!calls.holds(0, began), "a call that has just begun holds the title");
+        let later = began + 2 * PC_CALL_HOLDS_AFTER;
+        assert!(calls.holds(0, later), "a PC call has lasted {:?}, but the title is not held", 2 * PC_CALL_HOLDS_AFTER);
+        calls.end(1, 0, later);
+        calls.end(2, 0, later);
+        assert!(!calls.holds(0, later), "the calls are over, the title is still held");
+    }
+
+    /// Short PC calls add up between two frames: none of them is long, but after many in a row
+    /// the one going on holds the title. The title's own time between them is not held, and a
+    /// frame shown ends it.
+    #[test]
+    fn short_pc_calls_between_two_frames_hold_the_title() {
+        let mut calls = PcCalls::new();
+        let step = PC_CALL_HOLDS_AFTER / 10;
+        let mut now = std::time::Instant::now();
+        for id in 0..20 {
+            calls.begin(id, now);
+            assert!(id >= 9 || !calls.holds(7, now + step), "{id} short calls hold the title already");
+            now += step;
+            calls.end(id, 7, now);
+        }
+        assert!(!calls.holds(7, now), "no PC call is going on, the title is held");
+        calls.begin(20, now);
+        assert!(calls.holds(7, now), "twenty short PC calls since the last frame and one going on, but the title is not held");
+        assert!(!calls.holds(8, now), "a frame was shown, the calls before it still hold the title");
+        calls.end(20, 8, now);
     }
 
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):

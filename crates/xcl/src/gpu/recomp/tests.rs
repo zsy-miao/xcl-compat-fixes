@@ -4144,6 +4144,88 @@ fn memory_windows_reject_out_of_uma_aliasing(heap_windows: bool) {
     assert_eq!(*word(w1 + 0x3000), CANARY1, "out-of-UMA global_atomic_inc must not clobber w1");
 }
 
+#[test]
+fn gpu_window_at_32bit_carry_edge_cases() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let base_hi = (w0 >> 32) as u32;
+    assert!(base_hi >= 4);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+
+    *word(w0 + 0x0000) = 0x2222_3333;
+    *word(w0 + 0x0010) = 0x9999_AAAA;
+    *word(w0 + 0x0020) = 0xDEAD_DEAD;
+    *word(w1 + 0x0000) = 0x1111_2222;
+    *word(w1 + 0x0004) = 0x7777_8888;
+    *word(w1 + 0x0008) = 0x3333_4444;
+    *word(w1 + 0x0010) = 0x5555_6666;
+    *word(w1 + 0x0020) = 0xCAFE_CAFE;
+
+    let glbl = |n: &'static str, f: &[(&str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        (n, "ENC_FLAT_GLBL", f.iter().map(|&(a, b)| (unsafe { std::mem::transmute::<&str, &'static str>(a) }, b)).collect(), None)
+    };
+    let list = vec![
+        // 1. Ea::U carry: (w0 + 0xFFFF_FFFC) + v0(4) = w1 + 0x0000 -> 0x1111_2222
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 10), ("ADDR", 0), ("SADDR", 2), ("OFFSET", 0)]),
+        // 2. Ea::S positive constant carry: (w0 + 0xFFFF_FFF8) + OFFSET(+16) = w1 + 0x0008 -> 0x3333_4444
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 11), ("ADDR", 1), ("SADDR", 4), ("OFFSET", 16)]),
+        // 3. Ea::Mul pure high carry: w0 + (0x1000 * 0x10_0000) + v3(0x10) = w1 + 0x10 -> 0x5555_6666
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 12), ("VADDR", 2), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1), ("OFFEN", 1), ("OFFSET", 0)], None),
+        // 4. Ea::Mul simultaneous lo-carry + phi: ((base_hi - 1):0xFFFF_F004) + (0x1000 * 0x10_0001) = w1 + 4 -> 0x7777_8888
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 13), ("VADDR", 4), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1), ("OFFEN", 0), ("OFFSET", 0)], None),
+        // 5. S_LOAD_DWORD negative Ea::S(OFFSET = -16) borrows base_hi -> base_hi-1, then Ea::U(SOFFSET = s16 = 0x20) carries back to w0 + 0x10 -> 0x9999_AAAA
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 20), ("SBASE", 3), ("OFFSET", 0x1F_FFF0), ("SOFFSET", 16)], None),
+        // 6. Carry past end of UMA: (w1 + 0xFFFF_FFF0) + v6(0x20) = base_hi+2 -> read 0, drop store
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 14), ("ADDR", 6), ("SADDR", 24), ("OFFSET", 0)]),
+        glbl("GLOBAL_STORE_DWORD", &[("ADDR", 6), ("DATA", 7), ("SADDR", 24), ("OFFSET", 0)]),
+        // 7. Ea::S negative OFFSET(-16) with uaddc carry=1 cancels -1+1=0: (w0 + 0x0010) + (-16) = w0 + 0 -> 0x2222_3333
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 15), ("ADDR", 1), ("SADDR", 18), ("OFFSET", 0xFF0)]),
+        // 8. Ea::S negative OFFSET(-16) without carry borrows below w0: (w0 + 0x0030) - 0x30 + (-16) => store at (w0 + 0x0000) - 16 is dropped, w0 + 0x0020 intact
+        glbl("GLOBAL_STORE_DWORD", &[("ADDR", 1), ("DATA", 8), ("SADDR", 6), ("OFFSET", 0xFF0)]),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let p = prog(&refs);
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil);
+
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[0xFFFF_FFFC, base_hi]); // s[2:3] = w0 + 0xFFFF_FFFC
+    st.sgpr[4..6].copy_from_slice(&[0xFFFF_FFF8, base_hi]); // s[4:5] = w0 + 0xFFFF_FFF8
+    st.sgpr[6..8].copy_from_slice(&[0, base_hi]); // s[6:7] = w0 + 0 (SBASE 3)
+    st.sgpr[8..12].copy_from_slice(&[0, (base_hi & 0xFFFF) | (0x1000 << 16), 0x20_0000, 0]); // SRSRC 2 (s[8:11])
+    st.sgpr[12..16].copy_from_slice(&[0xFFFF_F004, ((base_hi - 1) & 0xFFFF) | (0x1000 << 16), 0x20_0000, 0]); // SRSRC 3 (s[12:15])
+    st.sgpr[16] = 0x20; // SOFFSET for S_LOAD_DWORD
+    st.sgpr[18..20].copy_from_slice(&[0x0010, base_hi]); // s[18:19] = w0 + 0x10
+    st.sgpr[24..26].copy_from_slice(&[0xFFFF_FFF0, base_hi + 1]); // s[24:25] = w1 + 0xFFFF_FFF0
+    for r in st.vgpr.iter_mut() {
+        r[0] = 4;
+        r[1] = 0;
+        r[2] = 0x10_0000;
+        r[3] = 0x10;
+        r[4] = 0x10_0001;
+        r[6] = 0x20;
+        r[7] = 0xDEAD_C0DE;
+        r[8] = 0x1234_5678;
+        r[14] = 0x9999_9999;
+    }
+
+    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    assert_eq!(r.vgpr[0][10], 0x1111_2222, "Ea::U carry w0 -> w1");
+    assert_eq!(r.vgpr[0][11], 0x3333_4444, "Ea::S positive carry w0 -> w1");
+    assert_eq!(r.vgpr[0][12], 0x5555_6666, "Ea::Mul high dword carry w0 -> w1");
+    assert_eq!(r.vgpr[0][13], 0x7777_8888, "Ea::Mul lo-carry + phi w0-1 -> w1");
+    assert_eq!(r.sgpr[20], 0x9999_AAAA, "S_LOAD_DWORD borrow then SOFFSET carry-back to w0");
+    assert_eq!(r.vgpr[0][14], 0, "carry past UMA limit returns 0");
+    assert_eq!(r.vgpr[0][15], 0x2222_3333, "Ea::S negative OFFSET with carry=1 stays in w0");
+    assert_eq!(*word(w0 + 0x0020), 0xDEAD_DEAD, "store borrowing below w0 is dropped");
+    assert_eq!(*word(w1 + 0x0020), 0xCAFE_CAFE, "store past UMA limit dropped");
+}
+
 /// The start-up check of the coherent UMA windows (`real::check_uma_import`): the GPU sees what
 /// the CPU writes there. Fails, as it should, where the import fell back to memory of its own
 /// (vkd3d-proton under a Wine without `userfaultfd` write watches, #175).

@@ -1425,9 +1425,14 @@ impl Lw {
                     4 => (e(lw, 0), e(lw, 1), e(lw, 1), e(lw, 3)),
                     _ => (e(lw, 0), one, e(lw, 1), e(lw, 3)),
                 };
-                for (k, v) in [w, hh, dd, n].into_iter().enumerate() {
+                // a level past the last: RDNA2 gives 0 for every size (an AMD driver, RDNA4, answers
+                // for a level it clamped)
+                let has = lw.cmp(Pred::ULt, mipv, n);
+                for (k, v) in [w, hh, dd].into_iter().enumerate() {
+                    let v = lw.s.m.select(has, v, zero);
                     lw.wr(tmps[k], v);
                 }
+                lw.wr(tmps[3], n);
                 Ok(())
             })?;
             let r = tmps.map(|t| self.rd(t));

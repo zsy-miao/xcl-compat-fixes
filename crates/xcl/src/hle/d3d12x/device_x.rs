@@ -1226,6 +1226,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
     }
+    // the PC's reserved resource and tile mappings for it can take long where the console's
+    // placement takes no time (`pso_async::title_held`)
+    let _in_pc = super::pso_async::pc_call();
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc_for_device(this, &x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
@@ -1699,8 +1702,14 @@ mod tests {
             103, 107,      // YUV (NV12, YUY2)
         ] {
             let (out_fmt, out_flags) = make(3, fmt, 1, 0x4);
-            assert_eq!(out_fmt, fmt, "format {fmt} kept");
-            assert_eq!(out_flags & 0x4, 0, "format {fmt} must strip ALLOW_UNORDERED_ACCESS");
+            if matches!((fmt, out_fmt), (85, 28) | (88, 87)) {
+                // promoted to a format a PC driver takes as a UAV of the same values: the flag
+                // stays, and is valid there
+                assert_eq!(out_flags & 0x4, 0x4, "format {fmt} promoted to {out_fmt} keeps ALLOW_UNORDERED_ACCESS");
+            } else {
+                assert_eq!(out_fmt, fmt, "format {fmt} kept");
+                assert_eq!(out_flags & 0x4, 0, "format {fmt} must strip ALLOW_UNORDERED_ACCESS");
+            }
         }
         // Multisampled textures never support UAV even on UAV-capable formats:
         assert_eq!(make(3, 28, 4, 0x5), (28, 0x1));

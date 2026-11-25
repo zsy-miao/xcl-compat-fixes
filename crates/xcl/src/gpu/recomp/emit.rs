@@ -2862,7 +2862,9 @@ impl Em {
                 _ => return Err("get_resinfo dim"),
             };
             self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
-            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
+            // a level past the last: RDNA2 gives 0 for every size and the level count. D3D12 asks
+            // for the same, but an AMD driver (RDNA4) answers for a level it clamped
+            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} if ({mipv} >= {t}_n) {{ {t}_w = 0u; {t}_h = 0u; {t}_d = 0u; }} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
             let query = if matches!(dim, 0 | 1) {
                 // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
                 // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is

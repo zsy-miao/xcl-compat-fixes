@@ -581,3 +581,34 @@ fn gpu_direct_unaligned_multi_dword_format_store() {
     let got: Vec<u8> = r.mem.iter().flat_map(|v| v.to_le_bytes()).collect();
     assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
 }
+
+#[test]
+fn window_at_lowers_to_32bit_carry_without_int64() {
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+    let with_adds = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 2), ("OFFSET", 16)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 0), ("SADDR", 2), ("OFFSET", 0xFFC)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SBASE", 2), ("OFFSET", 0x1F_FFFC), ("SOFFSET", 4)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1), ("OFFEN", 1), ("OFFSET", 4)], None),
+    ]);
+    let dxil = translate(&with_adds, ko).expect("multi-window with adds translates");
+    super::validate::validate(&dxil).expect("validates without Int64Ops");
+    if let Ok(dis) = super::validate::disassemble(&dxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(!dis.contains("64-bit integers") && !body.contains("i64"), "window_at with adds must not emit i64:\n{dis}");
+        assert!(!dis.contains("binaryWithCarryOrBorrow"), "window_at should avoid uaddc struct overhead:\n{dis}");
+        assert!(body.contains("icmp ult i32"), "expected scalar 32-bit carry compare in DXIL:\n{dis}");
+        assert!(dis.contains("dx.op.binaryWithTwoOuts.i32"), "expected UMul in DXIL:\n{dis}");
+    }
+
+    let zero_off = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let dxil0 = translate(&zero_off, ko).expect("zero-offset multi-window translates");
+    super::validate::validate(&dxil0).expect("zero-offset validates");
+    if let Ok(dis0) = super::validate::disassemble(&dxil0) {
+        let body0 = dis0.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(!dis0.contains("64-bit integers") && !body0.contains("i64"), "zero-offset window_at must not emit i64:\n{dis0}");
+        assert!(!body0.contains("icmp ult"), "zero-offset window_at must not emit carry compare:\n{dis0}");
+    }
+}

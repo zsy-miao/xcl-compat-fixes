@@ -3,7 +3,7 @@
 //! `xcl_m*` accessors with `Options::heap_windows` (`recomp::emit::mem_accessors`).
 
 use super::lower::{Lw, VAR_WIN};
-use super::module::{Pred, Value};
+use super::module::{CastOp, Pred, Value};
 use crate::gpu::rdna2::Decoded;
 
 /// A term of a 64-bit effective address (`window_at`).
@@ -59,21 +59,81 @@ impl Lw {
         if !self.windowed() {
             return;
         }
-        let mut ea = self.pack64(lo, hi);
-        for &t in adds {
-            let x = match t {
-                Ea::U(v) => self.zext64(v),
-                Ea::K(k) => self.c64(k as u64),
-                Ea::S(v) => self.sext64(v),
-                Ea::Mul(a, b) => {
-                    let (a, b) = (self.zext64(a), self.zext64(b));
-                    self.mul(a, b)
+        let non_zero = |t: &Ea| match *t {
+            Ea::K(0) => false,
+            Ea::U(v) | Ea::S(v) => self.s.m.const_u64(v) != Some(0),
+            Ea::Mul(a, b) => self.s.m.const_u64(a) != Some(0) && self.s.m.const_u64(b) != Some(0),
+            Ea::K(_) => true,
+        };
+        let terms: Vec<Ea> = adds.iter().copied().filter(non_zero).collect();
+        let (mut lo, mut hi) = (lo, hi);
+        let uadd = |lw: &mut Self, lo: &mut Value, hi: &mut Value, add_lo: Value, add_hi: Option<Value>| {
+            if let Some(ah) = add_hi {
+                *hi = lw.add(*hi, ah);
+            }
+            if lw.s.m.const_u64(*lo) == Some(0) {
+                *lo = add_lo;
+            } else {
+                let sum = lw.add(*lo, add_lo);
+                let carry = lw.cmp(Pred::ULt, sum, *lo);
+                *lo = sum;
+                let i32 = lw.s.m.i32();
+                let c32 = lw.s.m.cast(CastOp::ZExt, carry, i32);
+                *hi = lw.add(*hi, c32);
+            }
+        };
+        for (idx, t) in terms.iter().copied().enumerate() {
+            let has_more = idx + 1 < terms.len();
+            match t {
+                Ea::K(k) => {
+                    let kv = self.c(k);
+                    uadd(self, &mut lo, &mut hi, kv, None);
                 }
-            };
-            ea = self.add(ea, x);
+                Ea::U(v) => uadd(self, &mut lo, &mut hi, v, None),
+                Ea::S(v) => match self.s.m.const_u64(v) {
+                    Some(k) if (k as i32) < 0 => {
+                        let neg_k = (k as u32).wrapping_neg();
+                        if self.s.m.const_u64(lo) == Some(0) {
+                            lo = v;
+                            hi = self.addc(hi, u32::MAX);
+                        } else {
+                            let borrow = self.cmpc(Pred::ULt, lo, neg_k);
+                            if has_more {
+                                lo = self.add(lo, v);
+                            }
+                            let i32 = self.s.m.i32();
+                            let b32 = self.s.m.cast(CastOp::ZExt, borrow, i32);
+                            hi = self.sub(hi, b32);
+                        }
+                    }
+                    Some(_) => uadd(self, &mut lo, &mut hi, v, None),
+                    None => {
+                        let sign = self.ashrc(v, 31);
+                        uadd(self, &mut lo, &mut hi, v, Some(sign));
+                    }
+                },
+                Ea::Mul(a, b) => match (self.s.m.const_u64(a), self.s.m.const_u64(b)) {
+                    (Some(1), _) => uadd(self, &mut lo, &mut hi, b, None),
+                    (_, Some(1)) => uadd(self, &mut lo, &mut hi, a, None),
+                    (Some(ka), Some(kb)) => {
+                        let prod = (ka as u32 as u64) * (kb as u32 as u64);
+                        let (plo, phi) = (prod as u32, (prod >> 32) as u32);
+                        if phi != 0 {
+                            hi = self.addc(hi, phi);
+                        }
+                        if plo != 0 {
+                            let plov = self.c(plo);
+                            uadd(self, &mut lo, &mut hi, plov, None);
+                        }
+                    }
+                    _ => {
+                        let (phi, plo) = self.s.umul_wide(a, b);
+                        uadd(self, &mut lo, &mut hi, plo, Some(phi));
+                    }
+                },
+            }
         }
-        let (_, h) = self.unpack64(ea);
-        self.window_hi(h, write);
+        self.window_hi(hi, write);
     }
 
     /// `window_at` of a high dword already computed (`window_read` / `window_write`).

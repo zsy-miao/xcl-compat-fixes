@@ -3858,6 +3858,9 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
 type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
 unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // built in the call on one of the title's threads (no stand-in): the driver's time is not
+    // the title's (`pso_async::title_held`); a worker's build holds nobody
+    let _in_pc = (!super::pso_async::building_here()).then(super::pso_async::pc_call);
     let mut hr = driver_pso(f, this, desc, riid, ppv);
     if hr == E_NOINTERFACE {
         let iid = pc_iid(Kind::PipelineState);
@@ -7418,6 +7421,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
+    // own work in the submission. Where that takes long, it is not the title's time
+    // (`pso_async::title_held`)
+    let _in_pc = super::pso_async::pc_call();
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand

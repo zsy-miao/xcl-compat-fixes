@@ -1352,7 +1352,8 @@ mod shader_cache_tests {
                 Ok((compiled(marker), rerouted))
             })
             .unwrap()
-            .dxil[0]
+            // (`compiled`: a DXIL container whose marker byte is 67, not its first byte)
+            .dxil[67]
         };
         let mut calls = 0;
         assert_eq!(go(enormous_blob, 7, 1, true, &mut calls), 1);
