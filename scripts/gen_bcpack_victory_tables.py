@@ -5,8 +5,8 @@ victory-formats/bcpack-tables.bin.
 
 Layout is that of the format's constant tables: 128 x 9 u16 model frequencies, the
 rank tables, 512 u16 BC7 control words, then 255 dictionary entries per format.
-BC7 entries follow VIctory PR #658: after the two index widths, two bytes repeat
-them and there are 16 + 15 signed indices, not 32.
+BC7 entry 0 stores all 32 signed indices directly after its two index widths; entries
+1..254 repeat the two width bytes first and store 16 + 15 signed indices (VIctory PR #658).
 
     python -I scripts/gen_bcpack_victory_tables.py <bcpack-tables.bin> <out.rs>
 """
@@ -74,12 +74,15 @@ def main(src, dst):
         ix = [r.i16() for _ in range(16)]
         bc6.append((e, mode, ix))
     bc7 = []
-    for _ in range(DICTIONARY):
+    for entry in range(DICTIONARY):
         ctrl = r.u16()
         ep = [r.u16() for _ in range(24)]
         bits = [r.u8(), r.u8()]
-        r.u16()  # the widths again; not indices
-        ix = [r.i16() for _ in range(31)] + [0]  # set 1 has 15 slots, unused
+        if entry == 0:
+            ix = [r.i16() for _ in range(32)]
+        else:
+            r.u16()  # the widths again; not indices
+            ix = [r.i16() for _ in range(31)] + [0]  # set 1 has 15 slots, unused
         bc7.append((ctrl, ep, bits, ix))
     assert r.i == len(r.b), (r.i, len(r.b))
 

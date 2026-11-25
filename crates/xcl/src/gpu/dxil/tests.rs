@@ -177,3 +177,42 @@ fn blocks_are_written_in_reverse_post_order() {
     let want: Vec<u32> = (0..64).map(|l| ((l as u32) << 2) + 7 + sgpr[l]).collect();
     assert_eq!(&r.raw[..64], &want[..]);
 }
+
+/// `replace_uses` makes a whole map of trivial phis in one pass and leaves the module as
+/// `replace_all_uses` one at a time in order does, a chain included (`a → b`, then `b → v`,
+/// as the SSA construction makes when `b` turns trivial after `a`).
+#[test]
+fn batched_replacements_match_one_at_a_time() {
+    let build = |batched: bool| {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let io = s.raw_uav(0, 0);
+        let res = s.raw_uav(1, 0);
+        let lane = s.thread_id_in_group(0);
+        let two = s.m.i32c(2);
+        let off = s.m.bin(BinOp::Shl, lane, two);
+        let next = s.m.new_block();
+        let x = s.raw_load(io, off, 1)[0];
+        s.m.br(next);
+        let entry = s.m.entry_block();
+        s.m.set_block(next);
+        let i32 = s.m.i32();
+        let b = s.m.phi(i32);
+        s.m.add_incoming(b, x, entry);
+        let a = s.m.phi(i32);
+        s.m.add_incoming(a, b, entry);
+        let sum = s.m.bin(BinOp::Add, a, b);
+        s.raw_store(res, off, &[sum]);
+        if batched {
+            s.m.replace_uses(&std::collections::HashMap::from([(a, b), (b, x)]));
+        } else {
+            s.m.replace_all_uses(a, b);
+            s.m.replace_all_uses(b, x);
+        }
+        s.finish([64, 1, 1], None)
+    };
+    let c = build(true);
+    assert_eq!(c, build(false));
+    if let Err(e) = validate::validate(&c) {
+        panic!("validator rejected the kernel:\n{e}");
+    }
+}

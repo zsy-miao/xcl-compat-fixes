@@ -5,9 +5,9 @@
 //! directly indexed descriptor heaps (images / samplers). Mapping the title's root arguments
 //! onto that ABI at draw time is the next step (needs the console runtime's user-data layout).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -15,11 +15,12 @@ use windows::Win32::Graphics::Direct3D12::*;
 use super::{dxc, interface, translate, Mode, Options};
 use crate::gpu::xbox;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Vertex,
     Pixel,
     Compute,
+    Mesh,
 }
 
 /// A console (xbox-native) shader container?
@@ -137,6 +138,12 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
 
+/// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
+fn shader_cache() -> &'static Mutex<ShaderCache> {
+    static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)))
+}
+
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
@@ -144,8 +151,6 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
     }
-    static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)));
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
         stage,
@@ -157,7 +162,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -206,9 +211,14 @@ mod translated {
         }
     }
 
+    /// The direct translator's version: `TRANSLATOR_VERSION` and the hash of its sources (build.rs).
+    pub(super) fn direct_version(version: u32, source: &str) -> u64 {
+        identity_for(source, &version.to_string())
+    }
+
     /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
     /// tagged with the direct translator's version and routing mode otherwise.
-    pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u32) -> u64 {
+    pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u64) -> u64 {
         let base = identity_for(source, toolchain);
         let tag = match backend {
             Backend::Hlsl => return base,
@@ -233,12 +243,23 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            identity_with(
+            let id =             identity_with(
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
                 Backend::current(),
-                crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
-            )
+                direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
+            );
+            // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
+            let id = match crate::gpu::dxil::kernel::compact_mode() {
+                Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
+                _ => id,
+            };
+            // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
+            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            }
         })
     }
 
@@ -343,6 +364,9 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
@@ -354,7 +378,10 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
-    if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
+    if matches!(stage, Stage::Vertex | Stage::Pixel) && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
         match direct_graphics(blob, stage, sampler_base, windows) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
@@ -455,7 +482,11 @@ pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static st
     console_translation(blob, stage, 0, mem_windows(), false).map(|(t, p)| (t.hlsl, p))
 }
 
-#[derive(Clone, PartialEq, Eq)]
+/// Upper entry cap for `ShaderCache` (the 64 MiB byte limit is the primary bound; a retail game
+/// has ~2 800 unique shaders across ~58 000 PSOs, so a 128-entry cap thrashed RAM to disk).
+const SHADER_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ShaderKey {
     hash: u64,
     stage: Stage,
@@ -469,6 +500,7 @@ struct ShaderEntry {
     key: ShaderKey,
     blob: Vec<u8>,
     shader: Arc<Compiled>,
+    gen: u64,
 }
 
 impl ShaderEntry {
@@ -481,7 +513,11 @@ impl ShaderEntry {
 }
 
 struct ShaderCache {
-    entries: VecDeque<ShaderEntry>,
+    entries: HashMap<u64, ShaderEntry>,
+    by_key: HashMap<ShaderKey, Vec<u64>>,
+    lru: VecDeque<(u64, u64)>,
+    next_id: u64,
+    next_gen: u64,
     bytes: usize,
     limit: usize,
 }
@@ -489,24 +525,65 @@ struct ShaderCache {
 impl ShaderCache {
     fn new(limit: usize) -> Self {
         Self {
-            entries: VecDeque::new(),
+            entries: HashMap::new(),
+            by_key: HashMap::new(),
+            lru: VecDeque::new(),
+            next_id: 0,
+            next_gen: 0,
             bytes: 0,
             limit,
         }
     }
 
+    fn compact_lru(&mut self) {
+        if self.lru.len() > self.entries.len().max(64) * 4 {
+            self.lru.retain(|&(id, gen)| self.entries.get(&id).is_some_and(|e| e.gen == gen));
+        }
+    }
+
+    fn evict_one(&mut self) -> bool {
+        while let Some((id, gen)) = self.lru.pop_front() {
+            if self.entries.get(&id).is_some_and(|e| e.gen == gen) {
+                if let Some(old) = self.entries.remove(&id) {
+                    self.bytes -= old.bytes();
+                    if let Some(ids) = self.by_key.get_mut(&old.key) {
+                        ids.retain(|&x| x != id);
+                        if ids.is_empty() {
+                            self.by_key.remove(&old.key);
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn get(&mut self, key: &ShaderKey, blob: &[u8]) -> Option<Arc<Compiled>> {
-        let at = self
-            .entries
+        let id = self
+            .by_key
+            .get(key)?
             .iter()
-            .rposition(|e| &e.key == key && e.blob == blob)?;
-        let entry = self.entries.remove(at)?;
-        let shader = entry.shader.clone();
-        self.entries.push_back(entry);
+            .copied()
+            .find(|id| self.entries.get(id).is_some_and(|e| e.blob == blob))?;
+        self.next_gen += 1;
+        let gen = self.next_gen;
+        let shader = {
+            let entry = self.entries.get_mut(&id)?;
+            entry.gen = gen;
+            entry.shader.clone()
+        };
+        self.lru.push_back((id, gen));
+        self.compact_lru();
         Some(shader)
     }
 
     fn insert(&mut self, key: ShaderKey, blob: &[u8], shader: Arc<Compiled>) {
+        if let Some(ids) = self.by_key.get(&key) {
+            if ids.iter().any(|id| self.entries.get(id).is_some_and(|e| e.blob == blob)) {
+                return;
+            }
+        }
         let bytes = blob.len()
             + key.cache_dir.capacity()
             + shader.dxil.capacity()
@@ -514,19 +591,41 @@ impl ShaderCache {
         if bytes > self.limit {
             return;
         }
-        while self.bytes + bytes > self.limit || self.entries.len() >= 128 {
-            let Some(old) = self.entries.pop_front() else {
+        while self.bytes + bytes > self.limit || self.entries.len() >= SHADER_CACHE_MAX_ENTRIES {
+            if !self.evict_one() {
                 break;
-            };
-            self.bytes -= old.bytes();
+            }
         }
-        self.entries.push_back(ShaderEntry {
-            key,
-            blob: blob.to_vec(),
-            shader,
-        });
+        self.next_id += 1;
+        self.next_gen += 1;
+        let (id, gen) = (self.next_id, self.next_gen);
+        self.by_key.entry(key.clone()).or_default().push(id);
+        self.entries.insert(
+            id,
+            ShaderEntry {
+                key,
+                blob: blob.to_vec(),
+                shader,
+                gen,
+            },
+        );
+        self.lru.push_back((id, gen));
         self.bytes += bytes;
     }
+}
+
+/// Per-`ShaderKey` in-flight mutex so concurrent PSO workers requesting the same shader coalesce
+/// into a single translation/compilation instead of translating the same program N times in parallel.
+fn shader_flight(key: ShaderKey) -> Arc<Mutex<()>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<ShaderKey, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    flights.retain(|_, v| v.strong_count() != 0);
+    if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
+        return flight;
+    }
+    let flight = Arc::new(Mutex::new(()));
+    flights.insert(key, Arc::downgrade(&flight));
+    flight
 }
 
 fn cached_shader(
@@ -539,7 +638,23 @@ fn cached_shader(
         dxc::note_memory_hit();
         return Ok(shader);
     }
-    // Keep compilation outside the cache lock, including cached-only probes.
+    // Cached-only probes (non-blocking PSO creation) must never block on an in-flight worker.
+    if dxc::in_cached_only() {
+        let shader = Arc::new(compile_one()?);
+        let mut cache = cache.lock().unwrap();
+        if let Some(existing) = cache.get(&key, blob) {
+            return Ok(existing);
+        }
+        cache.insert(key, blob, shader.clone());
+        return Ok(shader);
+    }
+    let flight = shader_flight(key.clone());
+    let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
+        dxc::note_memory_hit();
+        return Ok(shader);
+    }
+    // Keep compilation outside the cache lock.
     let shader = Arc::new(compile_one()?);
     let mut cache = cache.lock().unwrap();
     if let Some(existing) = cache.get(&key, blob) {
@@ -603,6 +718,20 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
+    // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
+    if super::lower_dxil::enabled() {
+        match super::lower_dxil::compute_with(code, &cs, o) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("CS per-lane");
+                dump_direct(blob, &k.dxil);
+                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+            }
+            Err(e) => {
+                let reason = crate::gpu::dxil::coverage::record_fallback("CS per-lane", &e);
+                crate::xlog_info!("[SHADER] per-lane fallback reason=\"{reason}\" detail=\"{}\" – per-instruction form", e.lines().next().unwrap_or(""));
+            }
+        }
+    }
     let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
@@ -662,6 +791,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
         Stage::Vertex => 4,
         Stage::Pixel => 5,
         Stage::Compute => 6,
+        Stage::Mesh => return Err("mesh shaders go through console_mesh".into()),
     };
     let f = sh
         .fssm
@@ -701,21 +831,68 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
+fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
+}
+
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
+    finish_two_pass_compiled(Compiled { dxil: cs, samplers: t.static_samplers }, record, ps)
 }
 
-/// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
-/// the pixel shader `ps` (its container: console or PC) reads.
-pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+fn compile_console_mesh(
+    blob: &[u8],
+    code: &[u8],
+    ms: &super::MsInterface,
+    wave64: bool,
+    windows: u32,
+    split_wave64: bool,
+) -> Result<Compiled, String> {
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    if crate::gpu::dxil::kernel::enabled() {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
+        let o = crate::gpu::dxil::kernel::KernelOptions {
+            wave64,
+            split: wave64 && split_wave64,
+            mem_windows: windows,
+            sampler_base: 0,
+        };
+        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("MS");
+                dump_direct(blob, &k.dxil);
+                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+            }
+            Err(e) => direct_fallback("MS", &e),
+        }
+    }
+    let t = super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    let dxil = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
+    Ok(Compiled { dxil, samplers: t.static_samplers })
+}
+
+fn console_mesh_with(
+    blob: &[u8],
+    ps: Option<&[u8]>,
+    split_wave64: bool,
+    windows: u32,
+    cache_dir: &std::path::Path,
+    cache: &Mutex<ShaderCache>,
+    compile: impl FnOnce(&[u8], &super::MsInterface, bool) -> Result<Compiled, String>,
+) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -724,21 +901,35 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
-    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
-        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
-        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
-            Ok(k) => {
-                crate::gpu::dxil::coverage::record_translated("MS");
-                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
-            }
-            Err(e) => direct_fallback("MS", &e),
-        }
-    }
-    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
+    let split = wave64 && split_wave64;
+    let compile_one = || compile(code, ms, wave64);
+    // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
+    // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
+    let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
+        let key = ShaderKey {
+            hash: crate::gpu::shader::fnv64(blob),
+            stage: Stage::Mesh,
+            sampler_base: 0,
+            windows,
+            split_wave64: split,
+            cache_dir: cache_dir.to_path_buf(),
+        };
+        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, compile_one);
+        cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
+    } else {
+        compile_one()?
+    };
+    finish_two_pass_compiled(cs, record, ps)
+}
+
+/// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
+/// the pixel shader `ps` (its container: console or PC) reads.
+pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    let windows = mem_windows();
+    let dir = dxc::cache_dir();
+    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
+        compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
+    })
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -789,6 +980,20 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    if crate::gpu::dxil::kernel::enabled() {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+        match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("GS");
+                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+            }
+            Err(e) => direct_fallback("GS", &e),
+        }
+    }
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
     finish_two_pass(translation, record, ps)
 }
@@ -971,6 +1176,22 @@ mod shader_cache_tests {
         assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
     }
 
+    /// An edit of the direct translator's sources changes the direct entries' identity (no
+    /// `TRANSLATOR_VERSION` bump needed) and leaves the HLSL path's.
+    #[test]
+    fn direct_dxil_identity_tracks_its_sources() {
+        use translated::{direct_version, identity_with, Backend};
+        let built = env!("XCL_DIRECT_DXIL_SOURCE_ID");
+        assert_eq!(built.len(), 16);
+        assert!(u64::from_str_radix(built, 16).is_ok());
+        let id = |backend, version, source| identity_with("s", "t", backend, direct_version(version, source));
+        for backend in [Backend::DirectCompute, Backend::DirectAll] {
+            assert_ne!(id(backend, 7, built), id(backend, 7, "edited"), "{backend:?}: edited sources, same version");
+            assert_ne!(id(backend, 7, built), id(backend, 8, built), "{backend:?}: a version bump");
+        }
+        assert_eq!(id(Backend::Hlsl, 7, built), id(Backend::Hlsl, 8, "edited"));
+    }
+
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
     /// is a miss for the HLSL identity (and the other way round) for the same request.
     #[test]
@@ -1112,6 +1333,7 @@ mod shader_cache_tests {
             key: key(1),
             blob: b"a".to_vec(),
             shader: t.clone(),
+            gen: 0,
         }
         .bytes();
         let mut cache = ShaderCache::new(limit);
@@ -1133,12 +1355,124 @@ mod shader_cache_tests {
         assert!(cache.get(&key(4), b"d").is_none());
         assert_eq!(cache.bytes, limit);
         assert_eq!(cache.entries.len(), 2);
-        let mut cache = ShaderCache::new(1 << 20);
-        for i in 0..129 {
+        let mut cache = ShaderCache::new(64 << 20);
+        for i in 0..=(SHADER_CACHE_MAX_ENTRIES as u64) {
             cache.insert(key(i), b"a", t.clone());
         }
-        assert_eq!(cache.entries.len(), 128);
+        assert_eq!(cache.entries.len(), SHADER_CACHE_MAX_ENTRIES);
         assert!(cache.get(&key(0), b"a").is_none());
+    }
+
+    #[test]
+    fn shader_cache_coalesces_concurrent_same_key_compiles() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = Mutex::new(ShaderCache::new(1 << 20));
+        let compiles = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(4);
+        let k = key(0xC0A1_E5CE);
+        std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..4 {
+                let cache = &cache;
+                let compiles = &compiles;
+                let barrier = &barrier;
+                let k = k.clone();
+                threads.push(scope.spawn(move || {
+                    barrier.wait();
+                    cached_shader(cache, k, b"shared-ms", || {
+                        compiles.fetch_add(1, Ordering::AcqRel);
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        Ok(compiled(0x42))
+                    })
+                }));
+            }
+            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap().unwrap()).collect();
+            assert_eq!(compiles.load(Ordering::Acquire), 1, "concurrent same-key translates must coalesce to 1");
+            for r in &results[1..] {
+                assert!(Arc::ptr_eq(&results[0], r));
+            }
+        });
+    }
+
+    fn synthetic_mesh_container() -> Vec<u8> {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
+        let mut psv_r = vec![0u8; 48];
+        psv_r[12..14].copy_from_slice(&3u16.to_le_bytes()); // max_vertices
+        psv_r[14..16].copy_from_slice(&1u16.to_le_bytes()); // max_primitives
+        psv_r[24] = 13; // mesh
+        psv_r[27] = 2; // triangles
+        psv_r[36..40].copy_from_slice(&32u32.to_le_bytes());
+        psv_r[40..44].copy_from_slice(&1u32.to_le_bytes());
+        psv_r[44..48].copy_from_slice(&1u32.to_le_bytes());
+        let mut psv0 = 48u32.to_le_bytes().to_vec();
+        psv0.extend_from_slice(&psv_r);
+        psv0.extend_from_slice(&0u32.to_le_bytes());
+
+        // Minimal OSG1 with SV_Position (system_value = 1, mask = 0xF, float = 3).
+        let name = b"SV_Position\0";
+        let mut osg1 = Vec::new();
+        osg1.extend_from_slice(&1u32.to_le_bytes()); // count
+        osg1.extend_from_slice(&8u32.to_le_bytes()); // offset
+        let name_off = (8 + 32) as u32;
+        for w in [0u32, name_off, 0, 1, 3, 0, 0x0F0F, 0] {
+            osg1.extend_from_slice(&w.to_le_bytes());
+        }
+        osg1.extend_from_slice(name);
+
+        let f = fssm(&CODE, &[(7, 0)]);
+        container(&[
+            (b"SFI0", &[0; 8]),
+            (b"HASH", &[0; 20]),
+            (b"OSG1", &osg1),
+            (b"PSV0", &psv0),
+            (b"DXIL", &dxil_part(13, &[f])),
+        ])
+    }
+
+    #[test]
+    fn console_mesh_caches_hlsl_compute_pass_in_memory_and_on_disk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let blob = synthetic_mesh_container();
+        let dir = std::env::temp_dir().join(format!("xcl-mesh-hlsl-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Mutex::new(ShaderCache::new(64 << 20));
+        let compiles = AtomicUsize::new(0);
+
+        let run = |c: &Mutex<ShaderCache>| {
+            console_mesh_with(&blob, None, false, 1, &dir, c, |code, ms, wave64| {
+                compiles.fetch_add(1, Ordering::SeqCst);
+                compile_console_mesh(&blob, code, ms, wave64, 1, false)
+            })
+        };
+
+        let first = run(&cache).expect("first console_mesh compile");
+        assert_eq!(compiles.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.lock().unwrap().entries.len(), 1);
+
+        // Second call must hit in-memory ShaderCache without re-translating or recompiling.
+        let second = run(&cache).expect("in-memory cached console_mesh");
+        assert_eq!(compiles.load(Ordering::SeqCst), 1);
+        assert_eq!(second.cs, first.cs);
+        assert_eq!(second.samplers, first.samplers);
+
+        // Cold RAM cache must hit the on-disk translated/v2 Stage::Mesh entry unless disk caching is disabled.
+        if std::env::var("XCL_TRANSLATED_CACHE").ok().as_deref() != Some("0") {
+            let cold_cache = Mutex::new(ShaderCache::new(64 << 20));
+            let third = run(&cold_cache).expect("disk cached console_mesh");
+            assert_eq!(compiles.load(Ordering::SeqCst), 1);
+            assert_eq!(third.cs, first.cs);
+            assert_eq!(third.samplers, first.samplers);
+        }
+
+        // Public entry point also populates the global cache so a cached_only repeat succeeds.
+        let pub_first = console_mesh(&blob, None, false).expect("public console_mesh");
+        let (pub_second, missed) = dxc::cached_only(|| console_mesh(&blob, None, false));
+        let pub_second = pub_second.expect("cached_only console_mesh hit");
+        assert!(!missed);
+        assert_eq!(pub_second.cs, pub_first.cs);
+        assert_eq!(pub_second.ms, pub_first.ms);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

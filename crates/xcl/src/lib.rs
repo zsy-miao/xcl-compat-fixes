@@ -28,6 +28,8 @@ pub mod resolver;
 pub mod rpf;
 mod rpf_probe;
 pub mod shaders;
+#[cfg(test)]
+mod source_hash;
 pub mod state;
 pub mod stubs;
 pub mod tls;

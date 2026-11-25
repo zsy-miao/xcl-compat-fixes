@@ -103,9 +103,15 @@ fn junk_streams_do_not_panic() {
 }
 
 /// The BC7 dictionary indices follow VIctory PR #658: a set with 0 bits holds no
-/// indices, and pixel 0 is the anchor (top bit clear).
+/// indices, and pixel 0 is the anchor (top bit clear). Entry 0 stores all 32 indices
+/// directly without the repeated width word, keeping its leading `[2, 1, 0, ...]` values.
 #[test]
 fn bc7_dictionary_indices_line_up() {
+    let (ep0, ix0) = super::tables::BC7[0];
+    assert_eq!(ep0.ctrl, 0);
+    assert_eq!(ix0.bits, [4, 0]);
+    assert_eq!(ix0.ix[0], [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(ix0.ix[1], [0; 16]);
     for (k, (_, ix)) in super::tables::BC7.iter().enumerate() {
         assert!(ix.bits[0] > 0, "entry {k}: the first index set has no bits");
         let hi = 1i16 << (ix.bits[0] - 1);

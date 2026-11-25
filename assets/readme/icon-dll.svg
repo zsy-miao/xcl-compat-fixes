@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Console libraries">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#1fb9d8"/></linearGradient></defs>
+  <g fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="8" y="8" width="22" height="22" rx="5"/>
+    <rect x="34" y="34" width="22" height="22" rx="5"/>
+    <path d="M30 19H42Q47 19 47 24V34"/>
+    <path d="M19 30V42Q19 47 24 47H34"/>
+  </g>
+  <rect x="8" y="8" width="22" height="22" rx="5" fill="url(#g)" opacity=".2"/>
+  <rect x="34" y="34" width="22" height="22" rx="5" fill="url(#g)" opacity=".2"/>
+</svg>

@@ -31,6 +31,9 @@
 
 #![allow(non_snake_case)]
 
+#[path = "dstorage/parallel.rs"]
+mod parallel;
+
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::AsRawHandle;
@@ -867,29 +870,32 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+fn note_request(r: &Request) {
+    let n = r.destination_size as usize;
+    // the first requests: where a title's data goes and how it is packed
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    if k < 16 || k.is_power_of_two() {
+        crate::xlog_info!(
+            "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
+            r.options,
+            if r.memory_source() { "memory" } else { "file" },
+            if r.zlib() { ", zlib" } else { "" },
+            r.destination,
+            if r.dest_physical_pages() { " (physical pages)" } else { "" },
+            r.destination_page_offset,
+            r.source_size,
+            r.intermediate_size
+        );
+    }
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
-    {
-        // the first requests: where a title's data goes and how it is packed
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let k = N.fetch_add(1, Ordering::Relaxed);
-        REQUESTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        if k < 16 || k.is_power_of_two() {
-            crate::xlog_info!(
-                "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
-                r.options,
-                if r.memory_source() { "memory" } else { "file" },
-                if r.zlib() { ", zlib" } else { "" },
-                r.destination,
-                if r.dest_physical_pages() { " (physical pages)" } else { "" },
-                r.destination_page_offset,
-                r.source_size,
-                r.intermediate_size
-            );
-        }
-    }
+    note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
@@ -1055,6 +1061,10 @@ struct QueueInner {
     errors: Mutex<(u32, Option<FirstError>)>,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    #[cfg(test)]
+    pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
+    #[cfg(test)]
+    test_hook: OnceLock<parallel::TestHook>,
 }
 
 impl QueueInner {
@@ -1118,59 +1128,69 @@ impl QueueInner {
             }
         }
         let _active = ActiveGuard(self);
+        if let Some(pool) = parallel::pool_for(self) {
+            parallel::run(self, pool, rx);
+            return;
+        }
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
         for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
-                    }
-                    continue;
+            for entry in batch {
+                self.run_entry(entry, &mut since_status);
+            }
+        }
+    }
+
+    fn update_error(&self, hr: HRESULT, req: Request, file: Option<&FileInner>, since_status: &mut HRESULT) {
+        self.fail(hr, req, file);
+        if *since_status >= 0 {
+            *since_status = hr;
+        }
+    }
+
+    #[inline]
+    fn run_entry(&self, e: Entry, since_status: &mut HRESULT) {
+        if self.closed.load(Ordering::Acquire) {
+            if let Entry::Status(s, i) = e {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(E_QUEUE_CLOSED, Ordering::Release);
                 }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
-                    }
-                    Entry::Refused { seq, hr, req, file, fill } => {
-                        // a cancelled request is no failure, refused or not
-                        if self.is_cancelled(seq, req.tag) {
-                            continue;
-                        }
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
-                        }
-                        self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
-                    }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
-                    }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
-                    }
+            }
+            return;
+        }
+        match e {
+            Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                if self.is_cancelled(seq, req.tag) {
+                    // Cancelled requests are skipped without affecting status or error record.
+                    return;
                 }
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                    self.update_error(hr, req, file.as_deref(), since_status);
+                }
+            }
+            Entry::Refused { seq, hr, req, file, fill } => {
+                // a cancelled request is no failure, refused or not
+                if self.is_cancelled(seq, req.tag) {
+                    return;
+                }
+                if let Some(t) = &fill {
+                    // the destination gets solid blocks; the request still fails
+                    unsafe { bcpack_fill(&req, t) };
+                }
+                self.update_error(hr, req, file.as_deref(), since_status);
+            }
+            Entry::Status(s, i) => {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(*since_status, Ordering::Release);
+                }
+                *since_status = S_OK;
+            }
+            Entry::Signal(fence, value) => unsafe {
+                fence.signal(value);
+            },
+            #[cfg(test)]
+            Entry::Gate(b) => {
+                b.wait();
             }
         }
     }
@@ -1288,6 +1308,10 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        #[cfg(test)]
+        pool_override: OnceLock::new(),
+        #[cfg(test)]
+        test_hook: OnceLock::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1457,6 +1481,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
         // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
+    parallel::wake_waiters(q);
     // Wait outside queue locks so no in-flight worker request can still touch caller buffers
     // after `Close()` returns (including for concurrent `Close()` callers).
     let (lock, cvar) = &q.worker_active;

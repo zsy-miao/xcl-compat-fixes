@@ -1,0 +1,44 @@
+{
+ "stages": {
+  "CS": {
+   "panicked": 0,
+   "timeout": 0,
+   "total": 1636,
+   "translated": 1636,
+   "unsupported": 0,
+   "validator_failed": 0
+  },
+  "GS": {
+   "panicked": 0,
+   "timeout": 0,
+   "total": 390,
+   "translated": 390,
+   "unsupported": 0,
+   "validator_failed": 0
+  },
+  "MS": {
+   "panicked": 0,
+   "timeout": 0,
+   "total": 8724,
+   "translated": 8724,
+   "unsupported": 0,
+   "validator_failed": 0
+  },
+  "PS": {
+   "panicked": 0,
+   "timeout": 0,
+   "total": 9511,
+   "translated": 9511,
+   "unsupported": 0,
+   "validator_failed": 0
+  },
+  "VS": {
+   "panicked": 0,
+   "timeout": 0,
+   "total": 2184,
+   "translated": 2184,
+   "unsupported": 0,
+   "validator_failed": 0
+  }
+ }
+}

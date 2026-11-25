@@ -11,7 +11,52 @@ use super::ops::{AtomicOp, CompType, Sampler, TexKind, Texture};
 use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded};
 
+/// Upper bound on valid SRV indices in the shared shader-visible view heap
+/// (`console_heap::GLOBAL_MAX = 1 << 21`, leaving `index + 1` in-bounds for the paired UAV).
+/// Guarding / clamping dynamic heap indices prevents AMD Tier-3 GPUs from page-faulting
+/// on null, uninitialized, or unpatched console T# descriptors.
+const VIEW_HEAP_MAX_SRV: u32 = (1 << 21) - 1;
+/// D3D12 shader-visible sampler heap limit (`2048` samplers: `0..=2047`).
+const SAMPLER_HEAP_MASK: u32 = 0x7FF;
+
 impl Lw {
+    /// True when a T# carries a valid XCL image descriptor whose SRV (`tw0`) and paired
+    /// UAV (`tw0 + 1`) indices are within the shared shader-visible view heap:
+    /// - `tw3[31:28] >= 8` (valid GFX10 `SQ_RSRC_IMG_TYPE`, rejecting null T# and buffer V#);
+    /// - `tw1[7:0] == 0` (`desc::xcl_image_words` clears `BASE_ADDRESS_HI`, rejecting raw GPU VAs);
+    /// - `tw0 < VIEW_HEAP_MAX_SRV` (rejecting OOB indices and `u32::MAX` wraparound on `tw0 + 1`).
+    fn valid_tsharp(&mut self, tw0: Value, tw1: Value, tw3: Value) -> Value {
+        let rtype = self.lshrc(tw3, 28);
+        let ok_ty = self.cmpc(Pred::UGe, rtype, 8);
+        let hi_va = self.andc(tw1, 0xFF);
+        let ok_va = self.cmpc(Pred::Eq, hi_va, 0);
+        let ok_idx = self.cmpc(Pred::ULt, tw0, VIEW_HEAP_MAX_SRV);
+        let ok = self.land(ok_ty, ok_va);
+        self.land(ok, ok_idx)
+    }
+
+    /// The sampler of the MIMG at `pc`: a static sampler (bound at `s<i>, space1` in order of
+    /// first use) when the console bound one there, else the heap sampler the S# indexes.
+    fn mimg_sampler(&mut self, pc: u64, has_c: bool, s3: Value) -> Sampler {
+        match self.static_samplers.get(&pc).copied() {
+            Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
+                Some(u) => u.2,
+                None => {
+                    let k = self.static_used.len() as u32;
+                    let cur = self.cur();
+                    self.s.m.set_block(self.init.entry);
+                    let h = self.s.sampler(self.sampler_base + k, 1, has_c);
+                    self.s.m.set_block(cur);
+                    self.static_used.push((w, has_c, h));
+                    h
+                }
+            },
+            None => {
+                let si = self.andc(s3, SAMPLER_HEAP_MASK);
+                self.s.heap_sampler(si, has_c, true)
+            }
+        }
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -32,15 +77,6 @@ impl Lw {
         let f32 = self.s.m.f32();
         self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
     }
-    fn load3f(&mut self, at: Value) -> [Value; 3] {
-        let mut r = [at; 3];
-        for (k, slot) in r.iter_mut().enumerate() {
-            let a = self.addc(at, 4 * k as u32);
-            let v = self.mem_ld(a);
-            *slot = self.f(v);
-        }
-        r
-    }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
@@ -52,27 +88,34 @@ impl Lw {
         for box32 in [true, false] {
             let is = self.cmpc(Pred::Eq, ty, if box32 { 5 } else { 4 });
             self.guarded(is, &mut |lw| {
-                let mut child = [ones; 4];
-                for (k, c) in child.iter_mut().enumerate() {
-                    let a = lw.addc(at, 4 * k as u32);
-                    *c = lw.mem_ld(a);
-                }
+                // Box32 is 28 contiguous dwords (4 children + 4×6 box floats);
+                // Box16 is 16 contiguous dwords (4 children + 4×3 packed f16 pairs).
+                // Load the whole node in one window switch using 4-dword rawBufferLoads.
+                let at_al = lw.andc(at, !3);
+                let chunks = if box32 { 7usize } else { 4usize };
+                let words = lw.with_mem_i32s(None, chunks * 4, &mut |lw, m| {
+                    let mut out = Vec::with_capacity(chunks * 4);
+                    for j in 0..chunks {
+                        let a = lw.addc(at_al, 16 * j as u32);
+                        out.extend(lw.s.raw_load(m, a, 0xF));
+                    }
+                    out
+                });
+                let child = [words[0], words[1], words[2], words[3]];
                 let ninf = lw.s.m.f32c(0xFF80_0000);
                 let pinf = lw.s.m.f32c(0x7F80_0000);
                 let mut tn = [pinf; 4];
                 let mut id = [ones; 4];
-                for k in 0..4u32 {
+                for k in 0..4usize {
                     let (mn, mx) = if box32 {
-                        let a = lw.addc(at, 16 + 24 * k);
-                        let b = lw.addc(at, 28 + 24 * k);
-                        (lw.load3f(a), lw.load3f(b))
+                        let b = 4 + 6 * k;
+                        (
+                            [lw.f(words[b]), lw.f(words[b + 1]), lw.f(words[b + 2])],
+                            [lw.f(words[b + 3]), lw.f(words[b + 4]), lw.f(words[b + 5])],
+                        )
                     } else {
-                        let a = lw.addc(at, 16 + 12 * k);
-                        let mut h = [ones; 3];
-                        for (j, slot) in h.iter_mut().enumerate() {
-                            let x = lw.addc(a, 4 * j as u32);
-                            *slot = lw.mem_ld(x);
-                        }
+                        let b = 4 + 3 * k;
+                        let h = [words[b], words[b + 1], words[b + 2]];
                         let hx16 = lw.lshrc(h[0], 16);
                         let hy16 = lw.lshrc(h[1], 16);
                         let hz16 = lw.lshrc(h[2], 16);
@@ -102,7 +145,7 @@ impl Lw {
                     let a = lw.fmax(a, lo[2]);
                     let b = lw.fmin(hi[0], hi[1]);
                     let b = lw.fmin(b, hi[2]);
-                    let cv = lw.cmpc(Pred::Ne, child[k as usize], u32::MAX);
+                    let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
                     let mut all = cv;
                     for c in 0..3 {
                         let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
@@ -115,8 +158,8 @@ impl Lw {
                     let hit = lw.land(all, ab);
                     let x = lw.land(b0, at_);
                     let hit = lw.land(hit, x);
-                    tn[k as usize] = lw.sel(hit, a, pinf);
-                    id[k as usize] = lw.sel(hit, child[k as usize], ones);
+                    tn[k] = lw.sel(hit, a, pinf);
+                    id[k] = lw.sel(hit, child[k], ones);
                 }
                 for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
                     let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
@@ -136,18 +179,39 @@ impl Lw {
         }
         let tri = self.cmpc(Pred::ULe, ty, 3);
         self.guarded(tri, &mut |lw| {
+            let t0 = lw.cmpc(Pred::Eq, ty, 0);
             let t1 = lw.cmpc(Pred::Eq, ty, 1);
+            let t2 = lw.cmpc(Pred::Eq, ty, 2);
+            let t3 = lw.cmpc(Pred::Eq, ty, 3);
+            let le1 = lw.cmpc(Pred::ULe, ty, 1);
             let k0 = lw.c(0);
-            let a0 = lw.selc(t1, 12, k0);
-            let k36 = lw.c(36);
             let k12 = lw.c(12);
-            let a1 = lw.sel(t1, k36, k12);
+            let k24 = lw.c(24);
+            let k36 = lw.c(36);
+            let k48 = lw.c(48);
+            let a0_12 = lw.sel(t1, k12, k24);
+            let a0 = lw.sel(t0, k0, a0_12);
+            let a1_34 = lw.sel(t3, k48, k36);
+            let a1 = lw.sel(t0, k12, a1_34);
+            let a2_23 = lw.sel(t2, k48, k0);
+            let a2 = lw.sel(le1, k24, a2_23);
             let p0 = lw.add(at, a0);
             let p1 = lw.add(at, a1);
-            let p2 = lw.addc(at, 24);
-            let v0 = lw.load3f(p0);
-            let v1 = lw.load3f(p1);
-            let v2 = lw.load3f(p2);
+            let p2 = lw.add(at, a2);
+            let p60 = lw.addc(at, 60);
+            let (p0, p1, p2, p60) = (lw.andc(p0, !3), lw.andc(p1, !3), lw.andc(p2, !3), lw.andc(p60, !3));
+            let words = lw.with_mem_i32s(None, 10, &mut |lw, m| {
+                let mut out = Vec::with_capacity(10);
+                out.extend(lw.s.raw_load(m, p0, 0x7));
+                out.extend(lw.s.raw_load(m, p1, 0x7));
+                out.extend(lw.s.raw_load(m, p2, 0x7));
+                out.push(lw.s.raw_load(m, p60, 0x1)[0]);
+                out
+            });
+            let v0 = [lw.f(words[0]), lw.f(words[1]), lw.f(words[2])];
+            let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
+            let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
+            let tw = words[9];
             let e1 = lw.f3(v1, v0, Lw::fsub);
             let e2 = lw.f3(v2, v0, Lw::fsub);
             let p = lw.cross(dir, e2);
@@ -176,8 +240,6 @@ impl Lw {
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];
-            let p60 = lw.addc(at, 60);
-            let tw = lw.mem_ld(p60);
             let sh = lw.shlc(ty, 3);
             let tid = lw.shr_masked(tw, sh);
             let s0 = lw.andc(tid, 3);
@@ -417,7 +479,12 @@ impl Lw {
         };
         let tw0 = self.sreg(srsrc);
         let tw1 = self.sreg(srsrc + 1);
+        let tw3 = self.sreg(srsrc + 3);
         let act = self.act();
+        let valid = self.valid_tsharp(tw0, tw1, tw3);
+        let run = self.land(act, valid);
+        let z0 = self.c(0);
+        let safe_tw0 = self.sel(valid, tw0, z0);
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         let kind = match dim {
             0 => TexKind::D1,
@@ -427,8 +494,23 @@ impl Lw {
             3 => TexKind::CubeArray,
             4 => TexKind::D1Array,
             5 => TexKind::D2Array,
+            // multisampled: the fragment index is the sample index (D3D12 MSAA resources have
+            // no FMASK; their samples are stored uncompressed)
+            6 => TexKind::D2MS,
+            7 => TexKind::D2MSArray,
             _ => return err(d, "MIMG dim"),
         };
+        let ms = matches!(dim, 6 | 7);
+        if ms && (sampling || base == "get_lod") {
+            return err(d, "MIMG sample MSAA");
+        }
+        if ms && !matches!(base, "load" | "msaa_load" | "get_resinfo") {
+            // stores / atomics need RWTexture2DMS (SM 6.7, WriteableMSAATextures)
+            return err(d, "MIMG MSAA store / atomic / load_mip");
+        }
+        if base == "msaa_load" && !ms {
+            return err(d, "image_msaa_load on a single-sampled dim");
+        }
 
         if sampling {
             if f("UNORM") != 0 && dim != 3 {
@@ -443,7 +525,7 @@ impl Lw {
             } else {
                 None
             };
-            let mut coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
+            let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let lod = i_extra.map(|i| compf(self, i));
             let cl = i_clamp.map(|i| compf(self, i));
             let s3 = self.sreg(ssamp + 3);
@@ -457,142 +539,155 @@ impl Lw {
                 None
             };
             let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
-            let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
-            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
-                // the console's static samplers: bound at s<i>, space1 in order of first use
-                Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
-                    Some(u) => u.2,
-                    None => {
-                        let k = self.static_used.len() as u32;
-                        let cur = self.cur();
-                        self.s.m.set_block(self.init.entry);
-                        let h = self.s.sampler(self.sampler_base + k, 1, has_c);
-                        self.s.m.set_block(cur);
-                        self.static_used.push((w, has_c, h));
-                        h
+            // Keep pixel-shader implicit-LOD samples convergent for quad derivatives (clamp
+            // the heap index to 0 and zero invalid results); guard all other samples/gathers
+            // so inactive lanes and invalid/OOB T#s never invoke `createHandleFromHeap`.
+            let implicit_lod = ps && !gather && !has_lz && grads.is_none() && lod.is_none();
+            let sample_body = |lw: &mut Lw, idx: Value| -> LResult<[Value; 4]> {
+                let mut coords = coords.clone();
+                let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
+                let tex = lw.s.heap_texture(idx, kind, false, CompType::F32, 4, true);
+                let smp: Sampler = lw.mimg_sampler(d.pc, has_c, s3);
+                if let Some(o) = ovgpr {
+                    // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
+                    let level = match (&lod, has_lz || gather) {
+                        (_, true) => lw.c(0),
+                        (Some(l), _) => {
+                            let r = lw.un(op::ROUND_NE, *l);
+                            let z = lw.fc(0.0);
+                            let r = lw.fmax(r, z);
+                            lw.ftoui(r)
+                        }
+                        // the implicit LOD of a pixel shader's sample, rounded
+                        (None, false) if ps && grads.is_none() && !has_c => {
+                            let l = lw.s.calculate_lod(tex, smp, &spatial, true);
+                            let r = lw.un(op::ROUND_NE, l);
+                            let z = lw.fc(0.0);
+                            let r = lw.fmax(r, z);
+                            lw.ftoui(r)
+                        }
+                        _ => lw.c(0),
+                    };
+                    let dims = lw.s.get_dimensions(tex.handle, Some(level));
+                    let one = lw.c(1);
+                    let (w, hh, dd) = match dim {
+                        0 => (lw.s.m.extract(dims, 0), one, one),
+                        1 => (lw.s.m.extract(dims, 0), lw.s.m.extract(dims, 1), one),
+                        2 => (lw.s.m.extract(dims, 0), lw.s.m.extract(dims, 1), lw.s.m.extract(dims, 2)),
+                        4 => (lw.s.m.extract(dims, 0), one, one),
+                        _ => (lw.s.m.extract(dims, 0), lw.s.m.extract(dims, 1), one),
+                    };
+                    let mut ofs = Vec::new();
+                    for (sh, size) in [(26u32, w), (18, hh), (10, dd)] {
+                        let x = lw.shlc(o, sh);
+                        let x = lw.ashrc(x, 26);
+                        let xf = lw.sitof(x);
+                        let sf = lw.uitof(size);
+                        ofs.push(lw.fdiv(xf, sf));
                     }
-                },
-                None => {
-                    let si = self.andc(s3, 0xFFF);
-                    self.s.heap_sampler(si, has_c, true)
+                    for (k, c) in coords.iter_mut().enumerate() {
+                        if (dim == 4 && k == 1) || (dim == 5 && k == 2) {
+                            continue;
+                        }
+                        *c = lw.fadd(*c, ofs[k]);
+                    }
                 }
-            };
-            if let Some(o) = ovgpr {
-                // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
-                let level = match (&lod, has_lz || gather) {
-                    (_, true) => self.c(0),
-                    (Some(l), _) => {
-                        let r = self.un(op::ROUND_NE, *l);
-                        let z = self.fc(0.0);
-                        let r = self.fmax(r, z);
-                        self.ftoui(r)
+                // array layers are rounded; cube coordinates become a direction and a cube index
+                let coord: Vec<Value> = match dim {
+                    3 => {
+                        let mut v = lw.cube_dir(coords[0], coords[1], coords[2]).to_vec();
+                        v.push(lw.cube_slice(coords[2]));
+                        v
                     }
-                    // the implicit LOD of a pixel shader's sample, rounded
-                    (None, false) if ps && grads.is_none() && !has_c => {
-                        let l = self.s.calculate_lod(tex, smp, &spatial, true);
-                        let r = self.un(op::ROUND_NE, l);
-                        let z = self.fc(0.0);
-                        let r = self.fmax(r, z);
-                        self.ftoui(r)
-                    }
-                    _ => self.c(0),
+                    4 => vec![coords[0], lw.un(op::ROUND_NE, coords[1])],
+                    5 => vec![coords[0], coords[1], lw.un(op::ROUND_NE, coords[2])],
+                    _ => coords.clone(),
                 };
-                let dims = self.s.get_dimensions(tex.handle, Some(level));
-                let one = self.c(1);
-                let (w, hh, dd) = match dim {
-                    0 => (self.s.m.extract(dims, 0), one, one),
-                    1 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
-                    2 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), self.s.m.extract(dims, 2)),
-                    4 => (self.s.m.extract(dims, 0), one, one),
-                    _ => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
+                let floor = |lw: &mut Lw, l: Value| match cl {
+                    Some(c) => lw.fmax(l, c),
+                    None => l,
                 };
-                let mut ofs = Vec::new();
-                for (sh, size) in [(26u32, w), (18, hh), (10, dd)] {
-                    let x = self.shlc(o, sh);
-                    let x = self.ashrc(x, 26);
-                    let xf = self.sitof(x);
-                    let sf = self.uitof(size);
-                    ofs.push(self.fdiv(xf, sf));
-                }
-                for (k, c) in coords.iter_mut().enumerate() {
-                    if (dim == 4 && k == 1) || (dim == 5 && k == 2) {
-                        continue;
+                let r: [Value; 4] = if gather {
+                    if comps.len() != 1 {
+                        return err(d, "gather4 dmask");
                     }
-                    *c = self.fadd(*c, ofs[k]);
-                }
-            }
-            // array layers are rounded; cube coordinates become a direction and a cube index
-            let coord: Vec<Value> = match dim {
-                3 => {
-                    let mut v = self.cube_dir(coords[0], coords[1], coords[2]).to_vec();
-                    v.push(self.cube_slice(coords[2]));
-                    v
-                }
-                4 => vec![coords[0], self.un(op::ROUND_NE, coords[1])],
-                5 => vec![coords[0], coords[1], self.un(op::ROUND_NE, coords[2])],
-                _ => coords.clone(),
+                    match cmp {
+                        Some(z) => lw.s.gather_cmp(tex, smp, &coord, &[], comps[0] as u32, z),
+                        None => lw.s.gather(tex, smp, &coord, &[], comps[0] as u32),
+                    }
+                } else {
+                    match (&cmp, &grads, &lod, &bias) {
+                        (Some(z), _, _, _) if has_lz || !ps => {
+                            let v = lw.s.sample_cmp_level_zero(tex, smp, &coord, &[], *z);
+                            [v[0]; 4]
+                        }
+                        (Some(z), _, _, _) => {
+                            let v = lw.s.sample_cmp(tex, smp, &coord, &[], *z, if dim == 3 { None } else { cl });
+                            [v[0]; 4]
+                        }
+                        (None, Some((dx, dy)), _, _) if dim == 3 => {
+                            let len = |lw: &mut Lw, x: &[Value]| {
+                                let a = lw.fmul(x[0], x[0]);
+                                let b = x.get(1).copied().unwrap_or_else(|| lw.fc(0.0));
+                                let bb = lw.fmul(b, b);
+                                let s = lw.fadd(a, bb);
+                                lw.un(op::SQRT, s)
+                            };
+                            let z = lw.c(0);
+                            let dims = lw.s.get_dimensions(tex.handle, Some(z));
+                            let size = lw.s.m.extract(dims, 0);
+                            let lx = len(lw, dx);
+                            let ly = len(lw, dy);
+                            let m = lw.fmax(lx, ly);
+                            let sf = lw.uitof(size);
+                            let m = lw.fmul(m, sf);
+                            let eps = lw.fc(1e-8);
+                            let m = lw.fmax(m, eps);
+                            let l = lw.un(op::LOG, m);
+                            let l = floor(lw, l);
+                            lw.s.sample_level(tex, smp, &coord, &[], l)
+                        }
+                        (None, Some((dx, dy)), _, _) => lw.s.sample_grad(tex, smp, &coord, &[], dx, dy, cl),
+                        (None, None, Some(l), _) => lw.s.sample_level(tex, smp, &coord, &[], *l),
+                        (None, None, None, Some(b)) if ps => lw.s.sample_bias(tex, smp, &coord, &[], *b, if dim == 3 { None } else { cl }),
+                        (None, None, None, Some(b)) => {
+                            let l = floor(lw, *b);
+                            lw.s.sample_level(tex, smp, &coord, &[], l)
+                        }
+                        _ if has_lz || !ps => {
+                            let z = lw.fc(0.0);
+                            let l = floor(lw, z);
+                            lw.s.sample_level(tex, smp, &coord, &[], l)
+                        }
+                        _ => lw.s.sample(tex, smp, &coord, &[], if dim == 3 { None } else { cl }),
+                    }
+                };
+                Ok(r)
             };
-            let floor = |lw: &mut Lw, l: Value| match cl {
-                Some(c) => lw.fmax(l, c),
-                None => l,
-            };
-            let r: [Value; 4] = if gather {
-                if comps.len() != 1 {
-                    return err(d, "gather4 dmask");
-                }
-                match cmp {
-                    Some(z) => self.s.gather_cmp(tex, smp, &coord, &[], comps[0] as u32, z),
-                    None => self.s.gather(tex, smp, &coord, &[], comps[0] as u32),
-                }
+            let (r, rb): ([Value; 4], [Value; 4]) = if implicit_lod {
+                let raw = sample_body(self, safe_tw0)?;
+                let zf = self.fc(0.0);
+                let r = raw.map(|v| self.sel(valid, v, zf));
+                let rb = r.map(|v| self.bits(v));
+                (r, rb)
             } else {
-                match (&cmp, &grads, &lod, &bias) {
-                    (Some(z), _, _, _) if has_lz || !ps => {
-                        let v = self.s.sample_cmp_level_zero(tex, smp, &coord, &[], *z);
-                        [v[0]; 4]
-                    }
-                    (Some(z), _, _, _) => {
-                        let v = self.s.sample_cmp(tex, smp, &coord, &[], *z, if dim == 3 { None } else { cl });
-                        [v[0]; 4]
-                    }
-                    (None, Some((dx, dy)), _, _) if dim == 3 => {
-                        let len = |lw: &mut Lw, x: &[Value]| {
-                            let a = lw.fmul(x[0], x[0]);
-                            let b = x.get(1).copied().unwrap_or_else(|| lw.fc(0.0));
-                            let bb = lw.fmul(b, b);
-                            let s = lw.fadd(a, bb);
-                            lw.un(op::SQRT, s)
-                        };
-                        let z = self.c(0);
-                        let dims = self.s.get_dimensions(tex.handle, Some(z));
-                        let size = self.s.m.extract(dims, 0);
-                        let lx = len(self, dx);
-                        let ly = len(self, dy);
-                        let m = self.fmax(lx, ly);
-                        let sf = self.uitof(size);
-                        let m = self.fmul(m, sf);
-                        let eps = self.fc(1e-8);
-                        let m = self.fmax(m, eps);
-                        let l = self.un(op::LOG, m);
-                        let l = floor(self, l);
-                        self.s.sample_level(tex, smp, &coord, &[], l)
-                    }
-                    (None, Some((dx, dy)), _, _) => self.s.sample_grad(tex, smp, &coord, &[], dx, dy, cl),
-                    (None, None, Some(l), _) => self.s.sample_level(tex, smp, &coord, &[], *l),
-                    (None, None, None, Some(b)) if ps => self.s.sample_bias(tex, smp, &coord, &[], *b, if dim == 3 { None } else { cl }),
-                    (None, None, None, Some(b)) => {
-                        let l = floor(self, *b);
-                        self.s.sample_level(tex, smp, &coord, &[], l)
-                    }
-                    _ if has_lz || !ps => {
-                        let z = self.fc(0.0);
-                        let l = floor(self, z);
-                        self.s.sample_level(tex, smp, &coord, &[], l)
-                    }
-                    _ => self.s.sample(tex, smp, &coord, &[], if dim == 3 { None } else { cl }),
+                let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
+                let z = self.c(0);
+                for &t in &tmps {
+                    self.wr(t, z);
                 }
+                self.guarded(run, &mut |lw| {
+                    let res = sample_body(lw, tw0)?;
+                    for k in 0..4 {
+                        let b = lw.bits(res[k]);
+                        lw.wr(tmps[k], b);
+                    }
+                    Ok(())
+                })?;
+                let rb = tmps.map(|t| self.rd(t));
+                let r = rb.map(|b| self.f(b));
+                (r, rb)
             };
-            let rb: Vec<Value> = r.iter().map(|&v| self.bits(v)).collect();
             let n = if gather { 4 } else { comps.len() };
             let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
             let vals: Vec<Value> = sel
@@ -613,22 +708,20 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
                 _ => coords[..kind.grads().min(coords.len())].to_vec(),
             };
             let s3 = self.sreg(ssamp + 3);
-            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let tex = self.s.heap_texture(safe_tw0, kind, false, CompType::F32, 4, true);
+            let smp = self.mimg_sampler(d.pc, false, s3);
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);
-            let r = [self.bits(a), self.bits(b), z, z];
+            let ab = self.bits(a);
+            let bb = self.bits(b);
+            let r = [self.sel(valid, ab, z), self.sel(valid, bb, z), z, z];
             let vals: Vec<Value> = comps.iter().map(|&c| if d16 {
                 let f = self.f(r[c as usize]);
                 self.s.f32_to_f16(f)
@@ -638,30 +731,63 @@ impl Lw {
             return self.image_result(vdata, &vals, d16, act);
         }
 
+        if base == "get_resinfo" && ms {
+            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself
+            let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
+            let z = self.c(0);
+            for &t in &tmps {
+                self.wr(t, z);
+            }
+            self.guarded(run, &mut |lw| {
+                let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+                let dims = lw.s.get_dimensions(tex.handle, None);
+                let one = lw.c(1);
+                let w = lw.s.m.extract(dims, 0);
+                let hh = lw.s.m.extract(dims, 1);
+                let dd = if dim == 7 { lw.s.m.extract(dims, 2) } else { one };
+                for (k, v) in [w, hh, dd, one].into_iter().enumerate() {
+                    lw.wr(tmps[k], v);
+                }
+                Ok(())
+            })?;
+            let r = tmps.map(|t| self.rd(t));
+            let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
+            return self.image_result(vdata, &vals, d16, act);
+        }
+
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
-            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let dims = self.s.get_dimensions(tex.handle, Some(mipv));
-            let one = self.c(1);
-            let e = |lw: &mut Lw, i: u32| lw.s.m.extract(dims, i);
-            // HLSL GetDimensions outputs per dim; missing ones are 1
-            let (w, hh, dd, n) = match dim {
-                0 => (e(self, 0), one, one, e(self, 3)),
-                1 => (e(self, 0), e(self, 1), one, e(self, 3)),
-                // a cube array: its layers are faces, 6 per cube
-                3 => {
-                    let n = e(self, 2);
-                    {
-                        let k = self.c(6);
-                        (e(self, 0), e(self, 1), self.mul(n, k), e(self, 3))
+            let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
+            let z = self.c(0);
+            for &t in &tmps {
+                self.wr(t, z);
+            }
+            self.guarded(run, &mut |lw| {
+                let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+                let dims = lw.s.get_dimensions(tex.handle, Some(mipv));
+                let one = lw.c(1);
+                let e = |lw: &mut Lw, i: u32| lw.s.m.extract(dims, i);
+                // HLSL GetDimensions outputs per dim; missing ones are 1
+                let (w, hh, dd, n) = match dim {
+                    0 => (e(lw, 0), one, one, e(lw, 3)),
+                    1 => (e(lw, 0), e(lw, 1), one, e(lw, 3)),
+                    // a cube array: its layers are faces, 6 per cube
+                    3 => {
+                        let n = e(lw, 2);
+                        let k = lw.c(6);
+                        (e(lw, 0), e(lw, 1), lw.mul(n, k), e(lw, 3))
                     }
+                    2 | 5 => (e(lw, 0), e(lw, 1), e(lw, 2), e(lw, 3)),
+                    _ => (e(lw, 0), one, e(lw, 1), e(lw, 3)),
+                };
+                for (k, v) in [w, hh, dd, n].into_iter().enumerate() {
+                    lw.wr(tmps[k], v);
                 }
-                2 | 5 => (e(self, 0), e(self, 1), e(self, 2), e(self, 3)),
-                _ => (e(self, 0), one, e(self, 1), e(self, 3)),
-            };
-            let r = [w, hh, dd, n];
+                Ok(())
+            })?;
+            let r = tmps.map(|t| self.rd(t));
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         let ic: Vec<Value> = (0..body as usize).map(|k| compu(self, i_body + k)).collect();
@@ -674,6 +800,9 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        if ms {
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run);
+        }
         match base {
             "load" | "load_mip" => {
                 let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
@@ -683,7 +812,8 @@ impl Lw {
                 }
                 for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
                     let is = self.cmpc(Pred::Eq, cls, cv);
-                    self.guarded(is, &mut |lw| {
+                    let c = self.land(run, is);
+                    self.guarded(c, &mut |lw| {
                         let tex: Texture = lw.s.heap_texture(tw0, lkind, false, ct, 4, true);
                         let r = lw.s.texture_load(tex, Some(mip), &ic, &[]);
                         for k in 0..4 {
@@ -733,7 +863,7 @@ impl Lw {
                 let ui = self.addc(tw0, 1);
                 for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
                     let is = self.cmpc(Pred::Eq, cls, cv);
-                    let c = self.land(act, is);
+                    let c = self.land(run, is);
                     self.guarded(c, &mut |lw| {
                         let tex = lw.s.heap_texture(ui, lkind, true, ct, 4, true);
                         let v4 = if ct == CompType::F32 { vals.map(|v| lw.f(v)) } else { vals };
@@ -768,11 +898,12 @@ impl Lw {
                 self.wr(tmp, z);
                 let opn = opn.to_string();
                 let ic2 = ic.clone();
-                self.guarded(act, &mut |lw| {
+                self.guarded(run, &mut |lw| {
                     let tex = lw.s.heap_texture(ui, lkind, true, ct, 1, true);
                     let old = match aop {
                         Some(o) => lw.s.atomic_binop(tex.handle, o, &ic2, v),
-                        None if opn == "cmpswap" || opn == "fcmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                        None if opn == "cmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                        None if opn == "fcmpswap" => lw.texel_fcas(tex.handle, &ic2, cmpv, v),
                         None => lw.texel_cas(tex.handle, &ic2, &opn, v),
                     };
                     lw.wr(tmp, old);
@@ -789,6 +920,73 @@ impl Lw {
             }
             _ => err(d, "MIMG"),
         }
+    }
+
+    /// `image_load` / `image_msaa_load` on a multisampled T#: `ic` = x, y, (slice,) fragment.
+    /// `image_load` reads the DMASK components of that sample; `image_msaa_load` reads the one
+    /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
+    /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value, run: Value) -> LResult<()> {
+        let nc = kind.coords();
+        let frag = ic[nc];
+        let coords = ic[..nc].to_vec();
+        let samples: Vec<Value> = if base == "msaa_load" { (0..4).map(|k| self.addc(frag, k)).collect() } else { vec![frag] };
+        // per sample: the texel's four channels as raw bits
+        let tmps: Vec<[u32; 4]> = samples.iter().map(|_| [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()]).collect();
+        let z = self.c(0);
+        for t in &tmps {
+            for &v in t {
+                self.wr(v, z);
+            }
+        }
+        for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
+            let is = self.cmpc(Pred::Eq, cls, cv);
+            let c = self.land(run, is);
+            let samples = samples.clone();
+            let coords = coords.clone();
+            let tmps = tmps.clone();
+            self.guarded(c, &mut |lw| {
+                let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                // Emit all TextureLoad calls before GetDimensions in this basic block:
+                // AMD's DXIL compiler (amdxc64.dll) hits a null-pointer dereference
+                // (0xc0000005) when dx.op.getDimensions precedes dx.op.textureLoad on a
+                // dynamically indexed heap Texture2DMS/Texture2DMSArray in the same block.
+                let loads: Vec<[Value; 4]> = samples.iter().map(|&sv| lw.s.texture_load_sample(tex, sv, &coords)).collect();
+                let dims = lw.s.get_dimensions(tex.handle, None);
+                let count = lw.s.m.extract(dims, 3);
+                for (si, (&sv, r)) in samples.iter().zip(loads).enumerate() {
+                    let inside = lw.cmp(Pred::ULt, sv, count);
+                    for k in 0..4 {
+                        let b = lw.bits(r[k]);
+                        let zz = lw.c(0);
+                        let b = lw.sel(inside, b, zz);
+                        lw.wr(tmps[si][k], b);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let raw: Vec<Value> = if base == "msaa_load" {
+            let c = comps.first().copied().unwrap_or(0) as usize;
+            tmps.iter().map(|t| self.rd(t[c])).collect()
+        } else {
+            comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
+        };
+        let vals: Vec<Value> = if d16 {
+            raw.iter()
+                .map(|&x| {
+                    let fx = self.f(x);
+                    let h = self.s.f32_to_f16(fx);
+                    let lo = self.andc(x, 0xFFFF);
+                    let fl = self.cmpc(Pred::Eq, cls, 0);
+                    self.sel(fl, h, lo)
+                })
+                .collect()
+        } else {
+            raw
+        };
+        self.image_result(vdata, &vals, d16, act)
     }
 
     /// A compare-exchange loop on a texel (`rmw32` on an `At::Ref` texel).
@@ -840,6 +1038,42 @@ impl Lw {
         p
     }
 
+    /// IEEE-754 float compare-exchange loop on a texel (`image_atomic_fcmpswap`).
+    fn texel_fcas(&mut self, h: Value, ic: &[Value], cmp: Value, v: Value) -> Value {
+        // the initial value: an atomic or 0 reads it without changing it
+        let z = self.c(0);
+        let init = self.s.atomic_binop(h, AtomicOp::Or, ic, z);
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let try_cas = self.block(Some(1));
+        let ex = self.block(Some(2));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i32 = self.s.m.i32();
+        let c = self.s.m.phi(i32);
+        let i = self.s.m.phi(i32);
+        self.s.m.add_incoming(c, init, pre);
+        self.s.m.add_incoming(i, z, pre);
+        let eq = self.feq_bits32(c, cmp);
+        let lp_end = self.cur();
+        self.cond_br(eq, try_cas, ex);
+        self.s.m.set_block(try_cas);
+        let p = self.s.atomic_cmpxchg(h, ic, c, v);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        let res = self.s.m.phi(i32);
+        self.s.m.add_incoming(res, c, lp_end);
+        self.s.m.add_incoming(res, p, me);
+        res
+    }
+
     /// `img_cls`: 1 uint, 2 sint, 0 float (by the buffer-format table's numeric type).
     fn img_cls(&mut self, fmt: Value) -> Value {
         let info = self.fmt_info(fmt);
@@ -875,5 +1109,69 @@ impl Lw {
             self.wr(VAR_VGPR + (vdata + k as u64) as u32, nv);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod heap_bounds_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp;
+
+    fn mimg_prog(ops: &[(&str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, fields) in ops {
+            code.extend(rdna2::encode(name, "ENC_MIMG", fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    /// Dynamic `ResourceDescriptorHeap` and `SamplerDescriptorHeap` indices must be
+    /// bounds-checked / clamped in both Direct DXIL and HLSL so AMD Tier-3 GPUs never
+    /// page-fault on null, uninitialized, or OOB T#/S# descriptors.
+    #[test]
+    fn mimg_view_and_sampler_heap_indices_are_guarded() {
+        let code = mimg_prog(&[
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)]),
+            ("IMAGE_LOAD", &[("VDATA", 14), ("VADDR", 2), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)]),
+            ("IMAGE_GET_RESINFO", &[("VDATA", 18), ("VADDR", 4), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1)]),
+            ("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 2), ("SRSRC", 8), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)]),
+            ("IMAGE_ATOMIC_ADD", &[("VDATA", 7), ("VADDR", 2), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]),
+        ]);
+
+        let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
+        validate::validate(&dxil).expect("dxil validate");
+        let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+        assert!(dis.contains("2097151"), "expected VIEW_HEAP_MAX_SRV guard in direct DXIL:\n{dis}");
+        assert!(dis.contains("2047"), "expected 0x7FF sampler heap mask in direct DXIL:\n{dis}");
+
+        let hlsl = recomp::translate(&code, &recomp::Options::default()).expect("hlsl translate");
+        assert!(hlsl.complete(), "hlsl unsupported: {:?}", hlsl.unsupported);
+        assert!(hlsl.hlsl.contains("2097151u"), "expected VIEW_HEAP_MAX_SRV check in HLSL");
+        assert!(hlsl.hlsl.contains("& 0x7FFu"), "expected 0x7FFu sampler heap mask in HLSL");
+        assert!(!hlsl.hlsl.contains("& 0xFFFu"), "unexpected unclamped 0xFFFu sampler mask in HLSL");
+        // Ensure atomic UAV handle creation is inside the guarded `if (and(..., ..._ok))` block.
+        assert!(hlsl.hlsl.contains("InterlockedAdd(") && hlsl.hlsl.contains("_ok)) { RWTexture2D<uint>"), "expected atomic UAV handle inside guard");
+    }
+
+    /// Pixel-shader implicit-LOD `image_sample` and `image_get_lod` must keep convergent
+    /// control flow for quad derivatives while clamping invalid/OOB T# indices to slot 0.
+    #[test]
+    fn ps_implicit_lod_sample_and_get_lod_validate() {
+        let code = mimg_prog(&[
+            ("IMAGE_SAMPLE", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)]),
+            ("IMAGE_GET_LOD", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)]),
+        ]);
+        let ps = recomp::PsInterface::default();
+        let k = kernel::translate_pixel(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &ps).expect("direct ps translate");
+        validate::validate(&k.dxil).expect("dxil ps validate");
+        let dis = validate::disassemble(&k.dxil).expect("dxil ps disassemble");
+        assert!(dis.contains("2097151"), "expected VIEW_HEAP_MAX_SRV clamp in PS DXIL:\n{dis}");
+        assert!(dis.contains("2047"), "expected 0x7FF sampler mask in PS DXIL:\n{dis}");
+
+        let hlsl = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Pixel(ps), ..Default::default() }).expect("hlsl ps translate");
+        assert!(hlsl.complete(), "hlsl ps unsupported: {:?}", hlsl.unsupported);
+        assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains("2097151u"), "expected convergent clamp in PS HLSL");
     }
 }

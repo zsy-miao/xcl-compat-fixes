@@ -43,6 +43,39 @@ const TOKEN_MASK: u64 = 0xFFFF_FFFF_FFFF;
 const KNOWN_TOKENS: usize = 64;
 const FLIPPED_KEEP: usize = 64;
 
+/// `XCL_FRAME_INTERVAL_US`: optional override for the console frame clock interval (µs).
+/// - unset: honor the title's `SetFrameIntervalX` interval (default)
+/// - `0` / `uncapped` / `off`: uncap `WaitFrameEventX` (return immediately with a fresh token)
+/// - positive µs (e.g. `8333` for 120 Hz, `4167` for 240 Hz): clamp the clock's effective interval
+///   to `min(requested, override)` (at least 1000 µs so the clock thread never busy-spins).
+pub fn parse_interval_override(raw: Option<&str>) -> Option<u32> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("uncapped") || s.eq_ignore_ascii_case("off") {
+        return Some(0);
+    }
+    s.parse::<u32>().ok()
+}
+
+fn interval_override() -> Option<u32> {
+    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| parse_interval_override(std::env::var("XCL_FRAME_INTERVAL_US").ok().as_deref()))
+}
+
+/// Effective clock thread interval (µs): `None` means uncapped (handled in `wait_frame_event_x`).
+pub fn effective_clock_interval_us(requested_us: u32, override_us: Option<u32>) -> Option<u32> {
+    if requested_us == 0 {
+        return None;
+    }
+    match override_us {
+        None => Some(requested_us),
+        Some(0) => None,
+        Some(ov) => Some(ov.min(requested_us).max(1000)),
+    }
+}
+
 /// Frame intervals the console accepts (µs, with the rounding a title may use); the 120 Hz
 /// ones (8 333, 25 000) only on a display that runs at 120 Hz.
 pub fn interval_valid(len_us: u32, high_refresh: bool) -> bool {
@@ -215,7 +248,14 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
         c.generation += 1;
     });
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| crate::xlog_info!("D3D12.X: frame interval {len_us} µs (periodicity {periodicity}, flags {flags:#x})"));
+    ONCE.call_once(|| match interval_override() {
+        Some(0) => crate::xlog_info!("D3D12.X: frame interval {len_us} µs requested (XCL_FRAME_INTERVAL_US=0 – uncapped, periodicity {periodicity}, flags {flags:#x})"),
+        Some(ov) => {
+            let eff = effective_clock_interval_us(len_us, Some(ov)).unwrap_or(0);
+            crate::xlog_info!("D3D12.X: frame interval {len_us} µs requested → {eff} µs effective (XCL_FRAME_INTERVAL_US={ov}, periodicity {periodicity}, flags {flags:#x})");
+        }
+        None => crate::xlog_info!("D3D12.X: frame interval {len_us} µs (periodicity {periodicity}, flags {flags:#x})"),
+    });
     SetEvent(wake());
     S_FALSE
 }
@@ -321,8 +361,11 @@ fn trace_calls(what: std::fmt::Arguments) {
 
 pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, timeout_ms: u32, block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
     trace_calls(format_args!("WaitFrameEventX(type {ty}, timeout {timeout_ms} ms, block {block:p}, flags {flags:#x}, token in {:#x})", if token.is_null() { 0 } else { *token }));
-    let internal = with(|c| ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled).then(|| c.kinds[ty as usize].internal as usize));
-    let Some(internal) = internal else { return E_INVALIDARG };
+    let scheduled = with(|c| {
+        ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled)
+            .then(|| (c.kinds[ty as usize].internal as usize, Arc::clone(&c.kinds[ty as usize].extra)))
+    });
+    let Some((internal, scheduled_extra)) = scheduled else { return E_INVALIDARG };
     let token_in = if token.is_null() { 0 } else { *token };
     if ty == 0 && token_in != 0 && (!ISSUED.lock().unwrap().iter().any(|e| e.0 == token_in) || flags & TOKEN_ON_TIMEOUT != 0) {
         return E_INVALIDARG;
@@ -331,20 +374,50 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
         Ok(h) => h,
         Err(e) => return e,
     };
-    let mut hs = vec![internal as HANDLE];
-    hs.extend(extra);
-    let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
-    ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
-    if r == WAIT_TIMEOUT {
-        ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
-    }
-    let (hr, index) = if r == WAIT_TIMEOUT {
-        (S_FALSE, -1)
-    } else if ((r - WAIT_OBJECT_0) as usize) < hs.len() {
-        // -2: the frame event itself, else the index of the ancillary handle
-        (S_OK, if r == WAIT_OBJECT_0 { -2 } else { (r - WAIT_OBJECT_0) as i32 - 1 })
+    let uncapped = interval_override() == Some(0);
+    let (hr, index, origin_now) = if uncapped {
+        for &h in &scheduled_extra.0 {
+            if SetEvent(h) == 0 {
+                ReleaseSemaphore(h, 1, std::ptr::null_mut());
+            }
+        }
+        let (hr, index) = if !extra.is_empty() && (flags & WAIT_ALL) != 0 {
+            let r = WaitForMultipleObjects(extra.len() as u32, extra.as_ptr(), 1, timeout_ms);
+            ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
+            if r == WAIT_TIMEOUT {
+                ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
+                (S_FALSE, -1)
+            } else if ((r - WAIT_OBJECT_0) as usize) < extra.len() {
+                (S_OK, -2)
+            } else {
+                (E_FAIL, -1)
+            }
+        } else {
+            ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
+            (S_OK, -2)
+        };
+        let now = qpc();
+        if ty == 0 && hr == S_OK {
+            LAST_ORIGIN.store(now, Ordering::Relaxed);
+        }
+        (hr, index, Some(now))
     } else {
-        (E_FAIL, -1)
+        let mut hs = vec![internal as HANDLE];
+        hs.extend(extra);
+        let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
+        ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
+        if r == WAIT_TIMEOUT {
+            ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
+        }
+        let (hr, index) = if r == WAIT_TIMEOUT {
+            (S_FALSE, -1)
+        } else if ((r - WAIT_OBJECT_0) as usize) < hs.len() {
+            // -2: the frame event itself, else the index of the ancillary handle
+            (S_OK, if r == WAIT_OBJECT_0 { -2 } else { (r - WAIT_OBJECT_0) as i32 - 1 })
+        } else {
+            (E_FAIL, -1)
+        };
+        (hr, index, None)
     };
     note_signaled(block, index);
     if hr == E_FAIL {
@@ -353,7 +426,9 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     let issue = index == -2 || (index == -1 && flags & TOKEN_ON_TIMEOUT != 0);
     if ty == 0 && issue {
         // the origin this wait consumed (a timeout with TOKEN_ON_TIMEOUT: now)
-        let origin = if index == -2 { take_origin(&ORIGINS) } else { None }.unwrap_or_else(qpc);
+        let origin = origin_now
+            .or_else(|| if index == -2 { take_origin(&ORIGINS) } else { None })
+            .unwrap_or_else(qpc);
         let mut issued = ISSUED.lock().unwrap();
         if token_in != 0 {
             if let Some(e) = issued.iter_mut().find(|e| e.0 == token_in) {
@@ -415,7 +490,7 @@ pub unsafe extern "system" fn frame_statistics_x(_this: *mut std::ffi::c_void, t
 }
 
 /// sleep until `deadline` (qpc); false: woken by a change of the schedule
-unsafe fn sleep_until(timer: HANDLE, deadline: i64) -> bool {
+unsafe fn sleep_until(timer: HANDLE, deadline: i64, allow_spin: bool) -> bool {
     const SPIN_US: i64 = 600;
     loop {
         let left = deadline - qpc();
@@ -423,8 +498,9 @@ unsafe fn sleep_until(timer: HANDLE, deadline: i64) -> bool {
             return true;
         }
         let left_us = left * 1_000_000 / qpf();
-        if left_us > SPIN_US {
-            let due = -((left_us - SPIN_US) * 10); // relative, 100 ns units
+        if !allow_spin || left_us > SPIN_US {
+            let wait_us = if allow_spin { left_us - SPIN_US } else { left_us.max(1) };
+            let due = -(wait_us * 10); // relative, 100 ns units
             SetWaitableTimer(timer, &due, 0, None, std::ptr::null(), 0);
             let hs = [timer, wake()];
             if WaitForMultipleObjects(2, hs.as_ptr(), 0, INFINITE) == WAIT_OBJECT_0 + 1 {
@@ -450,10 +526,8 @@ fn clock_thread() {
             // origin and type 2 both at offset 0 and waits on type 2; picking one, the origin
             // always won and type 2 never came)
             let plan = with(|c| {
-                if !c.active || c.interval_us == 0 {
-                    return None;
-                }
-                let interval = ticks(c.interval_us as i64);
+                let effective_us = if c.active { effective_clock_interval_us(c.interval_us, interval_override()) } else { None }?;
+                let interval = ticks(effective_us as i64);
                 let now = qpc();
                 let due: Vec<(i64, usize, usize, Arc<Handles>)> = c
                     .kinds
@@ -461,7 +535,8 @@ fn clock_thread() {
                     .enumerate()
                     .filter(|(_, k)| k.scheduled)
                     .map(|(i, k)| {
-                        let mut d = next_deadline(c.base_qpc, interval, ticks(k.offset_us as i64), now - 1);
+                        let offset_us = k.offset_us % effective_us.max(1);
+                        let mut d = next_deadline(c.base_qpc, interval, ticks(offset_us as i64), now - 1);
                         if d - last[i] < interval / 2 {
                             d += interval; // this point of the frame already fired
                         }
@@ -469,13 +544,13 @@ fn clock_thread() {
                     })
                     .collect();
                 let first = due.iter().map(|e| e.0).min()?;
-                Some((c.generation, first, due.into_iter().filter(|e| e.0 == first).collect::<Vec<_>>()))
+                Some((c.generation, first, effective_us > 2000, due.into_iter().filter(|e| e.0 == first).collect::<Vec<_>>()))
             });
-            let Some((generation, deadline, due)) = plan else {
+            let Some((generation, deadline, allow_spin, due)) = plan else {
                 WaitForMultipleObjects(1, &wake(), 0, INFINITE);
                 continue;
             };
-            if !sleep_until(timer, deadline) || !with(|c| c.generation == generation) {
+            if !sleep_until(timer, deadline, allow_spin) || !with(|c| c.generation == generation) {
                 continue;
             }
             for (_, ty, internal, extra) in due {
@@ -528,6 +603,24 @@ mod tests {
             assert_eq!((take_origin(&q), take_origin(&q), take_origin(&q)), (Some(43), Some(44), None));
             CloseHandle(sem as HANDLE);
         }
+    }
+
+    #[test]
+    fn interval_override_parsing_and_clamping() {
+        assert_eq!(parse_interval_override(None), None);
+        assert_eq!(parse_interval_override(Some("")), None);
+        assert_eq!(parse_interval_override(Some("bad")), None);
+        assert_eq!(parse_interval_override(Some("0")), Some(0));
+        assert_eq!(parse_interval_override(Some("uncapped")), Some(0));
+        assert_eq!(parse_interval_override(Some("OFF")), Some(0));
+        assert_eq!(parse_interval_override(Some("8333")), Some(8333));
+
+        assert_eq!(effective_clock_interval_us(0, Some(8333)), None);
+        assert_eq!(effective_clock_interval_us(33333, None), Some(33333));
+        assert_eq!(effective_clock_interval_us(33333, Some(0)), None);
+        assert_eq!(effective_clock_interval_us(33333, Some(8333)), Some(8333));
+        assert_eq!(effective_clock_interval_us(16667, Some(33333)), Some(16667));
+        assert_eq!(effective_clock_interval_us(33333, Some(200)), Some(1000));
     }
 
     #[test]

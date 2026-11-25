@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 372" role="img" aria-labelledby="t d">
+  <title id="t">How XCL works</title>
+  <desc id="d">The game's x64 code goes through the PE loader to the CPU and calls the console system libraries, which XCL implements; the RDNA2 shaders go through the shader recompiler to the Direct3D 12 driver and the GPU; textures, sound and video go through XCL's memory and DirectStorage</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1328"/>
+      <stop offset="1" stop-color="#15123a"/>
+    </linearGradient>
+    <linearGradient id="ink" gradientUnits="userSpaceOnUse" x1="340" y1="0" x2="940" y2="0">
+      <stop offset="0" stop-color="#a48dff"/>
+      <stop offset="1" stop-color="#4fe3f2"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#22c8e6" stop-opacity=".22"/>
+    </linearGradient>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; fill: #f3f6ff }
+    .h { font-size: 21px; font-weight: 700 }
+    .r { font-size: 18px; font-weight: 600; text-anchor: middle }
+    .s { font-size: 14px; fill: #bcc7ea; text-anchor: middle }
+    .line { fill: none; stroke: url(#ink); stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 5 9; animation: run 2.4s linear infinite }
+    .dot { fill: #4fe3f2 }
+    @keyframes run { to { stroke-dashoffset: -56 } }
+    @media (prefers-reduced-motion: reduce) { .line { animation: none } }
+  </style>
+  <rect x="1" y="1" width="1278" height="370" rx="22" fill="url(#bg)" stroke="#fff" stroke-opacity=".13" stroke-width="2"/>
+  <g fill="#fff" fill-opacity=".04" stroke="#fff" stroke-opacity=".12">
+    <rect x="28" y="26" width="320" height="320" rx="18"/>
+    <rect x="932" y="26" width="320" height="320" rx="18"/>
+  </g>
+  <rect x="460" y="26" width="360" height="320" rx="18" fill="url(#core)" stroke="#9fb6ff" stroke-opacity=".45"/>
+  <text class="h" x="52" y="62">Your unpacked game</text>
+  <text class="h" x="484" y="62">XCL</text>
+  <text class="h" x="956" y="62">Your PC</text>
+  <g fill="#fff" fill-opacity=".07" stroke="#fff" stroke-opacity=".14">
+    <rect x="52" y="86" width="272" height="66" rx="14"/>
+    <rect x="52" y="170" width="272" height="66" rx="14"/>
+    <rect x="52" y="254" width="272" height="66" rx="14"/>
+    <rect x="484" y="80" width="312" height="54" rx="13"/>
+    <rect x="484" y="144" width="312" height="60" rx="13"/>
+    <rect x="484" y="214" width="312" height="54" rx="13"/>
+    <rect x="484" y="278" width="312" height="54" rx="13"/>
+    <rect x="956" y="100" width="272" height="86" rx="14"/>
+    <rect x="956" y="214" width="272" height="106" rx="14"/>
+  </g>
+  <text class="r" x="188" y="125">x64 code</text>
+  <text class="r" x="188" y="209">RDNA2 shaders</text>
+  <text class="r" x="188" y="293">textures, sound, video</text>
+  <text class="r" x="640" y="113">PE loader</text>
+  <text class="r" x="640" y="170">console system libraries</text>
+  <text class="s" x="640" y="192">written independently</text>
+  <text class="r" x="640" y="247">shader recompiler</text>
+  <text class="r" x="640" y="311">memory, textures, DirectStorage</text>
+  <text class="r" x="1092" y="139">CPU</text>
+  <text class="s" x="1092" y="163">runs the game's code as it is</text>
+  <text class="r" x="1092" y="262">Direct3D 12 driver, GPU</text>
+  <text class="s" x="1092" y="287">HLSL → DXIL, pipelines, frames</text>
+  <path class="line" d="M324 112C390 112 420 107 484 107"/>
+  <path class="line" d="M324 128C390 128 420 174 484 174"/>
+  <path class="line" d="M324 203C390 203 420 241 484 241"/>
+  <path class="line" d="M324 287C390 287 420 305 484 305"/>
+  <path class="line" d="M796 107C862 107 892 135 956 135"/>
+  <path class="line" d="M796 168C862 168 892 154 956 154"/>
+  <path class="line" d="M796 182C862 182 892 240 956 240"/>
+  <path class="line" d="M796 241C862 241 892 267 956 267"/>
+  <path class="line" d="M796 305C862 305 892 292 956 292"/>
+  <g class="dot">
+    <circle cx="484" cy="107" r="4"/><circle cx="484" cy="174" r="4"/><circle cx="484" cy="241" r="4"/><circle cx="484" cy="305" r="4"/>
+    <circle cx="956" cy="135" r="4"/><circle cx="956" cy="154" r="4"/><circle cx="956" cy="240" r="4"/><circle cx="956" cy="267" r="4"/><circle cx="956" cy="292" r="4"/>
+  </g>
+</svg>

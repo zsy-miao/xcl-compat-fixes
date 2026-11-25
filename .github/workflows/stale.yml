@@ -1,0 +1,46 @@
+# A pull request with no activity for 3 days gets the `stale` label and a comment, and is closed
+# 4 days later (a week in all, as in CONTRIBUTING.md) unless something happens on it. Issues are
+# left alone. PRs labelled `goal:world-load` or `keep-open` are never touched.
+name: Stale PRs
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only log what would be done
+        type: boolean
+        default: true
+
+permissions:
+  actions: write # where the last run stopped is kept in the cache
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: stale
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          days-before-pr-stale: 3
+          days-before-pr-close: 4
+          stale-pr-label: stale
+          exempt-pr-labels: goal:world-load,keep-open
+          sort-by: updated
+          ascending: true
+          operations-per-run: 300
+          debug-only: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          stale-pr-message: >-
+            Nothing has happened on this PR for 3 days, so it is marked `stale` and will be closed in
+            4 days. A push or a comment takes the mark off: rebase it onto `main` if it conflicts, and
+            say in one line what it still fixes. If it only waits for a maintainer, a comment saying so is enough.
+          close-pr-message: >-
+            Closed after a week with no activity. This is not a verdict on the code: if it still applies to
+            `main`, rebase it, say so here and it can be reopened.

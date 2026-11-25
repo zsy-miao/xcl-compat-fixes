@@ -329,7 +329,13 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
         }
         0..=3 => {
             let ty = node & 7;
-            let v = if ty == 1 { [vec3(data, at + 12), vec3(data, at + 36), vec3(data, at + 24)] } else { [vec3(data, at), vec3(data, at + 12), vec3(data, at + 24)] };
+            let (o0, o1, o2) = match ty {
+                0 => (0, 12, 24),
+                1 => (12, 36, 24),
+                2 => (24, 36, 48),
+                _ => (24, 48, 0),
+            };
+            let v = [vec3(data, at + o0), vec3(data, at + o1), vec3(data, at + o2)];
             match triangle_hit(&v, o, d) {
                 Some([t, det, i, j]) => {
                     let bc = [det - i - j, i, j, 0.0];
@@ -627,5 +633,41 @@ pub(crate) mod tests {
         let big = [[0.0, 0.0, 0.0], [1e10, 0.0, 0.0], [0.0, 1e10, 0.0]];
         assert!(triangle_hit(&big, [2e10, 2e10, -1.0], d).is_none());
         assert!(triangle_hit(&big, [2e9, 2e9, -1.0], d).is_some());
+    }
+
+    #[test]
+    fn triangle_node_types_0_to_3_select_expected_vertices() {
+        // 5 vertices forming 4 triangles in distinct xy regions at distinct z planes:
+        // v0=(0,0,1), v1=(2,0,1), v2=(1,2,1), v3=(3,2,2), v4=(1,4,3)
+        let verts = [
+            [0.0f32, 0.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0],
+            [3.0, 2.0, 2.0],
+            [1.0, 4.0, 3.0],
+        ];
+        let mut data = vec![0u8; 64];
+        for (k, v) in verts.iter().enumerate() {
+            for (c, &f) in v.iter().enumerate() {
+                data[k * 12 + c * 4..k * 12 + c * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            }
+        }
+        // id dword at +60: I=1, J=2 (9) for all 4 triangle types
+        data[60..64].copy_from_slice(&0x0909_0909u32.to_le_bytes());
+        let d = [0.0, 0.0, 1.0];
+        let inv = [f32::INFINITY, f32::INFINITY, 1.0];
+        // Type 2 = (v2, v3, v4): centroid at ((1+3+1)/3, (2+2+4)/3) = (5/3, 8/3), z in 1..3
+        let hit2 = intersect_node(&data, 2, 100.0, [5.0 / 3.0, 8.0 / 3.0, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(hit2[1] != 1.0 || hit2[0].is_finite(), "type 2 must hit (v2,v3,v4)");
+        assert!(hit2[0].is_finite() && (hit2[0] / hit2[1] - 2.0).abs() < 1e-4);
+        // Type 2 must miss a ray aimed at type 0's interior (1.0, 0.5)
+        let miss2 = intersect_node(&data, 2, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(miss2[0].is_infinite());
+        // Type 3 = (v2, v4, v0): centroid at ((1+1+0)/3, (2+4+0)/3) = (2/3, 2.0)
+        let hit3 = intersect_node(&data, 3, 100.0, [2.0 / 3.0, 2.0, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(hit3[0].is_finite() && (hit3[0] / hit3[1] - 5.0 / 3.0).abs() < 1e-4);
+        // Type 3 must miss a ray aimed at type 0's interior (1.0, 0.5)
+        let miss3 = intersect_node(&data, 3, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
+        assert!(miss3[0].is_infinite());
     }
 }

@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 380" role="img" aria-labelledby="t d">
+  <title id="t">XCL</title>
+  <desc id="d">A compatibility layer that runs Xbox Series X|S games you own on Windows, without CPU emulation</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset=".55" stop-color="#19123f"/>
+      <stop offset="1" stop-color="#07293a"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9b82ff"/>
+      <stop offset=".5" stop-color="#6fa8ff"/>
+      <stop offset="1" stop-color="#35d6ea"/>
+    </linearGradient>
+    <linearGradient id="mark" gradientUnits="userSpaceOnUse" x1="98" y1="0" x2="480" y2="0">
+      <stop offset="0" stop-color="#b3a1ff"/>
+      <stop offset=".55" stop-color="#7fb0ff"/>
+      <stop offset="1" stop-color="#4fe3f2"/>
+    </linearGradient>
+    <linearGradient id="face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8f78ff" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#35d6ea" stop-opacity=".4"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#22c8e6" stop-opacity=".42"/>
+      <stop offset="1" stop-color="#22c8e6" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#fff" stroke-opacity=".055"/>
+    </pattern>
+    <filter id="soft" x="-20%" y="-40%" width="140%" height="180%"><feGaussianBlur stdDeviation="14"/></filter>
+    <clipPath id="card"><rect width="1280" height="380" rx="28"/></clipPath>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif }
+    .flow { fill: none; stroke: url(#ink); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 6 22; opacity: .5; animation: run 9s linear infinite }
+    .b { animation-duration: 13s; opacity: .34 }
+    .c { animation-duration: 17s; opacity: .24 }
+    .slab { animation: lift 6s ease-in-out infinite }
+    .s2 { animation-delay: -2s }
+    .s3 { animation-delay: -4s }
+    @keyframes run { to { stroke-dashoffset: -560 } }
+    @keyframes lift { 50% { transform: translateY(-7px) } }
+    @media (prefers-reduced-motion: reduce) { .flow, .slab { animation: none } }
+  </style>
+  <g clip-path="url(#card)">
+    <rect width="1280" height="380" fill="url(#bg)"/>
+    <circle cx="180" cy="360" r="330" fill="url(#glow1)"/>
+    <circle cx="1130" cy="40" r="330" fill="url(#glow2)"/>
+    <rect width="1280" height="380" fill="url(#grid)"/>
+    <path class="flow" d="M-20 70C260 10 420 150 700 90S1120 20 1300 96"/>
+    <path class="flow b" d="M-20 330C240 380 470 250 720 300S1090 380 1300 300"/>
+    <path class="flow c" d="M-20 190C300 120 520 260 760 190S1110 130 1300 200"/>
+    <path class="flow b" d="M-20 250C220 300 520 180 800 250S1130 260 1300 240"/>
+
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="25">
+      <g stroke="#6f8cff" opacity=".55" filter="url(#soft)">
+        <path d="M112 98 208 194M208 98 112 194"/>
+        <path d="M342 109A52 52 0 1 0 342 183"/>
+        <path d="M404 98V194H470"/>
+      </g>
+      <g stroke="url(#mark)">
+        <path d="M112 98 208 194M208 98 112 194"/>
+        <path d="M342 109A52 52 0 1 0 342 183"/>
+        <path d="M404 98V194H470"/>
+      </g>
+    </g>
+    <text x="98" y="266" font-size="29" font-weight="700" fill="#f3f6ff">Console games you own, running natively on Windows</text>
+    <text x="98" y="304" font-size="19" fill="#bcc7ea">No CPU emulation&#160;&#160;·&#160;&#160;RDNA2 shaders recompiled to DXIL&#160;&#160;·&#160;&#160;Direct3D 12</text>
+
+    <g transform="translate(1062 0)" stroke-linejoin="round">
+      <g stroke="#8fb4ff" stroke-opacity=".5" stroke-width="2" stroke-dasharray="3 7">
+        <path d="M0 152V196M-130 108V276M130 108V276"/>
+      </g>
+      <g class="slab s3">
+        <path d="M-130 276 0 314V332L-130 294Z" fill="#1c1a52"/>
+        <path d="M130 276 0 314V332L130 294Z" fill="#0d3a52"/>
+        <path d="M0 238 130 276 0 314-130 276Z" fill="url(#face)" stroke="url(#ink)" stroke-width="2"/>
+        <text x="0" y="283" font-size="21" font-weight="700" fill="#f3f6ff" text-anchor="middle">D3D12</text>
+      </g>
+      <g class="slab s2">
+        <path d="M-130 190 0 228V246L-130 208Z" fill="#231d62"/>
+        <path d="M130 190 0 228V246L130 208Z" fill="#12415c"/>
+        <path d="M0 152 130 190 0 228-130 190Z" fill="url(#face)" stroke="url(#ink)" stroke-width="2"/>
+        <text x="0" y="197" font-size="19" font-weight="700" fill="#f3f6ff" text-anchor="middle">RDNA2 → DXIL</text>
+      </g>
+      <g class="slab">
+        <path d="M-130 104 0 142V160L-130 122Z" fill="#2b2372"/>
+        <path d="M130 104 0 142V160L130 122Z" fill="#174a68"/>
+        <path d="M0 66 130 104 0 142-130 104Z" fill="url(#face)" stroke="url(#ink)" stroke-width="2"/>
+        <text x="0" y="111" font-size="21" font-weight="700" fill="#f3f6ff" text-anchor="middle">x64</text>
+      </g>
+    </g>
+  </g>
+  <rect x="1" y="1" width="1278" height="378" rx="27" fill="none" stroke="#fff" stroke-opacity=".14" stroke-width="2"/>
+</svg>

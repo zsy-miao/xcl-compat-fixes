@@ -107,7 +107,8 @@ fn page_descriptors(n: u32, p: u32) -> u32 {
     2 * n.saturating_sub(p * PAGE_SLOTS).clamp(1, PAGE_SLOTS)
 }
 
-/// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`.
+/// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`. A freed
+/// range ending at the cursor is contiguous with the tail: take it and bump over into the tail.
 fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) -> Option<u32> {
     if let Some(i) = free.iter().position(|&(_, n)| n >= count) {
         let (f, n) = free[i];
@@ -116,6 +117,13 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
         } else {
             free[i] = (f + count, n - count);
         }
+        return Some(f);
+    }
+    // no single freed range is big enough: one ending at the cursor continues into the tail
+    if let Some(i) = free.iter().position(|&(f, n)| f + n == *next && (n as u64 + (cap - *next) as u64) >= count as u64) {
+        let (f, n) = free[i];
+        free.swap_remove(i);
+        *next += count - n;
         return Some(f);
     }
     if cap - *next < count {
@@ -151,6 +159,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
+        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
@@ -159,11 +168,36 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             heap,
             cap,
             // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32,
+            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
         });
     }
     true
+}
+
+/// Null views at descriptors `0..MEM_HEAP_BASE` of the shared heap (an SRV / UAV pair per
+/// console slot: even SRV, odd UAV), where shaders land for a T# of zeros (word 0, the PC index,
+/// is 0): they read zeros there rather than whatever an unwritten descriptor holds.
+unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
+    for k in 0..crate::gpu::recomp::MEM_HEAP_BASE as u64 {
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize };
+        if k % 2 == 0 {
+            let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+            };
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&d), at);
+        } else {
+            let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV::default() },
+            };
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
+        }
+    }
 }
 
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -176,17 +210,19 @@ pub fn window_views_failed() -> bool {
 
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
-/// A window without a buffer gets window 0's. False (and the shaders keep the switch): no
-/// shared heap.
+/// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; unused
+/// trailing slots (`(0, 0)`) safely alias window 0's buffer.
 pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
-    let ok = !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
+    let count = windows.len().max(crate::gpu::uma::MAX_WINDOWS);
+    let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|&(raw, bytes)| raw != 0 || bytes == 0);
+    let ok = count <= crate::gpu::uma::MAX_HEAP_WINDOWS && complete && windows.first().is_some_and(|w| w.0 != 0) && shared_heap(dev) && {
         let (device, cpu, inc) = {
             let g = GLOBAL.lock().unwrap();
             let s = g.as_ref().unwrap();
             (s.dev.clone(), s.cpu, s.inc)
         };
         // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
-        for k in 0..crate::gpu::uma::MAX_WINDOWS {
+        for k in 0..count {
             let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
             let raw = raw as *mut std::ffi::c_void;
             let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
@@ -197,7 +233,7 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
     };
     if !ok {
         WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::xlog_warn!("memory windows: not in the shared descriptor heap – translated shaders switch over the windows' root UAVs");
+        crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");
     }
     ok
 }
@@ -234,9 +270,27 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
 
 /// The shared range starting at `first` (`count` descriptors) is free again.
 pub fn release_global(first: u32, count: u32) {
-    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        s.free.push((first, count));
+    if count == 0 {
+        return;
     }
+    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+        merge_release(&mut s.free, first, count);
+    }
+}
+
+/// Add a released range to `free`, merging the ranges it touches: adjacent releases become
+/// one range, so first-fit (and the cursor-straddle in `take_range`) sees the whole run.
+fn merge_release(free: &mut Vec<(u32, u32)>, first: u32, count: u32) {
+    free.push((first, count));
+    free.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(free.len());
+    for (f, n) in free.drain(..) {
+        match out.last_mut() {
+            Some(last) if f <= last.0 + last.1 => last.1 = last.1.max(f + n - last.0),
+            _ => out.push((f, n)),
+        }
+    }
+    *free = out;
 }
 
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
@@ -543,6 +597,27 @@ mod tests {
     }
 
     #[test]
+    fn a_freed_range_at_the_cursor_continues_into_the_never_used_tail() {
+        // the false-full shape: four freed slots end at the cursor and four more were never
+        // used; a request for eight is contiguous across the cursor, not exhaustion
+        let (mut free, mut next) = (vec![(8u32, 4u32)], 12u32);
+        assert_eq!(take_range(&mut free, &mut next, 16, 8), Some(8), "freed range plus tail is one run");
+        assert_eq!(next, 16);
+        assert!(free.is_empty());
+    }
+
+    #[test]
+    fn released_ranges_touching_one_another_merge_into_one() {
+        let mut free = vec![(0u32, 4), (16, 4)];
+        merge_release(&mut free, 4, 8);
+        assert_eq!(free, vec![(0, 12), (16, 4)]);
+        merge_release(&mut free, 12, 4);
+        assert_eq!(free, vec![(0, 20)], "the merge chains across the whole run");
+        merge_release(&mut free, 30, 2);
+        assert_eq!(free, vec![(0, 20), (30, 2)]);
+    }
+
+    #[test]
     fn window_views_do_not_hold_global_during_device_calls() {
         const CHILD: &str = "XCL_TEST_WINDOW_VIEWS_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -579,12 +654,57 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::uma::MAX_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
             });
-            assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)]));
-            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            let window = (&mut resource as *mut _ as usize, 0x10000);
+            assert!(set_window_views(&dev, &[window]));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            let mut windows = [window; crate::gpu::uma::MAX_HEAP_WINDOWS];
+            assert!(set_window_views(&dev, &windows));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            // Unused trailing window `(0, 0)` safely aliases window 0; an active window that failed
+            // to open `(0, bytes > 0)` is rejected.
+            windows[7] = (0, 0);
+            assert!(set_window_views(&dev, &windows));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            windows[7] = (0, 0x10000);
+            assert!(!set_window_views(&dev, &windows));
+            assert_eq!(CALLS.load(Ordering::Relaxed), 0);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
             *GLOBAL.lock().unwrap() = None;
+        }
+    }
+
+    /// A T# of zeros (an empty slot) names descriptors 0 (SRV) and 1 (UAV): those must be
+    /// null views, never a memory window's raw buffer UAV (a texture read of that hangs the GPU).
+    #[test]
+    fn zero_tsharp_does_not_reach_window_views() {
+        use std::ffi::c_void;
+        use std::sync::Mutex as M;
+        static SEEN: M<Vec<(bool, usize, usize)>> = M::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn srv(_this: *mut c_void, r: *mut c_void, _d: *const D3D12_SHADER_RESOURCE_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            SEEN.lock().unwrap().push((false, r as usize, at.ptr));
+        }
+        unsafe extern "system" fn uav(_this: *mut c_void, r: *mut c_void, _c: *mut c_void, _d: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            SEEN.lock().unwrap().push((true, r as usize, at.ptr));
+        }
+        let base = crate::gpu::recomp::MEM_HEAP_BASE;
+        assert!(base >= 2, "window views overlap the SRV / UAV pair of a zero T#");
+        assert_eq!(base % 2, 0, "window views must not split a console slot's SRV / UAV pair");
+        let mut vt = [0usize; 20];
+        vt[18] = srv as usize;
+        vt[19] = uav as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        unsafe {
+            let dev = std::mem::ManuallyDrop::new(ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void));
+            null_views(&dev, 0x1000, 32);
+        }
+        let seen = SEEN.lock().unwrap().clone();
+        assert_eq!(seen.len(), base as usize);
+        for (k, &(is_uav, r, at)) in seen.iter().enumerate() {
+            assert_eq!((is_uav, r, at), (k % 2 == 1, 0, 0x1000 + 32 * k), "descriptor {k}");
         }
     }
 

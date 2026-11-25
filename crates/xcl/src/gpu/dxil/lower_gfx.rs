@@ -35,9 +35,11 @@ pub struct GfxCtx {
     pub ps_in: Vec<(Sig, bool)>,
     pub targets: BTreeMap<u32, (GfxOut, u32)>,
     pub depth: Option<GfxOut>,
-    /// PS: a DONE export happened somewhere (`xcl_live` decides the discard)
+    /// PS: DONE=1 / VM=1 export tracking (`live_vm_var` wins whenever any VM=1 export exists)
     pub ps_done: bool,
+    pub ps_vm: bool,
     pub live_var: u32,
+    pub live_vm_var: u32,
 }
 
 fn gct(component_type: u32) -> GCt {
@@ -147,7 +149,7 @@ impl Lw {
         self.gfx_common_init(vgpr);
         let pos = GfxOut { sig: pos_sig, comps: 4, float: true, vars: self.out_vars(4) };
         let params = outs.into_iter().map(|(sig, n, float)| GfxOut { sig, comps: n, float, vars: self.out_vars(n) }).collect();
-        self.gfx = Some(GfxCtx { io, vs: Some(vs.clone()), ps: None, pos: Some(pos), params, ps_in: Vec::new(), targets: BTreeMap::new(), depth: None, ps_done: false, live_var: 0 });
+        self.gfx = Some(GfxCtx { io, vs: Some(vs.clone()), ps: None, pos: Some(pos), params, ps_in: Vec::new(), targets: BTreeMap::new(), depth: None, ps_done: false, ps_vm: false, live_var: 0, live_vm_var: 0 });
     }
 
     /// PS entry: signatures, initial registers (`modes`: the interpolation of each
@@ -242,9 +244,11 @@ impl Lw {
             d.vars = self.out_vars(1);
         }
         let live_var = self.tmp_var();
+        let live_vm_var = self.tmp_var();
         let f = self.c(0);
         self.wr(live_var, f);
-        self.gfx = Some(GfxCtx { io, vs: None, ps: Some(ps.clone()), pos: None, params: Vec::new(), ps_in, targets, depth, ps_done: false, live_var });
+        self.wr(live_vm_var, f);
+        self.gfx = Some(GfxCtx { io, vs: None, ps: Some(ps.clone()), pos: None, params: Vec::new(), ps_in, targets, depth, ps_done: false, ps_vm: false, live_var, live_vm_var });
     }
 
     /// SGPRs from `io`, SCC 0, EXEC = `ballot(true)`.
@@ -262,8 +266,8 @@ impl Lw {
     /// The end of a graphics stage: the PS discard, then every output component.
     pub fn finish_gfx(&mut self) {
         let mut g = self.gfx.take().expect("graphics entry");
-        if g.ps_done {
-            let live = self.rd(g.live_var);
+        if g.ps_vm || g.ps_done {
+            let live = self.rd(if g.ps_vm { g.live_vm_var } else { g.live_var });
             let dead = self.cmpc(Pred::Eq, live, 0);
             g.io.discard(&mut self.s, dead);
         }
@@ -292,6 +296,7 @@ impl Lw {
     /// Graphics exports (`export_graphics`).
     pub fn export_gfx(&mut self, d: &Decoded, en: u64, tgt: u64, compr: bool, srcs: &[Value]) -> LResult<()> {
         let done = Self::fv(d, "DONE") == 1;
+        let vm = Self::fv(d, "VM") == 1;
         let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
         let comp = |lw: &mut Lw, c: usize| -> Value {
             if compr {
@@ -368,6 +373,14 @@ impl Lw {
             }
             9 => {}
             _ => return err(d, "export target"),
+        }
+        if vm {
+            self.gfx().ps_vm = true;
+            let lv = self.gfx().live_vm_var;
+            let a = self.act();
+            let (one, z) = (self.c(1), self.c(0));
+            let v = self.sel(a, one, z);
+            self.wr(lv, v);
         }
         if done {
             self.gfx().ps_done = true;

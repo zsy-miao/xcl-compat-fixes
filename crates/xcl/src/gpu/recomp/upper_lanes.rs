@@ -525,7 +525,7 @@ fn fetch_call(d: &Decoded) -> bool {
 
 /// VGPRs an instruction writes: `rdna2::vgpr_uses`, with an image load's data registers
 /// counted from its DMASK (the operand tables give four).
-fn vgpr_writes(d: &Decoded) -> Vec<u64> {
+pub(super) fn vgpr_writes(d: &Decoded) -> Vec<u64> {
     let (_, mut w) = rdna2::vgpr_uses(d);
     let n = d.inst.name;
     let dmask_counts = n.starts_with("IMAGE_SAMPLE") || n.starts_with("IMAGE_GATHER4") || n.starts_with("IMAGE_LOAD") || n == "IMAGE_GET_LOD";
@@ -713,7 +713,7 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
 }
 
 /// Successors of each instruction (index); None: unknown (an indirect jump).
-fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
+pub(super) fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
     insts
         .iter()
         .enumerate()

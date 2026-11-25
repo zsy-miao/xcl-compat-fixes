@@ -38,6 +38,12 @@ const INITIAL_SKIP_SAMPLES: usize = 64;
 const VLC_BITS: usize = 9;
 const SCALE_VLC_BITS: usize = 8;
 
+// The endpoints round to zero and positive infinity as f32. Exponents outside
+// this range round to the same values as the nearest endpoint.
+const QUANT_MIN_EXP: i32 = -904;
+const QUANT_MAX_EXP: i32 = 771;
+const QUANT_GAIN_COUNT: usize = (QUANT_MAX_EXP - QUANT_MIN_EXP + 1) as usize;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
     Xma1,
@@ -549,6 +555,13 @@ struct StaticTables {
     vec1_vlc: VlcTable,
     windows: [Vec<f32>; BLOCK_SIZES],
     imdct: [ImdctPlan; BLOCK_SIZES],
+    quant_gains: [f32; QUANT_GAIN_COUNT],
+}
+
+impl StaticTables {
+    fn quant_gain(&self, exp: i32) -> f32 {
+        self.quant_gains[(exp.clamp(QUANT_MIN_EXP, QUANT_MAX_EXP) - QUANT_MIN_EXP) as usize]
+    }
 }
 
 fn static_tables() -> &'static StaticTables {
@@ -571,6 +584,10 @@ fn static_tables() -> &'static StaticTables {
             vec1_vlc: VlcTable::from_pairs(VLC_BITS, &VEC1_TABLE, 0),
             windows,
             imdct,
+            quant_gains: std::array::from_fn(|i| {
+                let exp = QUANT_MIN_EXP + i as i32;
+                10.0_f64.powf(exp as f64 / 20.0) as f32
+            }),
         }
     })
 }
@@ -1408,7 +1425,7 @@ impl StreamDecoder {
                     let end = self.sfb_offsets[self.table_idx][b + 1].min(self.subframe_len);
                     let sf = self.channel[c].saved_scale_factors[sf_buf][b];
                     let exp = q_step - (max_sf - sf) * sf_step;
-                    let quant = 10.0_f64.powf(exp as f64 / 20.0) as f32;
+                    let quant = st.quant_gain(exp);
                     for k in start..end {
                         self.tmp[k] = self.channel[c].out[base + k] * quant;
                     }
@@ -1896,6 +1913,15 @@ impl Decoder {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn quant_gains_match_power_at_and_beyond_both_limits() {
+        let st = static_tables();
+        for exp in (-2000..=2000).chain([i32::MIN, i32::MAX]) {
+            let expected = 10.0_f64.powf(exp as f64 / 20.0) as f32;
+            assert_eq!(st.quant_gain(exp).to_bits(), expected.to_bits(), "exponent {exp}");
+        }
+    }
 
     // FFmpeg-verified synthetic XMA2/XMA1 test packets (copyright-free spectral tones;
     // zero-padded to 2048-byte packets). Every vector's output was cross-checked against

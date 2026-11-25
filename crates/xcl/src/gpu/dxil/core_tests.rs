@@ -279,3 +279,305 @@ fn graphics_stages_with_a_branch_before_their_exports() {
     assert_eq!(draw(&dvs, &dps, 0), cleared, "branch not taken");
     assert_eq!(draw(&dvs, &dps, 1), kept, "branch taken");
 }
+
+/// Geometry mode (ES+GS, the compute pass of `recomp::Mode::Geometry`): an ES that writes
+/// its vertex to the LDS ring, the GS that reads its triangle's vertices, writes them to
+/// its output area and emits a strip; split and native forms validate (also the ES or GS
+/// alone, as the coverage sweep translates them).
+#[test]
+fn geometry_mode_validates() {
+    use crate::gpu::recomp::GsInterface;
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut es = Vec::new();
+    // v20 = lane * ES item (16 B), ring[v20] = v9 (a fetched input)
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)]));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 256 + 20)]));
+    es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 132), ("VSRC1", 20)]));
+    es.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 20), ("DATA0", 9)]));
+    es.extend(e("S_BARRIER", "ENC_SOPP", &[]));
+    es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    let mut gs = Vec::new();
+    // v0 = vertex 0's dword offset: read it, write 3 output vertices at s2 + lane * 48
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)]));
+    gs.extend(e("DS_READ_B32", "ENC_DS", &[("ADDR", 30), ("VDST", 31)]));
+    gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 32), ("SRC0", 193), ("SRC1", 128)]));
+    gs.extend(e("V_MUL_U32_U24", "ENC_VOP2", &[("VDST", 32), ("SRC0", 176), ("VSRC1", 32)]));
+    gs.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 2), ("VSRC1", 32)]));
+    for k in 0..3u64 {
+        gs.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 32), ("DATA0", 31), ("OFFSET0", 16 * k)]));
+        gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)]));
+    }
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)]));
+    gs.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let g = GsInterface {
+        es_inputs: vec![sig("POSITION", 0, 0)],
+        es_outputs: vec![sig("SV_Position", 1, 0)],
+        outputs: vec![sig("SV_Position", 1, 0)],
+        max_vertex_count: 3,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es.clone();
+    code.extend_from_slice(&gs);
+    let mut es_end = es;
+    es_end.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let cases = [
+        ("ES+GS", code, g.clone()),
+        ("ES alone", es_end, GsInterface { gs_start: None, ..g.clone() }),
+        ("GS alone", gs, GsInterface { gs_start: Some(0), ..g }),
+    ];
+    for (name, code, g) in cases {
+        for split in [true, false] {
+            let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+            super::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{name} split {split}: {}", &e[..e.len().min(3000)]));
+        }
+    }
+}
+
+/// Exhaustive bit-exact check of the IEEE-754 bit-manipulation formula used by
+/// `lower_mem::uf_small_bits` for all 10-bit (mb=5) and 11-bit (mb=6) float inputs.
+#[test]
+fn uf_small_ieee_bit_math_matches_exact_formula() {
+    for mb in [5u32, 6u32] {
+        let p = 1u32 << mb;
+        let mmask = p - 1;
+        let mshift = 23 - mb;
+        let den_scale = f32::from_bits(if mb == 6 { 0x3580_0000 } else { 0x3600_0000 });
+        for v in 0..(1u32 << (mb + 5)) {
+            let e = v >> mb;
+            let m = v & mmask;
+            // Reference formula (matching HLSL `uf_small`)
+            let fm = (m as f32) / (p as f32);
+            let ref_f = if e == 31 {
+                f32::from_bits(if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 })
+            } else if e == 0 {
+                fm * (-14.0f32).exp2()
+            } else {
+                ((e as f32) - 15.0).exp2() * (1.0 + fm)
+            };
+            // Exact IEEE bit math
+            let got_bits = if e == 31 {
+                if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 }
+            } else if e == 0 {
+                ((m as f32) * den_scale).to_bits()
+            } else {
+                ((e + 112) << 23) | (m << mshift)
+            };
+            assert_eq!(got_bits, ref_f.to_bits(), "mb={mb} v={v:#x} (e={e} m={m})");
+        }
+    }
+}
+
+/// Multi-window switch dispatch, vector rawBufferLoad/Store, hoisted FormatLoad
+/// descriptors, single/multi-component FormatLoad, and hoisted BVH loads all pass
+/// DXIL validation across 1..=4 memory windows and wave configurations.
+#[test]
+fn multi_window_mem_format_and_bvh_validate() {
+    let code = prog(&[
+        // Load descriptor s[12:15] once, then reuse across repeated BUFFER_LOAD_FORMAT_X
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x80), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 12), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+        // Divergent EXEC so lane guards are active (non-constant `act`)
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        // Repeated single-component format loads sharing s[12:15] (exercises hoisted FmtComp1 + Load2)
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Sub-4 and full-4 component format loads + D16 + static MTBUF + small byte load
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 13), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 28), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Vector MUBUF & FLAT loads/stores
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_STORE_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("DATA", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+        ("GLOBAL_LOAD_USHORT", "ENC_FLAT_GLBL", &[("VDST", 24), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+        // BVH node intersection (box32 / box16 / tri hoisted vector loads)
+        ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 28), ("VADDR", 0), ("SRSRC", 3), ("DMASK", 0xF)], None),
+    ]);
+    for windows in [1u32, 2, 3, 4] {
+        for (wave64, split) in [(true, false), (false, false)] {
+            translate(&code, KernelOptions { wave64, split, mem_windows: windows, sampler_base: 0 })
+                .unwrap_or_else(|e| panic!("w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            if windows > 1 {
+                translate(&code, KernelOptions { wave64, split, mem_windows: windows | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
+                    .unwrap_or_else(|e| panic!("heap w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            }
+        }
+    }
+}
+
+/// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
+/// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
+/// the same S#, and validates.
+#[test]
+fn ps_get_lod_with_a_static_sampler() {
+    use crate::gpu::recomp::{Mode, PsInterface};
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 1 << 20 | 1 << 22, 0];
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for (k, &w) in linear.iter().enumerate() {
+        list.push(if w == 0 { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 128)], None) } else { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 255)], Some(w)) });
+    }
+    // uv = (I, J) of the first barycentric pair (v0, v1); T# s[16:23], S# s[24:27]
+    list.push(("IMAGE_GET_LOD", "ENC_MIMG", vec![("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("IMAGE_SAMPLE", "ENC_MIMG", vec![("VDATA", 6), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    }
+}
+
+/// Without a program-set `MODE[3:2]`, `v_cvt_f16_f32`, `v_mul_f16` and `v_pk_mul_f16`
+/// must round to nearest-even (matching RDNA2 and the HLSL path) rather than using
+/// `dx.op.legacyF32ToF16` (which rounds toward zero / flushes below the smallest f16 denormal).
+#[test]
+fn f16_conversions_and_products_default_to_round_to_nearest_even() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    const V: u64 = 256;
+    let code = prog(&[
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+    ]);
+    let w32_dxil = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let split_dxil = translate(&code, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let w64_dxil = translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    if let Ok(dis) = super::validate::disassemble(&w32_dxil) {
+        assert!(!dis.contains("legacyF32ToF16"), "default RNE f16 ops should not emit legacyF32ToF16:\n{dis}");
+    }
+
+    let (has_w32, has_w64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !has_w32 && !has_w64 {
+        return runner::skip_test("no wave32 or wave64 GPU");
+    }
+
+    let cvt_cases: [(f32, u16); 8] = [
+        (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
+        (3075.0, 0x6A02),
+        (f32::from_bits(3075.0f32.to_bits() + 1), 0x6A02),
+        (3081.0, 0x6A04),
+        (-3075.0, 0xEA02),
+        (65520.0, 0x7C00),
+        (f32::from_bits(0x3300_0000), 0x0000),
+        (f32::from_bits(0x3300_0001), 0x0001),
+    ];
+    // Lane 0: 3072 * (1 + 2^-10) = 3075.0 (exact midpoint -> 0x6A02 / 0xEA02).
+    // Lane 1: 2^-24 * (0.5 + 2^-11) = 2^-25 + 2^-35 (above half smallest f16 denormal -> 0x0001 / 0x8001).
+    let mul_cases: [(u32, u32, u16, u32); 2] = [
+        (0xEA00_6A00, 0x3C01_3C01, 0x6A02, 0xEA02_6A02),
+        (0x8001_0001, 0x3801_3801, 0x0001, 0x8001_0001),
+    ];
+
+    let mut runs: Vec<(&str, &[u8], bool)> = Vec::new();
+    if has_w32 {
+        runs.push(("wave32", &w32_dxil, false));
+        runs.push(("split-wave64", &split_dxil, true));
+    }
+    if has_w64 {
+        runs.push(("native-wave64", &w64_dxil, true));
+    }
+    for (label, dxil, wave64) in runs {
+        let mut st = KernelState::default();
+        if !wave64 {
+            st.sgpr[127] = 0;
+        }
+        let bases: &[usize] = if wave64 { &[0, 32] } else { &[0] };
+        for &base in bases {
+            for (i, &(value, _)) in cvt_cases.iter().enumerate() {
+                st.vgpr[base + i][0] = value.to_bits();
+            }
+            for (i, &(a, b, _, _)) in mul_cases.iter().enumerate() {
+                st.vgpr[base + i][1] = a;
+                st.vgpr[base + i][2] = b;
+            }
+        }
+        let r = runner::run(dxil, &st, &[]).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for &base in bases {
+            let actual: [u16; 8] = std::array::from_fn(|i| r.vgpr[base + i][10] as u16);
+            let expected = cvt_cases.map(|(_, bits)| bits);
+            assert_eq!(actual, expected, "{label} base {base}: v_cvt_f16_f32 {actual:04x?} != {expected:04x?}");
+            for (i, &(_, _, want_mul, want_pk)) in mul_cases.iter().enumerate() {
+                let got_mul = r.vgpr[base + i][11] as u16;
+                let got_pk = r.vgpr[base + i][12];
+                assert_eq!(got_mul, want_mul, "{label} lane {}: v_mul_f16 {got_mul:04x} != {want_mul:04x}", base + i);
+                assert_eq!(got_pk, want_pk, "{label} lane {}: v_pk_mul_f16 {got_pk:08x} != {want_pk:08x}", base + i);
+            }
+        }
+    }
+}
+
+/// `s_setreg_b32 hwreg(HW_REG_MODE, 3, 1), s0` sets bit 3 of `MODE` (offset 3, dp_mask 2):
+/// lowering must not subtract `2 - off` before matching `dp_mask`, and the dynamic f16 rounding
+/// result must agree with HLSL on the GPU.
+#[test]
+fn s_setreg_b32_mode_bit3_does_not_underflow() {
+    use crate::gpu::recomp::{dxc, runner, Options};
+    // HW_REG_MODE (1), offset 3, size-1 = 0 -> 1 | (3 << 6) = 0x00C1
+    let code = prog(&[
+        ("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x00C1)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None),
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct DXIL failed: {e}"));
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32");
+    }
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mut st = runner::KernelState::default();
+    st.sgpr[0] = 1; // MODE[3:2] = 0b10 (RTN, round toward -inf)
+    st.vgpr[0][1] = 0x3F80_0001; // +1.0 + 2^-23 -> 0x3C00
+    st.vgpr[1][1] = 0xBF80_0001; // -1.0 - 2^-23 -> 0xBC01
+    let direct = runner::run(&dxil, &st, &[]).unwrap();
+    let t = crate::gpu::recomp::translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (hlsl.vgpr[0][0], hlsl.vgpr[1][0]));
+    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (0x3C00, 0xBC01));
+}
+
+/// A 16-byte `buffer_store_format_xyzw` (32_32_32_32_FLOAT) at an address that is not
+/// dword aligned writes all four components; the bytes around it stay intact.
+#[test]
+fn gpu_direct_unaligned_multi_dword_format_store() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    // V# s[12:15] (SRSRC 3): base 0x100, stride 0, 64 bytes, format 77; lane 0 stores at +2
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None),
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let dxil = runner::direct_kernel(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC / wave64");
+        return;
+    }
+    let vals = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 64, (4 | 5 << 3 | 6 << 6 | 7 << 9) | 77 << 12]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 2;
+        r[10..14].copy_from_slice(&vals);
+    }
+    let fill = 0xDEAD_BEEFu32;
+    let r = runner::run(&dxil, &st, &vec![fill; 128]).expect("GPU run");
+    let mut want: Vec<u8> = std::iter::repeat_n(fill.to_le_bytes(), 128).flatten().collect();
+    want[0x102..0x112].copy_from_slice(&vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let got: Vec<u8> = r.mem.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
+}

@@ -315,6 +315,9 @@ impl TraceFilter {
 pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool) -> usize {
     let key = dll_key(dll);
     let (mut addr, source) = resolve_inner(&key, what, 0);
+    if matches!(source, Source::GameDll(_)) && crate::hle::bink::is_bink_dll(&key) {
+        addr = crate::hle::bink::wrap(&fname(what), addr);
+    }
     crate::xlog_debug!("import {importer}: {key}!{what} → {source:?}");
     if let Some(f) = trace_filter() {
         if f.wants(&key, &fname(what), &source) {
@@ -424,7 +427,12 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
         return r;
     }
     if let Some(m) = modules::find_mapped_by_base(h) {
-        return resolve_export_of_mapped(&m, what, 0);
+        let mut addr = resolve_export_of_mapped(&m, what, 0)?;
+        let key = dll_key(&m.name);
+        if crate::hle::bink::is_bink_dll(&key) {
+            addr = crate::hle::bink::wrap(&fname(what), addr);
+        }
+        return Some(addr);
     }
     // A real module: kernel-family modules prefer our overrides.
     let mut buf = [0u16; 260];
@@ -487,6 +495,13 @@ mod tests {
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("advapi32.dll", &name("RegSetValueExW"), 0);
         assert!(a != 0 && matches!(s, Source::System(ref d) if d == "advapi32.dll"), "{s:?}");
+    }
+
+    #[test]
+    fn xmem_imports_route_through_kernelx() {
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+        let (a, s) = resolve_inner("xmem.dll", &name("XMemIsToolsMemAvailable"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
     }
 
     #[test]

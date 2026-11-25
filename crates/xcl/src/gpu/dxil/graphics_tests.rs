@@ -695,6 +695,49 @@ fn vs_control_dependence_matches_dxc() {
     assert_valid(&c);
 }
 
+/// A value of a loop depends on what the loop's phi depends on, also when it is first reached
+/// through that phi (#1892): `acc = phi [X, entry], [next, loop]`, `next = acc + 1`, and the
+/// outputs A = acc, B = next. Asking for `acc` reaches `next` while `acc` is still being worked
+/// out; `next` must not keep the empty set it saw then.
+#[test]
+fn a_loop_value_first_reached_through_its_phi_keeps_the_phis_inputs() {
+    let mut s = Shader::new(Stage::Vertex, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Vertex);
+    let x = io.input(SigElement::user("X", 0, CompType::F32, 1));
+    let oa = io.output(SigElement::user("A", 0, CompType::F32, 1));
+    let ob = io.output(SigElement::user("B", 0, CompType::F32, 1));
+    let xv = io.load_input(&mut s, x, 0, 0);
+    let entry = s.m.current_block();
+    let (lp, exit) = (s.m.new_block(), s.m.new_block());
+    s.m.br(lp);
+    s.m.set_block(lp);
+    let (f32, i32) = (s.m.f32(), s.m.i32());
+    let acc = s.m.phi(f32);
+    let i = s.m.phi(i32);
+    let one = f(&mut s, 1.0);
+    let next = s.m.fbin(BinOp::Add, acc, one, 0);
+    let (c0, c1, c4) = (s.m.i32c(0), s.m.i32c(1), s.m.i32c(4));
+    let inext = s.m.bin(BinOp::Add, i, c1);
+    let done = s.m.cmp(Pred::Eq, inext, c4);
+    s.m.cond_br(done, exit, lp);
+    s.m.add_incoming(acc, xv, entry);
+    s.m.add_incoming(acc, next, lp);
+    s.m.add_incoming(i, c0, entry);
+    s.m.add_incoming(i, inext, lp);
+    s.m.set_block(exit);
+    io.store_output(&mut s, oa, 0, 0, acc);
+    io.store_output(&mut s, ob, 0, 0, next);
+    s.m.ret();
+    let (ins, outs, prims) = (io.place(Dir::In), io.place(Dir::Out), io.place(Dir::Prim));
+    let component = |p: &[Placed], sig: Sig| p[sig.id as usize].at.map(|(r, c)| r * 4 + c as u32).expect("a placed element");
+    let deps = compute_deps(&s, &ins, &outs, &prims);
+    let x_in = component(&ins, x);
+    for (name, out) in [("A", oa), ("B", ob)] {
+        let d = deps.out.get(&(0, component(&outs, out))).cloned().unwrap_or_default();
+        assert!(d.contains(&x_in), "output {name} depends on input X through the loop; its inputs: {d:?}");
+    }
+}
+
 /// A pixel shader reading a per-primitive attribute: `SV_Target =
 /// float4(COLOR.rgb, PRIMK)`, discarding pixels left of x = 4.
 fn prim_ps() -> Vec<u8> {

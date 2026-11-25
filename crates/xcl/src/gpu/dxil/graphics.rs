@@ -771,8 +771,49 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
         }
     }
     let in_base: Vec<Option<u32>> = inputs.iter().map(|e| e.at.map(|(r, c)| r * 4 + c as u32)).collect();
-    let mut memo: HashMap<Value, BTreeSet<u32>> = HashMap::new();
-    let mut ctrl_memo: HashMap<usize, BTreeSet<u32>> = HashMap::new();
+    /// What is known of a value's (or a block's) inputs: `pass` is the pass that worked it
+    /// out last, `open` while that is going on.
+    #[derive(Default)]
+    struct Known {
+        set: BTreeSet<u32>,
+        pass: u32,
+        open: bool,
+    }
+    /// The sets so far. A loop makes a value depend on itself: a value reached again while it
+    /// is `open` answers with what earlier passes know of it (`cut`), so what is derived from
+    /// that answer may miss inputs – the outputs are worked out again until no set grows.
+    #[derive(Default)]
+    struct Sets {
+        values: HashMap<Value, Known>,
+        blocks: HashMap<usize, Known>,
+        pass: u32,
+        cut: bool,
+        grew: bool,
+    }
+    impl Sets {
+        /// The answer for `key` without working it out: it is done in this pass, or open.
+        fn known<K: std::hash::Hash + Eq>(map: &HashMap<K, Known>, key: &K, pass: u32, cut: &mut bool) -> Option<BTreeSet<u32>> {
+            let k = map.get(key)?;
+            if k.open {
+                *cut = true;
+            } else if k.pass != pass {
+                return None;
+            }
+            Some(k.set.clone())
+        }
+        fn open<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Known>, key: K) {
+            map.entry(key).or_default().open = true;
+        }
+        /// `d` (with what was known before) is `key`'s set of this pass.
+        fn close<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Known>, key: K, mut d: BTreeSet<u32>, pass: u32, grew: &mut bool) -> BTreeSet<u32> {
+            let k = map.entry(key).or_default();
+            d.extend(k.set.iter().copied());
+            *grew |= d.len() > k.set.len();
+            *k = Known { set: d.clone(), pass, open: false };
+            d
+        }
+    }
+    let mut sets = Sets::default();
 
     struct Cx<'a> {
         s: &'a Shader,
@@ -783,29 +824,28 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
         in_base: &'a [Option<u32>],
         inputs: &'a [Placed],
     }
-    fn block_deps(cx: &Cx, b: usize, memo: &mut HashMap<Value, BTreeSet<u32>>, cm: &mut HashMap<usize, BTreeSet<u32>>) -> BTreeSet<u32> {
-        if let Some(d) = cm.get(&b) {
-            return d.clone();
+    fn block_deps(cx: &Cx, b: usize, st: &mut Sets) -> BTreeSet<u32> {
+        if let Some(d) = Sets::known(&st.blocks, &b, st.pass, &mut st.cut) {
+            return d;
         }
-        cm.insert(b, BTreeSet::new());
+        Sets::open(&mut st.blocks, b);
         let mut d = BTreeSet::new();
         for &a in &cx.ctrl[b] {
             if let Some(c) = cx.cond[a] {
-                d.extend(value_deps(cx, c, memo, cm));
+                d.extend(value_deps(cx, c, st));
             }
             if a != b {
-                d.extend(block_deps(cx, a, memo, cm));
+                d.extend(block_deps(cx, a, st));
             }
         }
-        cm.insert(b, d.clone());
-        d
+        Sets::close(&mut st.blocks, b, d, st.pass, &mut st.grew)
     }
-    fn value_deps(cx: &Cx, v: Value, memo: &mut HashMap<Value, BTreeSet<u32>>, cm: &mut HashMap<usize, BTreeSet<u32>>) -> BTreeSet<u32> {
+    fn value_deps(cx: &Cx, v: Value, st: &mut Sets) -> BTreeSet<u32> {
         let Value::Inst(i) = v else { return BTreeSet::new() };
-        if let Some(d) = memo.get(&v) {
-            return d.clone();
+        if let Some(d) = Sets::known(&st.values, &v, st.pass, &mut st.cut) {
+            return d;
         }
-        memo.insert(v, BTreeSet::new());
+        Sets::open(&mut st.values, v);
         let m = &cx.s.m;
         let mut d = BTreeSet::new();
         match m.inst_info(i) {
@@ -821,69 +861,76 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                             for r in 0..cx.inputs[id].e.nrows() {
                                 d.insert(base + r * 4 + col);
                             }
-                            d.extend(value_deps(cx, args[2], memo, cm));
+                            d.extend(value_deps(cx, args[2], st));
                         }
                     }
                 }
             }
             InstInfo::Call(_, args) => {
                 for &a in args {
-                    d.extend(value_deps(cx, a, memo, cm));
+                    d.extend(value_deps(cx, a, st));
                 }
             }
             InstInfo::Phi(list) => {
                 for &(x, from) in list {
-                    d.extend(value_deps(cx, x, memo, cm));
-                    d.extend(block_deps(cx, from.0 as usize, memo, cm));
+                    d.extend(value_deps(cx, x, st));
+                    d.extend(block_deps(cx, from.0 as usize, st));
                     if let Some(c) = cx.cond[from.0 as usize] {
-                        d.extend(value_deps(cx, c, memo, cm));
+                        d.extend(value_deps(cx, c, st));
                     }
                 }
             }
             InstInfo::Load(p) => {
-                d.extend(value_deps(cx, p, memo, cm));
+                d.extend(value_deps(cx, p, st));
                 if let Some(vs) = cx.root_stores.get(&root(cx.s, p)) {
                     for &x in vs {
-                        d.extend(value_deps(cx, x, memo, cm));
+                        d.extend(value_deps(cx, x, st));
                     }
                 }
             }
             InstInfo::Other(ops) => {
                 for x in ops {
-                    d.extend(value_deps(cx, x, memo, cm));
+                    d.extend(value_deps(cx, x, st));
                 }
             }
             InstInfo::Store(..) | InstInfo::Term(..) => {}
         }
         let _ = cx.block_of;
-        memo.insert(v, d.clone());
-        d
+        Sets::close(&mut st.values, v, d, st.pass, &mut st.grew)
     }
 
     let cx = Cx { s, block_of: &block_of, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
     let mut out: HashMap<(u8, u32), BTreeSet<u32>> = HashMap::new();
     let bases = |p: &[Placed]| -> Vec<Option<u32>> { p.iter().map(|e| e.at.map(|(r, c)| r * 4 + c as u32)).collect() };
     let (ob, pb) = (bases(outputs), bases(prims));
-    for b in 0..nb {
-        for &i in m.block_insts(Block(b as u32)) {
-            let InstInfo::Call(name, args) = m.inst_info(i) else { continue };
-            let (dir, base) = if name.starts_with("dx.op.storeOutput.") || name.starts_with("dx.op.storeVertexOutput.") {
-                (0u8, &ob)
-            } else if name.starts_with("dx.op.storePrimitiveOutput.") {
-                (1u8, &pb)
-            } else {
-                continue;
-            };
-            let id = m.const_u64(args[1]).unwrap() as usize;
-            let Some(base) = base[id] else { continue };
-            let col = m.const_u64(args[3]).unwrap() as u32;
-            let row = m.const_u64(args[2]).unwrap() as u32;
-            let mut d = value_deps(&cx, args[4], &mut memo, &mut ctrl_memo);
-            d.extend(block_deps(&cx, b, &mut memo, &mut ctrl_memo));
-            if args.len() > 5 {
-                d.extend(value_deps(&cx, args[5], &mut memo, &mut ctrl_memo));
+    // (code without a loop is done after one pass: nothing was cut)
+    loop {
+        sets.pass += 1;
+        (sets.cut, sets.grew) = (false, false);
+        for b in 0..nb {
+            for &i in m.block_insts(Block(b as u32)) {
+                let InstInfo::Call(name, args) = m.inst_info(i) else { continue };
+                let (dir, base) = if name.starts_with("dx.op.storeOutput.") || name.starts_with("dx.op.storeVertexOutput.") {
+                    (0u8, &ob)
+                } else if name.starts_with("dx.op.storePrimitiveOutput.") {
+                    (1u8, &pb)
+                } else {
+                    continue;
+                };
+                let id = m.const_u64(args[1]).unwrap() as usize;
+                let Some(base) = base[id] else { continue };
+                let col = m.const_u64(args[3]).unwrap() as u32;
+                let row = m.const_u64(args[2]).unwrap() as u32;
+                let mut d = value_deps(&cx, args[4], &mut sets);
+                d.extend(block_deps(&cx, b, &mut sets));
+                if args.len() > 5 {
+                    d.extend(value_deps(&cx, args[5], &mut sets));
+                }
+                out.entry((dir, base + row * 4 + col)).or_default().extend(d);
             }
-            out.entry((dir, base + row * 4 + col)).or_default().extend(d);
+        }
+        if !(sets.cut && sets.grew) {
+            break;
         }
     }
     Deps { out }

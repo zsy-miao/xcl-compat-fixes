@@ -24,6 +24,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
+    crate::xlog_info!(
+        "console: {} (title memory {} MiB, mode {})",
+        if boot.config.is_series_s() { "Xbox Series S (lockhart)" } else { "Xbox Series X (anaconda)" },
+        boot.config.title_memory_mb,
+        boot.config.title_memory
+    );
 
     if std::env::var_os("XCL_UMA_MB").is_none() && boot.config.uma_mb != 0 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());

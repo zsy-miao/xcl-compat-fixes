@@ -98,6 +98,7 @@ pub(super) fn parse(bc: &[u8]) -> Block {
 }
 
 const BLOCK_FUNCTION: u32 = 12;
+const FUNC_CODE_INST_BINOP: u32 = 2;
 const FUNC_CODE_INST_ATOMICRMW: u32 = 38;
 const FUNC_CODE_INST_CMPXCHG: u32 = 46;
 /// `bitc::ORDERING_SEQCST` (the in-memory `AtomicOrdering` value is 7, the
@@ -126,6 +127,20 @@ fn reader_round_trips_block_structure() {
     let root = parse(&bc);
     assert!(root.find(8).is_some(), "module block");
     assert!(root.find(BLOCK_FUNCTION).is_some(), "function block");
+}
+
+#[test]
+fn a_shorter_binop_record_has_only_its_own_operands() {
+    let mut m = Module::new();
+    m.define_entry("main");
+    let one = m.i32c(1);
+    let sum = m.bin_flags(BinOp::Add, one, one, 3);
+    m.bin(BinOp::Xor, sum, one);
+    m.ret();
+
+    let root = parse(&m.to_bitcode("dxil-ms-dx", ""));
+    let records = root.find(BLOCK_FUNCTION).unwrap().records_with(FUNC_CODE_INST_BINOP);
+    assert_eq!(records, [&[1, 1, BinOp::Add as u64, 3][..], &[1, 2, BinOp::Xor as u64][..]]);
 }
 
 #[test]

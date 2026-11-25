@@ -276,6 +276,12 @@ fn send(p: Arc<Pending>) {
     }
 }
 
+/// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
+/// what `xcl shaders --precompile --used-only` builds.
+pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default())
+}
+
 /// The pipelines a title used, by a hash of their shaders, kept between runs
 /// (`used-pipelines.txt` beside the DXIL cache, a key a line).
 ///

@@ -499,6 +499,9 @@ pub struct Channel {
 impl Channel {
     pub fn connect(&mut self, now: Instant) {
         self.connected = true;
+        // A reconnect starts a fresh channel: messages queued for the old one
+        // (a MSG_DISCONNECT nobody popped, stale command acks) must not surface.
+        self.messages.clear();
         self.next_frame = Some(now + FRAME);
     }
 
@@ -1135,6 +1138,18 @@ mod tests {
         assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_AUDIO_FRAME));
         c.disconnect();
         assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_DISCONNECTED));
+    }
+
+    #[test]
+    fn reconnect_drops_messages_queued_for_the_old_channel() {
+        let t0 = Instant::now();
+        let mut c = Channel::default();
+        c.connect(t0);
+        c.disconnect(); // queues MSG_DISCONNECTED; the title never pops it
+        c.connect(t0);
+        assert_eq!(c.pop(t0), None, "the stale disconnect must not surface on the new channel");
+        let later = t0 + FRAME * 3;
+        assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_AUDIO_FRAME));
     }
 
     #[test]

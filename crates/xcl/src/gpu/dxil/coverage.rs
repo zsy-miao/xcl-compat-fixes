@@ -123,12 +123,23 @@ pub struct Report {
     pub times_us: Vec<u64>,
     /// (direct DXIL bytes, HLSL-path DXIL bytes) for programs both paths produced
     pub sizes: Vec<(usize, usize)>,
+    /// the slowest programs: (microseconds, program), slowest first, at most [`SLOWEST`]
+    pub slowest: Vec<(u64, String)>,
 }
+
+/// How many of the slowest programs a [`Report`] keeps.
+pub const SLOWEST: usize = 10;
 
 impl Report {
     pub fn add(&mut self, name: &str, s: &Sample) {
         let c = self.stages.entry(s.stage).or_default();
-        self.times_us.push(s.time.as_micros() as u64);
+        let us = s.time.as_micros() as u64;
+        self.times_us.push(us);
+        if self.slowest.len() < SLOWEST || self.slowest.last().is_some_and(|l| l.0 < us) {
+            let at = self.slowest.partition_point(|l| l.0 >= us);
+            self.slowest.insert(at, (us, name.to_string()));
+            self.slowest.truncate(SLOWEST);
+        }
         match &s.result {
             Ok(size) => {
                 c.translated += 1;
@@ -186,6 +197,10 @@ impl Report {
         row(&mut s, "all", &self.total());
         let (p50, p95, max) = self.time_percentiles();
         s.push_str(&format!("  translation time per program: p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms\n", p50 as f64 / 1e3, p95 as f64 / 1e3, max as f64 / 1e3));
+        for (us, name) in &self.slowest {
+            s.push_str(&format!("    slow: {:>9.2} ms  {name}
+", *us as f64 / 1e3));
+        }
         if !self.sizes.is_empty() {
             let (d, h): (usize, usize) = self.sizes.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
             s.push_str(&format!("  DXIL size, {} programs: direct {} B, HLSL+DXC {} B (direct/HLSL {:.2})\n", self.sizes.len(), d, h, d as f64 / h.max(1) as f64));
@@ -239,7 +254,7 @@ pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool
         Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
         Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
         Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
-        Mode::Geometry(_) => Err("geometry mode (ES+GS): not supported by the direct translator".into()),
+        Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
     }));
     let k = match r {
         Ok(r) => r?,
@@ -394,8 +409,7 @@ mod tests {
             r.add(name, &Sample { stage: stage_name(&mode), result: res, time: t0.elapsed(), hlsl_size: None });
         }
         assert_eq!(r.stages["kernel"].translated, 1, "{}", r.text(5));
-        assert_eq!(r.stages["GS"].unsupported, 1);
-        assert!(r.ranked()[0].0.starts_with("geometry mode"));
+        assert_eq!(r.stages["GS"].translated, 1, "{}", r.text(5));
     }
 
     #[test]

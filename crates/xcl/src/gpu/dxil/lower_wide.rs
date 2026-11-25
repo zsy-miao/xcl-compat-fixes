@@ -61,7 +61,12 @@ impl Lw {
         };
         let fr = |s: &mut Self, e: Value| {
             let e = if clamp { s.un(op::SATURATE, e) } else { e };
-            s.to_f16(e)
+            // The product of two binary16 operands fits exactly in binary32.
+            if name == "v_pk_mul_f16" {
+                s.to_f16_rounded(e)
+            } else {
+                s.to_f16(e)
+            }
         };
         let dot: Option<Value> = match name {
             "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
@@ -408,7 +413,11 @@ impl Lw {
             if m.clamp {
                 v = s.un(op::SATURATE, v);
             }
-            s.to_f16(v)
+            if name == "v_mul_f16" {
+                s.to_f16_rounded(v)
+            } else {
+                s.to_f16(v)
+            }
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
@@ -450,6 +459,7 @@ impl Lw {
             "v_max_f16" => f2!(|s: &mut Self, x, y| s.fmax(x, y)),
             "v_fma_f16" => f3!(|s: &mut Self, x, y, w| s.fmad(x, y, w)),
             "v_med3_f16" => f3!(|s: &mut Self, x, y, w| s.med3f(x, y, w)),
+            "v_div_fixup_f16" => f3!(|s: &mut Self, x, y, w| s.div_fixup(x, y, w)),
             "v_min3_f16" => f3!(|s: &mut Self, x, y, w| {
                 let t = s.fmin(x, y);
                 s.fmin(t, w)
@@ -499,12 +509,7 @@ impl Lw {
             "v_mad_f16" => {
                 let (x, y, w) = (fh(self, 0), fh(self, 1), fh(self, 2));
                 let p = self.fmul(x, y);
-                let ph = if self.dyn_rm {
-                    let rm = self.rd(super::lower::VAR_FP16_RM);
-                    self.f32_to_f16_rm(p, rm)
-                } else {
-                    self.f32_to_f16_rne(p)
-                };
+                let ph = self.to_f16_rounded(p);
                 let p16 = self.s.f16_to_f32(ph);
                 let e = self.fadd(p16, w);
                 fr(self, e)
@@ -751,6 +756,42 @@ impl Lw {
         self.s.make_double(lo, hi)
     }
 
+    /// 64-bit integer comparison lowered as 32-bit high/low dword comparisons.
+    /// Avoids 64-bit `icmp` instructions, which AMD's D3D12 compiler miscompiles on
+    /// RDNA when the two 64-bit operands share a register/dword (e.g. `v[1:2]` vs `v[2:3]`),
+    /// and avoids requiring `Feature::Int64Ops` for comparisons alone.
+    pub fn cmp64(&mut self, opn: &str, signed: bool, (al, ah): (Value, Value), (bl, bh): (Value, Value)) -> Option<Value> {
+        Some(match opn {
+            "f" => self.b(false),
+            "t" | "tru" => self.b(true),
+            "eq" => {
+                let he = self.cmp(Pred::Eq, ah, bh);
+                let le = self.cmp(Pred::Eq, al, bl);
+                self.land(he, le)
+            }
+            "ne" | "lg" => {
+                let hn = self.cmp(Pred::Ne, ah, bh);
+                let ln = self.cmp(Pred::Ne, al, bl);
+                self.lor(hn, ln)
+            }
+            "lt" | "le" => {
+                let hi = self.cmp(if signed { Pred::SLt } else { Pred::ULt }, ah, bh);
+                let he = self.cmp(Pred::Eq, ah, bh);
+                let lo = self.cmp(if opn == "lt" { Pred::ULt } else { Pred::ULe }, al, bl);
+                let eq_lo = self.land(he, lo);
+                self.lor(hi, eq_lo)
+            }
+            "gt" | "ge" => {
+                let hi = self.cmp(if signed { Pred::SGt } else { Pred::UGt }, ah, bh);
+                let he = self.cmp(Pred::Eq, ah, bh);
+                let lo = self.cmp(if opn == "gt" { Pred::UGt } else { Pred::UGe }, al, bl);
+                let eq_lo = self.land(he, lo);
+                self.lor(hi, eq_lo)
+            }
+            _ => return None,
+        })
+    }
+
     pub fn valu64(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);
@@ -798,21 +839,7 @@ impl Lw {
                     let (a, b) = (f64v(self, 0), f64v(self, 1));
                     self.float_compare(opn, a, b).ok_or_else(|| format!("{}: VOPC 64", rdna2::format(d)))?
                 }
-                "u64" | "i64" => {
-                    let (a, b) = (u64v(self, 0), u64v(self, 1));
-                    let sg = ty == "i64";
-                    match opn {
-                        "f" => self.b(false),
-                        "t" | "tru" => self.b(true),
-                        "lt" => self.cmp(if sg { Pred::SLt } else { Pred::ULt }, a, b),
-                        "eq" => self.cmp(Pred::Eq, a, b),
-                        "le" => self.cmp(if sg { Pred::SLe } else { Pred::ULe }, a, b),
-                        "gt" => self.cmp(if sg { Pred::SGt } else { Pred::UGt }, a, b),
-                        "ne" | "lg" => self.cmp(Pred::Ne, a, b),
-                        "ge" => self.cmp(if sg { Pred::SGe } else { Pred::UGe }, a, b),
-                        _ => return err(d, "VOPC 64"),
-                    }
-                }
+                "u64" | "i64" => self.cmp64(opn, ty == "i64", lh[0], lh[1]).ok_or_else(|| format!("{}: VOPC 64", rdna2::format(d)))?,
                 _ => return err(d, "VOPC 64"),
             };
             self.write_mask(&dst, cond);
@@ -839,10 +866,10 @@ impl Lw {
                 };
                 let c = u64v(self, 2);
                 let w = self.add(p, c);
-                let carry = self.cmp(Pred::ULt, w, c);
+                let (lo, hi) = self.unpack64(w);
+                let carry = self.cmp64("lt", false, (lo, hi), lh[2]).expect("lt");
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
                 self.write_mask(&sdst, carry);
-                let (lo, hi) = self.unpack64(w);
                 self.write64(&dst, lo, hi);
                 return Ok(());
             }
@@ -923,6 +950,7 @@ impl Lw {
                         let a = f64v(self, 0);
                         let t = self.s.m.f32();
                         let f = self.s.m.cast(CastOp::FPTrunc, a, t);
+                        let f = self.rm_cvt_f64(a, f);
                         let f = match m.omod {
                             1..=3 => {
                                 let k = self.fc([2.0, 4.0, 0.5][m.omod as usize - 1]);
@@ -1247,5 +1275,68 @@ impl Lw {
         let mnz = self.nz(m);
         let nn = self.nz(n);
         self.fclass_bits(e, 0x7FF, mnz, qn, nn)
+    }
+}
+
+#[cfg(test)]
+mod cmp64_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp;
+
+    fn asm(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in list {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    /// 64-bit integer comparisons (`v_cmp_*_{i64,u64}` including shared-dword operands
+    /// `v[1:2]` vs `v[2:3]`) must lower via 32-bit high/low dword comparisons in both
+    /// Direct DXIL and HLSL so AMD's D3D12 compiler never sees `icmp i64`.
+    #[test]
+    fn cmp64_uses_32bit_dwords_no_i64_icmp() {
+        const V: u64 = 256;
+        // Overlapping 64-bit pairs: SRC0 = v[1:2], VSRC1 = v[2:3] (shared v2)
+        let mut ops = Vec::new();
+        for ty in ["U64", "I64"] {
+            for op in ["F", "LT", "EQ", "LE", "GT", "NE", "GE", "T"] {
+                let name: &'static str = Box::leak(format!("V_CMP_{op}_{ty}").into_boxed_str());
+                ops.push((name, "ENC_VOPC", vec![("SRC0", V + 1), ("VSRC1", 2)]));
+            }
+        }
+        let refs: Vec<(&str, &str, &[(&str, u64)])> = ops.iter().map(|(a, b, c)| (*a, *b, c.as_slice())).collect();
+        let code = asm(&refs);
+
+        let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
+        validate::validate(&dxil).expect("dxil validate");
+        let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+        assert!(!dis.contains("64-bit integers"), "64-bit integer compares should not require Int64Ops:\n{dis}");
+        let body = dis.split("define void @main()").nth(1).unwrap_or(&dis).split("\n}\n").next().unwrap_or(&dis);
+        assert!(!body.contains(" i64 "), "64-bit integer compares should not emit i64 ops in @main:\n{body}");
+
+        let hlsl = recomp::translate(&code, &recomp::Options::default()).expect("hlsl translate");
+        assert!(hlsl.complete(), "hlsl unsupported: {:?}", hlsl.unsupported);
+        let main = hlsl.hlsl.split("void main(").nth(1).unwrap_or(&hlsl.hlsl);
+        assert!(!main.contains("uint64_t") && !main.contains("int64_t"), "HLSL 64-bit compares should not use 64-bit types:\n{main}");
+    }
+
+    /// `v_mad_u64_u32` carry and `s_addc_u32`/`s_subb_u32`/`s_lshl1_add_u32` carry/borrow
+    /// also avoid `icmp i64` in Direct DXIL.
+    #[test]
+    fn carry_ops_avoid_i64_icmp() {
+        const V: u64 = 256;
+        let code = asm(&[
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 1)]),
+            ("S_SUBB_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 1)]),
+            ("S_LSHL1_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 3), ("SSRC1", 1)]),
+            ("V_MAD_U64_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 106), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        ]);
+        let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
+        validate::validate(&dxil).expect("dxil validate");
+        let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+        assert!(!dis.lines().any(|l| l.contains("icmp ") && l.contains(" i64 ")), "found i64 icmp in carry ops:\n{dis}");
     }
 }

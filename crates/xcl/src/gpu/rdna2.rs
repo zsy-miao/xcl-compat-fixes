@@ -304,11 +304,14 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
         // SDWA / DPP: the real src0 lives in the extension dword
         let ext = *d.words.get(1)?;
         let v = (ext & 0xff) as u64;
-        return Some(if d.variant == Variant::Sdwa && ext >> 23 & 1 == 1 {
-            scalar_operand(v, o.size, None)
+        return Some(if d.variant == Variant::Sdwa {
+            sdwa_source(v, o.size, ext >> 16)
         } else {
             reg_range("v", v, o.size)
         });
+    }
+    if f == "VSRC1" && d.variant == Variant::Sdwa {
+        return Some(sdwa_source(field_value(d.enc, &d.words, f)?, o.size, *d.words.get(1)? >> 24));
     }
     let v = field_value(d.enc, &d.words, f)? * register_scale(f);
     let width = d.enc.field_width(f);
@@ -345,6 +348,50 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
         }
         _ => scalar_operand(v, o.size, d.literal),
     })
+}
+
+/// An SDWA source: a VGPR, or a scalar operand when its S bit is set, inside the modifiers of
+/// its byte of the extension dword (`m`: SEL in bits 0-2, SEXT 3, NEG 4, ABS 5, S 7), written
+/// as LLVM writes them.
+fn sdwa_source(v: u64, size: u16, m: u32) -> String {
+    let mut s = if m >> 7 & 1 == 1 { scalar_operand(v, size, None) } else { reg_range("v", v, size) };
+    if m >> 5 & 1 == 1 {
+        s = format!("|{s}|");
+    }
+    if m >> 4 & 1 == 1 {
+        s.insert(0, '-');
+    }
+    if m >> 3 & 1 == 1 {
+        s = format!("sext({s})");
+    }
+    s
+}
+
+/// What the SDWA extension dword adds after the operands, in LLVM's words and order: `clamp`,
+/// the output modifier and the destination's part (VOP1 / VOP2), then the part each source is
+/// read from. A compare keeps a destination there instead (`sdwa_compare_destination`).
+fn sdwa_modifiers(d: &Decoded, s: &mut String) {
+    const SEL: [&str; 7] = ["BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD"];
+    const UNUSED: [&str; 3] = ["UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"];
+    let Some(&ext) = d.words.get(1) else { return };
+    let named = |names: &[&str], v: u32| names.get(v as usize).map_or_else(|| v.to_string(), |n| n.to_string());
+    if d.enc.name != "ENC_VOPC" {
+        if ext >> 13 & 1 == 1 {
+            s.push_str(" clamp");
+        }
+        s.push_str(["", " mul:2", " mul:4", " div:2"][(ext >> 14 & 3) as usize]);
+        let _ = write!(s, " dst_sel:{} dst_unused:{}", named(&SEL, ext >> 8 & 7), named(&UNUSED, ext >> 11 & 3));
+    }
+    let _ = write!(s, " src0_sel:{}", named(&SEL, ext >> 16 & 7));
+    if d.enc.name != "ENC_VOP1" {
+        let _ = write!(s, " src1_sel:{}", named(&SEL, ext >> 24 & 7));
+    }
+}
+
+/// The SGPR an SDWA compare writes instead of VCC (SD set; SDST in bits 8-14 of the dword).
+fn sdwa_compare_destination(d: &Decoded) -> Option<String> {
+    let ext = *d.words.get(1)?;
+    (d.variant == Variant::Sdwa && d.enc.name == "ENC_VOPC" && ext >> 15 & 1 == 1).then(|| scalar_operand((ext >> 8 & 0x7f) as u64, 32, None))
 }
 
 /// Fields that hold a scalar register number in units of several SGPRs: SMEM SBASE is
@@ -518,6 +565,8 @@ fn scalar_int(d: &Decoded, code: u64) -> Option<u32> {
 /// (`far_target`), so it is an unconditional branch like `s_branch` to everything that
 /// follows the control flow. Any other `s_setpc_b64` stays an indirect jump.
 pub fn resolve_far_jumps(insts: &mut [Decoded]) {
+    let mut targets: std::collections::BTreeSet<u64> = insts.iter().filter_map(branch_target).collect();
+    let mut resolved = Vec::new();
     for k in 3..insts.len() {
         let [get, lo, hi, set] = &insts[k - 3..=k] else { continue };
         if get.inst.name != "S_GETPC_B64" || set.inst.name != "S_SETPC_B64" {
@@ -547,8 +596,90 @@ pub fn resolve_far_jumps(insts: &mut [Decoded]) {
         let (Some(l), Some(h)) = (half(lo, r), half(hi, r + 1)) else { continue };
         let offset = (h as u64) << 32 | l as u64;
         let base = get.pc + get.len as u64;
-        insts[k].far_target = Some(if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) });
+        let target = if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) };
+        targets.insert(target);
+        resolved.push((k, target));
     }
+    // Every entry must execute GETPC before using its value. Include targets of all
+    // candidate far jumps before checking, so forward edges into later sequences count.
+    for (k, target) in resolved {
+        if !insts[k - 2..=k].iter().any(|d| targets.contains(&d.pc)) {
+            insts[k].far_target = Some(target);
+        }
+    }
+}
+
+/// The address dwords an image instruction reads, as LLVM counts them (`getAddrSizeMIMGOp`):
+/// one each for an offset, a bias and a compare value, the dimension's coordinates and a
+/// LOD / LOD clamp / mip level (two to a dword with A16), and the gradients (two to a dword
+/// in the `_g16` forms). The ray queries take a fixed 11 / 12 (8 / 9 with A16).
+fn mimg_address_dwords(name: &str, dim: usize, a16: bool) -> u64 {
+    // SQ_RSRC_IMG_*: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
+    const COORDS: [u64; 8] = [1, 2, 3, 3, 2, 3, 3, 4];
+    const GRADIENTS: [u64; 8] = [2, 4, 6, 4, 2, 4, 0, 0];
+    if name.contains("BVH") {
+        return if name.contains("BVH64") { 12 } else { 11 } - if a16 { 3 } else { 0 };
+    }
+    if name == "IMAGE_GET_RESINFO" {
+        return 1;
+    }
+    let has = |t: &str| name.split('_').any(|x| x == t);
+    let components = COORDS[dim] + (has("MIP") || has("CL") || has("L")) as u64;
+    let mut n = ["O", "B", "C"].iter().filter(|t| has(t)).count() as u64 + if a16 { components.div_ceil(2) } else { components };
+    if has("D") || has("CD") {
+        n += if has("G16") { (GRADIENTS[dim] / 2).next_multiple_of(2) } else { GRADIENTS[dim] };
+    }
+    n
+}
+
+/// An image instruction as LLVM writes it: the data registers DMASK selects (four for a
+/// gather; halved by D16, one more with TFE), the address registers the opcode and the
+/// dimension take (`mimg_address_dwords`; a list when NSA dwords name them one by one), the
+/// resource and the sampler, then `dmask`, `dim` and the flags (a ray query: `a16` alone).
+fn mimg_text(d: &Decoded) -> String {
+    const DIM: [&str; 8] = ["1D", "2D", "3D", "CUBE", "1D_ARRAY", "2D_ARRAY", "2D_MSAA", "2D_MSAA_ARRAY"];
+    let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (name, bvh) = (d.inst.name, d.inst.name.contains("BVH"));
+    let (dmask, dim) = (f("DMASK"), f("DIM") as usize);
+    let data = if bvh {
+        4
+    } else {
+        // a compare-and-swap has the value to compare with after the one to store: two at least
+        let least = if name.contains("CMPSWAP") { 2 } else { 1 };
+        let n = if name.starts_with("IMAGE_GATHER") { 4 } else { (dmask.count_ones() as u64).max(least) };
+        (if f("D16") == 1 { n.div_ceil(2) } else { n }) + f("TFE")
+    };
+    let addr = mimg_address_dwords(name, dim, f("A16") == 1);
+    let ops: Vec<String> = d
+        .ienc
+        .operands
+        .iter()
+        .filter_map(|o| match o.field {
+            Some("VDATA") => Some(reg_range("v", f("VDATA"), 32 * data as u16)),
+            Some("VADDR") if f("NSA") == 0 => Some(reg_range("v", f("VADDR"), 32 * addr as u16)),
+            // the first address register, then one a byte of the NSA dwords
+            Some("VADDR") => {
+                let more = d.words[2..].iter().flat_map(|w| w.to_le_bytes()).take(addr as usize - 1);
+                let list: Vec<String> = std::iter::once(f("VADDR") as u8).chain(more).map(|v| format!("v{v}")).collect();
+                Some(format!("[{}]", list.join(", ")))
+            }
+            _ => operand_text(d, o),
+        })
+        .collect();
+    let mut s = format!("{} {}", mnemonic(d), ops.join(", "));
+    if !bvh {
+        if dmask != 0 {
+            let _ = write!(s, " dmask:{dmask:#x}");
+        }
+        let _ = write!(s, " dim:SQ_RSRC_IMG_{}", DIM[dim]);
+    }
+    for (field, label) in [("UNORM", "unorm"), ("GLC", "glc"), ("SLC", "slc"), ("DLC", "dlc"), ("R128", "r128"), ("A16", "a16"), ("TFE", "tfe"), ("LWE", "lwe"), ("D16", "d16")] {
+        // a ray query has its DMASK, UNORM and R128 set, and no name for them
+        if f(field) == 1 && !(bvh && matches!(field, "UNORM" | "R128")) {
+            let _ = write!(s, " {label}");
+        }
+    }
+    s
 }
 
 pub fn mnemonic(d: &Decoded) -> String {
@@ -563,8 +694,11 @@ pub fn mnemonic(d: &Decoded) -> String {
 }
 
 pub fn format(d: &Decoded) -> String {
+    if d.enc.name == "ENC_MIMG" {
+        return mimg_text(d);
+    }
     let mut s = mnemonic(d);
-    let ops: Vec<String> = d.ienc.operands.iter().filter_map(|o| operand_text(d, o)).collect();
+    let ops: Vec<String> = sdwa_compare_destination(d).into_iter().chain(d.ienc.operands.iter().filter_map(|o| operand_text(d, o))).collect();
     if !ops.is_empty() {
         s.push(' ');
         s.push_str(&ops.join(", "));
@@ -578,10 +712,30 @@ pub fn format(d: &Decoded) -> String {
             let _ = write!(s, " ; lit {lit:#010x}");
         }
     }
+    if d.variant == Variant::Sdwa {
+        sdwa_modifiers(d, &mut s);
+    }
     match d.enc.name {
-        "ENC_SMEM" => {
-            if let Some(off) = field_value(d.enc, &d.words, "OFFSET") {
-                let _ = write!(s, ", {off:#x}");
+        // `s_load_dword s5, s[2:3], 0x64` (immediate offset), or `s0 offset:0x12345` (SGPR offset,
+        // then the immediate when not 0), then glc / dlc. Instructions with no offset operand
+        // (s_memtime, s_dcache_inv) print neither.
+        "ENC_SMEM" if d.ienc.operands.iter().any(|o| o.field == Some("SOFFSET")) => {
+            let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+            let off = f("OFFSET");
+            if f("SOFFSET") == 125 {
+                // SOFFSET = null: the immediate is the offset (`null` when it is 0 as well)
+                if off != 0 {
+                    let _ = write!(s, ", {off:#x}");
+                } else {
+                    s.push_str(", null");
+                }
+            } else if off != 0 {
+                let _ = write!(s, " offset:{off:#x}");
+            }
+            for (n, label) in [("GLC", "glc"), ("DLC", "dlc")] {
+                if f(n) == 1 {
+                    let _ = write!(s, " {label}");
+                }
             }
         }
         "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
@@ -683,6 +837,54 @@ mod tests {
     }
 
     #[test]
+    fn image_operands_and_modifiers() {
+        // llvm-mc 21.1.8 (-mcpu=gfx1030) gives these lines for the words
+        for (words, text) in [
+            (&[0xf200_3f88u32, 0x0018_1008][..], "image_load v[16:19], v[8:9], s[96:103] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc slc dlc"),
+            (&[0xf003_bf08, 0xc018_1008], "image_load v[16:18], v8, s[96:103] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc r128 a16 tfe lwe d16"),
+            (&[0xf080_0008, 0x0325_1008], "image_sample v16, v[8:9], s[20:27], s[100:103] dim:SQ_RSRC_IMG_2D"),
+            (&[0xf038_0f08, 0x0018_1008], "image_get_resinfo v[16:19], v8, s[96:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            (&[0xf180_0f08, 0x0325_1008], "image_get_lod v[16:19], v[8:9], s[20:27], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            (&[0xf088_0f10, 0x0325_1008], "image_sample_d v[16:19], v[8:16], s[20:27], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            // the address registers of an NSA form, one a byte
+            (&[0xf088_0f02, 0x0018_1008, 0x0000_0a09], "image_sample_d v[16:19], [v8, v9, v10], s[96:103], s[0:3] dmask:0xf dim:SQ_RSRC_IMG_1D"),
+        ] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(dis(&bytes), text);
+        }
+    }
+
+    /// Every image instruction of LLVM's gfx10 tests reads as LLVM writes it: data and address
+    /// registers, resource, sampler, `dmask`, `dim` and the flags.
+    #[test]
+    fn llvm_gfx10_image_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut nsa, mut wrong) = (0usize, 0usize, Vec::new());
+        let mut names = std::collections::HashSet::new();
+        for file in ["gfx10_mimg.txt", "gfx1030_new.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                if !asm.starts_with("image_") {
+                    continue;
+                }
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let d = decode(&bytes, 0).unwrap();
+                assert_eq!((d.enc.name, d.len), ("ENC_MIMG", bytes.len()), "{line}");
+                let got = format(&d);
+                total += 1;
+                nsa += (bytes.len() > 8) as usize;
+                names.insert(d.inst.name);
+                if got != asm {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total > 250 && nsa > 60 && names.len() > 100, "the image tests are not all there: {total} lines, {nsa} with NSA dwords, {} instructions", names.len());
+        assert!(wrong.is_empty(), "{} of {total} image lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
     fn vgpr_in_nine_bit_field() {
         // v_readfirstlane_b32 s5, v1 (LLVM gfx10_vop1.txt): SRC0 = 257 is v1, not "v257"
         assert_eq!(dis(&[0x01, 0x05, 0x0a, 0x7e]), "v_readfirstlane_b32 s5, v1");
@@ -693,6 +895,32 @@ mod tests {
         // SBASE counts SGPR pairs, SRSRC SGPR quads (seen in retail code)
         assert_eq!(dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]), "s_load_dwordx4 s[8:11], s[16:17], 0x920");
         assert_eq!(dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]), "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40");
+    }
+
+    /// Every SMEM line of LLVM's gfx10 tests: SGPR / immediate offset, glc, dlc.
+    #[test]
+    fn smem_text_matches_llvm() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu/gfx10_smem.txt");
+        let (mut n, mut skipped, mut bad) = (0, 0, Vec::new());
+        for line in std::fs::read_to_string(p).unwrap().lines() {
+            let Some((_, rest)) = line.strip_prefix('#').and_then(|r| r.split_once(':')) else { continue };
+            let Some((asm, enc)) = rest.split_once("; encoding: [") else { continue };
+            let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+            let want = asm.split_whitespace().collect::<Vec<_>>().join(" ");
+            n += 1;
+            let Ok(d) = decode(&bytes, 0) else {
+                skipped += 1; // not in RDNA2 (LLVM's gfx10 tests also cover instructions RDNA2 removed)
+                continue;
+            };
+            let got = format(&d);
+            if got != want {
+                bad.push(format!("{want} <- {got}"));
+            }
+        }
+        assert!(n - skipped > 150, "only {} SMEM lines decoded of {n}", n - skipped);
+        assert!(bad.is_empty(), "{} of {n} SMEM lines differ: {:?}", bad.len(), &bad[..bad.len().min(25)]);
+        // the word from issue #664
+        assert_eq!(dis(&[0x62, 0xdf, 0x0f, 0xf4, 0xa7, 0x50, 0xcf, 0xd4]), "s_load_dwordx8 null, s[68:69], vcc_lo offset:0xf50a7 glc dlc");
     }
 
     #[test]
@@ -720,11 +948,35 @@ mod tests {
     #[test]
     fn sdwa_and_dpp_src0() {
         // v_mov_b32_sdwa v1, v2 (SDWA dword: src0 = v2)
-        assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x06, 0x00]), "v_mov_b32_sdwa v1, v2");
+        assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x06, 0x00]), "v_mov_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD");
         // same with S0 set: src0 = s2
-        assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x86, 0x00]), "v_mov_b32_sdwa v1, s2");
+        assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x86, 0x00]), "v_mov_b32_sdwa v1, s2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD");
         // v_mov_b32_dpp v1, v3
         assert_eq!(dis(&[0xfa, 0x02, 0x02, 0x7e, 0x03, 0x1b, 0x00, 0xff]), "v_mov_b32_dpp v1, v3");
+    }
+
+    #[test]
+    fn sdwa_modifiers_and_scalar_sources() {
+        // the words LLVM's disassembler (llvm-mc 21.1.8, -mcpu=gfx1030) gives these lines for,
+        // less the implicit vcc_lo it writes for a compare without an SDST and for a carry
+        for (words, text) in [
+            ([0x7e0a_0af9u32, 0x0006_4601], "v_cvt_f32_i32_sdwa v5, v1 mul:2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"),
+            ([0x7e0a_a8f9, 0x0004_0601], "v_rcp_f16_sdwa v5, v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0"),
+            ([0x340a_04f9, 0x868e_0601], "v_lshlrev_b32_sdwa v5, sext(s1), s2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+            ([0x340a_04f9, 0x0686_06f2], "v_lshlrev_b32_sdwa v5, 1.0, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+            ([0x060a_04f9, 0x3636_0601], "v_add_f32_sdwa v5, -|v1|, -|v2| dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+            ([0x060a_04f9, 0x0606_c601], "v_add_f32_sdwa v5, v1, v2 div:2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+            ([0x060a_04f9, 0x0206_3001], "v_add_f32_sdwa v5, v1, v2 clamp dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:BYTE_2"),
+            ([0x500a_04f9, 0x0606_0601], "v_add_co_ci_u32_sdwa v5, v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+            // a compare has no destination part: an SGPR to write instead of VCC (SD), or nothing
+            ([0x7c02_04f9, 0x0606_8501], "v_cmp_lt_f32_sdwa s5, v1, v2 src0_sel:DWORD src1_sel:DWORD"),
+            ([0x7c02_04f9, 0x9636_0001], "v_cmp_lt_f32_sdwa -|v1|, -s2 src0_sel:DWORD src1_sel:DWORD"),
+            ([0x7c02_04f9, 0x8686_ff6a], "v_cmp_lt_f32_sdwa exec_hi, vcc_lo, s2 src0_sel:DWORD src1_sel:DWORD"),
+            ([0x7c22_04f9, 0x0606_0001], "v_cmpx_lt_f32_sdwa v1, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(dis(&bytes), text);
+        }
     }
 
     #[test]
@@ -746,6 +998,64 @@ mod tests {
     fn truncated_and_unknown() {
         assert_eq!(decode(&[0x01, 0x02], 0).err(), Some(DecodeError::Truncated));
         assert_eq!(decode(&[0xff, 0x03, 0x80, 0xbe], 0).err(), Some(DecodeError::Truncated));
+    }
+
+    fn far_jump_sequence(pc: u64, subtract: bool) -> Vec<Decoded> {
+        let names = if subtract { ["S_SUB_U32", "S_SUBB_U32"] } else { ["S_ADD_U32", "S_ADDC_U32"] };
+        let mut out = Vec::new();
+        let mut pc = pc;
+        for (name, enc, fields) in [
+            ("S_GETPC_B64", "ENC_SOP1", vec![("SDST", 0)]),
+            (names[0], "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 0), ("SSRC1", 144)]),
+            (names[1], "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)]),
+            ("S_SETPC_B64", "ENC_SOP1", vec![("SSRC0", 0)]),
+        ] {
+            let bytes = encode(name, enc, &fields, None).unwrap();
+            let d = decode(&bytes, pc).unwrap();
+            pc += d.len as u64;
+            out.push(d);
+        }
+        out
+    }
+
+    #[test]
+    fn far_jumps_keep_uninterrupted_add_and_subtract_sequences() {
+        for subtract in [false, true] {
+            let mut insts = far_jump_sequence(0x100, subtract);
+            resolve_far_jumps(&mut insts);
+            assert_eq!(branch_target(&insts[3]), Some(if subtract { 0xf4 } else { 0x114 }));
+        }
+    }
+
+    #[test]
+    fn far_jumps_with_an_entry_into_the_sequence_stay_indirect() {
+        for subtract in [false, true] {
+            for entry in 1..=3 {
+                let mut insts = far_jump_sequence(4, subtract);
+                let target = insts[entry].pc;
+                let bytes = encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", (target - 4) / 4)], None).unwrap();
+                insts.insert(0, decode(&bytes, 0).unwrap());
+                resolve_far_jumps(&mut insts);
+                assert_eq!(branch_target(insts.last().unwrap()), None,
+                           "entry at {target:#x}, subtract={subtract}");
+            }
+        }
+        // A branch to GETPC executes the whole sequence and still has a fixed target.
+        let bytes = encode("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap();
+        let mut insts = vec![decode(&bytes, 0).unwrap()];
+        insts.extend(far_jump_sequence(4, false));
+        resolve_far_jumps(&mut insts);
+        assert_eq!(branch_target(insts.last().unwrap()), Some(24));
+    }
+
+    #[test]
+    fn far_jumps_check_incoming_far_targets_before_resolving() {
+        // The first jump's target is +20, the low add of the second sequence.
+        let mut insts = far_jump_sequence(0, false);
+        insts.extend(far_jump_sequence(16, false));
+        resolve_far_jumps(&mut insts);
+        assert_eq!(branch_target(&insts[3]), Some(20));
+        assert_eq!(branch_target(&insts[7]), None);
     }
 
     /// Normalise an LLVM mnemonic to the AMD spec name (lower case, no encoding suffix).
@@ -844,5 +1154,45 @@ mod tests {
         assert!(unexpected.is_empty(), "instructions RDNA2 should know but failed to decode: {unexpected:?}");
         assert_eq!(len_ok, decoded, "instruction length mismatches: {worst:?}");
         assert_eq!(name_ok, decoded, "mnemonic mismatches: {worst:?}");
+    }
+
+    /// Every line of LLVM's gfx10 SDWA tests reads as LLVM writes it: the sources with their
+    /// modifiers, and the modifiers after them. Not compared: the carry LLVM names twice in
+    /// `v_*_co_ci_u32` and the mask of `v_cndmask_b32` (`vcc` / `vcc_lo`, implicit here as in the
+    /// plain forms).
+    #[test]
+    fn llvm_gfx10_sdwa_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut modified, mut wrong) = (0usize, 0usize, Vec::new());
+        for file in ["gfx10_vop1_sdwa.txt", "gfx10_vop2_sdwa.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let Some((mnemonic, rest)) = asm.trim().split_once(' ') else { continue };
+                // the operands end where the first modifier starts: no operand has a ':' or is "clamp"
+                let at = rest.split(' ').position(|w| w == "clamp" || w.contains(':')).unwrap();
+                let words: Vec<&str> = rest.split(' ').collect();
+                let operands = words[..at].join(" ");
+                let mut operands: Vec<&str> = operands.split(", ").collect();
+                if mnemonic.contains("_co_ci_") {
+                    assert!(matches!(operands.remove(1), "vcc" | "vcc_lo"), "{line}");
+                }
+                if mnemonic.contains("_co_ci_") || mnemonic.starts_with("v_cndmask") {
+                    assert!(matches!(operands.pop(), Some("vcc" | "vcc_lo")), "{line}");
+                }
+                let want = format!("{mnemonic} {} {}", operands.join(", "), words[at..].join(" "));
+                let d = decode(&bytes, 0).unwrap();
+                assert_eq!((d.variant, d.len), (Variant::Sdwa, bytes.len()), "{line}");
+                let got = format(&d);
+                let renamed = got.split_once(' ').is_some_and(|(m, r)| renamed_in_rdna2(mnemonic.trim_end_matches("_sdwa"), m.trim_end_matches("_sdwa")) && want.ends_with(r));
+                total += 1;
+                modified += (want.contains(['-', '|', '(']) || want.contains(" clamp ")) as usize;
+                if got != want && !renamed {
+                    wrong.push(format!("{got}  (LLVM: {})", asm.trim()));
+                }
+            }
+        }
+        assert!(total > 2500 && modified > 250, "the SDWA tests are not all there: {total} lines, {modified} with source or output modifiers");
+        assert!(wrong.is_empty(), "{} of {total} SDWA lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 }

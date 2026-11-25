@@ -17,6 +17,8 @@ pub enum Term {
 }
 
 pub struct CfgBlock {
+    /// byte offset of the block's first instruction
+    pub pc: u64,
     /// instruction indices (the terminating branch excluded for `Cond`/`Jump` by branch)
     pub insts: Vec<usize>,
     pub term: Term,
@@ -38,6 +40,16 @@ fn is_end(name: &str) -> bool {
 
 impl Cfg {
     pub fn build(code: &[u8]) -> Result<Cfg, String> {
+        Self::build_with(code, None)
+    }
+
+    /// Geometry mode: the ES's `s_setpc_b64` continues at `gs_start` (the GS code) when
+    /// that is past the start, else ends the program (`recomp::Mode::Geometry`).
+    pub fn build_geometry(code: &[u8], gs_start: Option<u64>) -> Result<Cfg, String> {
+        Self::build_with(code, Some(gs_start.filter(|&s| s > 0)))
+    }
+
+    fn build_with(code: &[u8], setpc: Option<Option<u64>>) -> Result<Cfg, String> {
         let mut insts: Vec<Decoded> = Vec::new();
         let mut off = 0usize;
         while off + 4 <= code.len() {
@@ -48,7 +60,19 @@ impl Cfg {
         rdna2::resolve_far_jumps(&mut insts);
         let index: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
         let mut leaders: BTreeSet<usize> = BTreeSet::from([0]);
+        let is_setpc = |d: &Decoded| setpc.is_some() && d.inst.name == "S_SETPC_B64" && d.far_target.is_none();
+        let setpc_target = match setpc {
+            Some(Some(t)) => Some(*index.get(&t).ok_or_else(|| format!("GS start {t:#x} is not the start of an instruction"))?),
+            _ => None,
+        };
+        if let Some(t) = setpc_target {
+            leaders.insert(t);
+        }
         for (i, d) in insts.iter().enumerate() {
+            if is_setpc(d) {
+                leaders.insert(i + 1);
+                continue;
+            }
             if let Some(t) = rdna2::branch_target(d) {
                 let ti = *index.get(&t).ok_or_else(|| format!("+{:#x}: branch to {t:#x}, which is not the start of an instruction", d.pc))?;
                 leaders.insert(ti);
@@ -70,6 +94,13 @@ impl Cfg {
                     term = Term::End;
                     break;
                 }
+                if is_setpc(d) {
+                    term = match setpc_target {
+                        Some(t) => Term::Jump(block_of[&t]),
+                        None => Term::End,
+                    };
+                    break;
+                }
                 if let Some(t) = rdna2::branch_target(d) {
                     let tb = block_of[&index[&t]];
                     let name = d.inst.name;
@@ -86,7 +117,7 @@ impl Cfg {
                 }
                 list.push(i);
             }
-            blocks.push(CfgBlock { insts: list, term, preds: Vec::new() });
+            blocks.push(CfgBlock { pc: insts[s].pc, insts: list, term, preds: Vec::new() });
         }
         // a conditional branch whose both edges meet is a jump
         for b in &mut blocks {
@@ -172,7 +203,7 @@ fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<us
         let mut copy = vec![usize::MAX; n];
         for b in (0..n).filter(|&b| region[b] && b != h) {
             copy[b] = blocks.len();
-            blocks.push(CfgBlock { insts: blocks[b].insts.clone(), term: blocks[b].term.clone(), preds: Vec::new() });
+            blocks.push(CfgBlock { pc: blocks[b].pc, insts: blocks[b].insts.clone(), term: blocks[b].term.clone(), preds: Vec::new() });
         }
         let redirect = |term: &mut Term, to: &dyn Fn(usize) -> usize| match term {
             Term::Jump(x) => *x = to(*x),
@@ -299,7 +330,7 @@ mod tests {
     use super::*;
 
     fn blk(term: Term) -> CfgBlock {
-        CfgBlock { insts: Vec::new(), term, preds: Vec::new() }
+        CfgBlock { pc: 0, insts: Vec::new(), term, preds: Vec::new() }
     }
 
     /// The console's loop entered in the middle (`62b584e061c05fc5`'s shape): 0 → {1 | 3},

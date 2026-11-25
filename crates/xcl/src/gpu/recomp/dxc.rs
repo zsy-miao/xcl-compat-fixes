@@ -258,6 +258,23 @@ mod version_tests {
         assert_eq!(lib(0, 0, "10.0.1.2").to_string(), "(file 10.0.1.2)");
     }
 
+    #[test]
+    fn a_source_compiled_at_o0_has_no_debug_noops() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let src = "RWByteAddressBuffer m : register(u0);\n[numthreads(1, 1, 1)] void main() { uint a = m.Load(0); uint b = a + 1u; m.Store(4, b); }\n";
+        let padded = format!("{src}{}", " ".repeat(8 * 1024 * 1024));
+        let with_noops = compile(src, "main", "cs_6_6", &["-O0"]).unwrap();
+        let without = compile(src, "main", "cs_6_6", &["-O0", "-opt-disable", "debug-nops"]).unwrap();
+        if without.len() == with_noops.len() {
+            println!("this DXC has no debug-nops switch");
+            return;
+        }
+        assert_eq!(compile(&padded, "main", "cs_6_6", &[]).unwrap().len(), without.len());
+    }
+
     /// The DXC of this PC, when it has one: what `report.json` says of it.
     #[test]
     fn the_loaded_dxc_is_identified() {
@@ -527,7 +544,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
         if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
+            args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
         }

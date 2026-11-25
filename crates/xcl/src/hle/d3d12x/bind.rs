@@ -287,7 +287,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -300,7 +300,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -310,6 +310,65 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
     }
+}
+
+/// XCL's own buffer for `fresh_indirect_arguments` (device, buffer): COMMON between its uses
+static ARGUMENT_ORDER: Mutex<Option<(usize, ID3D12Resource)>> = Mutex::new(None);
+
+/// `op` (an ExecuteIndirect on `list`) reading the arguments and count the list wrote before it.
+///
+/// The console orders a dispatch that writes indirect arguments before the ExecuteIndirect that
+/// reads them with a barrier that reaches the PC as a UAV barrier (`list_x::resource_barrier_x`).
+/// NVIDIA's driver (RTX 5090) fetches an ExecuteIndirect's arguments without waiting for that
+/// barrier: it ran the count that was there before the list in all but a few of 100 tries, also
+/// when the dispatch wrote them through another resource over the same memory, as translated
+/// shaders do through the memory window buffers (`execute_indirect_reads_the_arguments_written_before_it`).
+/// A retail title's ExecuteIndirect after the dispatch that writes its group count then runs
+/// whatever count the memory held before. A transition to INDIRECT_ARGUMENT makes the driver
+/// wait for the writes – of any buffer, as measured there. The title's buffer is in the title's
+/// state (its transitions reach the PC list), so a buffer of XCL's own takes it, COMMON ->
+/// INDIRECT_ARGUMENT before and back after. Only on a list XCL made (`list_x::on_create`) and
+/// not a bundle, which cannot hold barriers; its type comes from XCL's state, not a call to it.
+unsafe fn fresh_indirect_arguments(list: *mut c_void, op: impl FnOnce()) {
+    let tracked = super::list_x::tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_BUNDLE);
+    let buffer = if tracked { ID3D12GraphicsCommandList::from_raw_borrowed(&list).and_then(|l| argument_order_buffer(l)) } else { None };
+    let Some(buffer) = buffer else { return op() };
+    let b = buffer.as_raw() as usize;
+    super::list_x::transition(list, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    op();
+    super::list_x::transition(list, b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// The device's buffer for `fresh_indirect_arguments` (made on first use)
+unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D12Resource> {
+    let mut dev: Option<ID3D12Device> = None;
+    list.GetDevice(&mut dev).ok()?;
+    let dev = dev?;
+    let mut g = ARGUMENT_ORDER.lock().unwrap();
+    if let Some((_, b)) = g.as_ref().filter(|(d, _)| *d == dev.as_raw() as usize) {
+        return Some(b.clone());
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 256,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut b: Option<ID3D12Resource> = None;
+    if let Err(e) = dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect: no buffer to order its arguments after the writes before it ({e}) – it may read old ones");
+        }
+        return None;
+    }
+    let b = b?;
+    *g = Some((dev.as_raw() as usize, b.clone()));
+    Some(b)
 }
 
 /// A DrawInstanced of the console's rect list (three corners of each rectangle, the fourth
@@ -989,6 +1048,134 @@ mod tests {
         pso_async::released(built);
         pso_async::released(failed);
         assert!(!pso_async::is_pending(building));
+    }
+
+    /// A dispatch writes an ExecuteIndirect's group count through another buffer over the same
+    /// memory (as translated shaders write through the memory windows), a UAV barrier (what a
+    /// console barrier becomes), then the ExecuteIndirect: it runs the count just written, not
+    /// the one the memory held before the list (`fresh_indirect_arguments`; without it an RTX
+    /// 5090 ran the old count in nearly every try).
+    #[test]
+    fn execute_indirect_reads_the_arguments_written_before_it() {
+        use crate::gpu::{fence, recomp::runner::skip_test};
+        use std::mem::{transmute_copy, ManuallyDrop};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        const TRIES: u32 = 40;
+        // mode 0: write (x, 1, 1) at a[0..12]; mode 1: count the groups
+        let src = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0), UAV(u1)"
+cbuffer C : register(b0) { uint mode; uint x; };
+RWByteAddressBuffer a : register(u0);
+RWByteAddressBuffer c : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint t : SV_GroupIndex) {
+    if (t != 0u) return;
+    if (mode == 0u) a.Store3(0, uint3(x, 1u, 1u)); else c.InterlockedAdd(0, 1u);
+}
+"#;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let cs = D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs), CS: cs, ..Default::default() }).unwrap();
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 }, None, &mut sig).unwrap();
+            let sig = sig.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let desc = |width| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: width,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // the arguments and the buffer the dispatch writes them through: one memory
+            let mut heap: Option<ID3D12Heap> = None;
+            let heap_desc = D3D12_HEAP_DESC { SizeInBytes: 1 << 16, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, Alignment: 0, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS };
+            dev.CreateHeap(&heap_desc, &mut heap).unwrap();
+            let heap = heap.unwrap();
+            let placed = || {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreatePlacedResource(&heap, 0, &desc(1 << 16), D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let (args, written) = (placed(), placed());
+            // the group count, read on the CPU
+            let cpu_heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() };
+            let mut groups: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&cpu_heap, D3D12_HEAP_FLAG_NONE, &desc(256), D3D12_RESOURCE_STATE_COMMON, None, &mut groups).unwrap();
+            let groups = groups.unwrap();
+            let mut count = std::ptr::null_mut();
+            groups.Map(0, None, Some(&mut count)).unwrap();
+            let count = count as *mut u32;
+            let uav_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) },
+            };
+            let run = |list: &ID3D12GraphicsCommandList, close: &dyn Fn()| {
+                close();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let v = done.GetCompletedValue() + 1;
+                queue.Signal(&done, v).unwrap();
+                fence::wait(&done, v, &dev, None, 10_000).unwrap();
+            };
+            let (mut old, mut wrong) = (0u32, Vec::new());
+            for k in 0..TRIES {
+                // each try writes a count the memory does not hold yet
+                let new = if k % 2 == 0 { 4096 } else { 0 };
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+                let record = |x: u32| -> ID3D12GraphicsCommandList {
+                    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pso).unwrap();
+                    list.SetComputeRootSignature(&rs);
+                    list.SetComputeRootUnorderedAccessView(1, written.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(2, groups.GetGPUVirtualAddress());
+                    list.SetComputeRoot32BitConstants(0, 2, [0u32, x].as_ptr() as _, 0);
+                    list.Dispatch(1, 1, 1);
+                    list
+                };
+                let before = record(old);
+                run(&before, &|| before.Close().unwrap());
+                alloc.Reset().unwrap();
+                *count = 0;
+                let list = record(new);
+                list.ResourceBarrier(&[uav_barrier.clone()]);
+                list.SetComputeRoot32BitConstants(0, 2, [1u32, 0].as_ptr() as _, 0);
+                // from here as XCL records a title's ExecuteIndirect: on the adopted list
+                let raw = list.as_raw();
+                real::adopt(raw, real::Kind::CommandList);
+                list_x::on_create(raw, alloc.as_raw() as usize, 0, ty);
+                type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
+                type Close = unsafe extern "system" fn(*mut c_void) -> windows::core::HRESULT;
+                let ei: Ei = std::mem::transmute(real::orig_fn(raw, 59));
+                fresh_indirect_arguments(raw, || ei(raw, sig.as_raw() as usize, 1, args.as_raw() as usize, 0, 0, 0));
+                let close: Close = std::mem::transmute(real::orig_fn(raw, 9));
+                run(&list, &|| close(raw).unwrap());
+                let ran = std::ptr::read_volatile(count);
+                if ran != new {
+                    wrong.push((k, ran));
+                }
+                old = new;
+            }
+            groups.Unmap(0, None);
+            assert!(wrong.is_empty(), "{} of {TRIES} ExecuteIndirects ran another group count than the one written before them (try, groups): {wrong:?}", wrong.len());
+        }
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.

@@ -290,6 +290,11 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
         *out = target as *const Obj as *mut c_void;
         return S_OK;
     }
+    if c == XACCESSIBILITY && mute_tts() {
+        note(c, i, "XAccessibility: XCL (XCL_MUTE_TTS=1 – speech synthesis muted)".into());
+        *out = xcl_xaccessibility_object() as *const Obj as *mut c_void;
+        return S_OK;
+    }
     match pc_object(&c, &i) {
         Some(p) => {
             note(c, i, format!("{}: PC", family(&c)));
@@ -638,8 +643,21 @@ fn xcl_xasync_object() -> &'static Obj {
     })
 }
 
+fn parse_mute_tts(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        let s = v.trim();
+        !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("off") && !s.eq_ignore_ascii_case("false")
+    })
+}
+
+fn mute_tts() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_mute_tts(std::env::var("XCL_MUTE_TTS").ok().as_deref()))
+}
+
 /// Built-in XAccessibility COM object used as a fallback when Gaming Services
-/// (`System32\xgameruntime.dll`) is not installed on the host.
+/// (`System32\xgameruntime.dll`) is not installed on the host, or when `XCL_MUTE_TTS=1`
+/// silences Windows speech synthesis.
 fn xcl_xaccessibility_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
@@ -2053,5 +2071,17 @@ mod tests {
             assert_eq!(hr, S_OK);
             assert!(!queried.is_null());
         }
+    }
+
+    #[test]
+    fn parse_mute_tts_values() {
+        assert!(!parse_mute_tts(None));
+        assert!(!parse_mute_tts(Some("")));
+        assert!(!parse_mute_tts(Some("0")));
+        assert!(!parse_mute_tts(Some("off")));
+        assert!(!parse_mute_tts(Some("false")));
+        assert!(parse_mute_tts(Some("1")));
+        assert!(parse_mute_tts(Some("true")));
+        assert!(parse_mute_tts(Some("yes")));
     }
 }

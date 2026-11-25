@@ -1035,6 +1035,25 @@ fn uav_array_3d_stores_loads_and_texture_atomics_run() {
     assert_eq!(vol, (0..32).map(|i| i as f32).collect::<Vec<_>>());
 }
 
+fn native_16bit_supported() -> bool {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
+        let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+        let a: Option<IDXGIAdapter1> = if sel == crate::gpu::adapter::Selector::Warp {
+            factory.EnumWarpAdapter().ok()
+        } else {
+            crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().map(|(a, _)| a)
+        };
+        let Some(a) = a else { return false };
+        let Ok(dev) = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0) else { return false };
+        let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &mut o4 as *mut _ as _, std::mem::size_of_val(&o4) as u32).is_ok()
+            && o4.Native16BitShaderOpsSupported.as_bool()
+    }
+}
+
 #[test]
 fn half_precision_overloads_run() {
     // Native 16-bit floats (SM 6.2+ `-enable-16bit-types`).
@@ -1063,9 +1082,18 @@ fn half_precision_overloads_run() {
     }
     k.out(5, nan);
     let c = k.finish([32, 1, 1]);
+    match runner::wave32_supported() {
+        Ok(true) => {}
+        Ok(false) => return runner::skip_test("no wave32"),
+        Err(e) => return runner::skip_test(&e),
+    }
+    if !native_16bit_supported() {
+        runner::skip_test("no native 16-bit ops");
+        return;
+    }
     let xs: Vec<f32> = (0..32).map(|l| l as f32 * 0.75 - 9.0).collect();
     let ys: Vec<f32> = (0..32).map(|l| 5.0 - l as f32 * 0.5).collect();
-    let Some(r) = gpu(&c, &mem_of(&[xs.iter().map(|f| f.to_bits()).collect(), ys.iter().map(|f| f.to_bits()).collect()]), &[], &[]) else { return };
+    let r = runner::run_with(&c, &runner::KernelState::default(), &mem_of(&[xs.iter().map(|f| f.to_bits()).collect(), ys.iter().map(|f| f.to_bits()).collect()]), &[], &[]).expect("GPU run");
     let xmax = xs.iter().fold(f32::MIN, |m, &x| m.max(x));
     for l in 0..32 {
         let (x, y) = (xs[l], ys[l]); // all exactly representable in f16

@@ -241,6 +241,15 @@ impl Config {
         self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
     }
 
+    /// Normalize and apply a `XCL_DEVICE_TYPE` override ("anaconda"/"series x"/"xsx"/"x" or
+    /// "lockhart"/"series s"/"xss"/"s") in memory without modifying `xcl.toml`.
+    /// Returns the canonical device type name when applied.
+    pub fn apply_device_type_override(&mut self, raw: &str) -> Option<&'static str> {
+        let canonical = parse_device_type(raw)?;
+        self.device_type = canonical.into();
+        Some(canonical)
+    }
+
     /// Configured `D3D12_RAYTRACING_TIER` override for `CheckFeatureSupport(D3D12_OPTIONS5)`:
     /// `None` keeps the host GPU tier ("auto"), `Some(0 / 10 / 11)` forces NOT_SUPPORTED /
     /// TIER_1_0 / TIER_1_1. `XCL_RAYTRACING` overrides `xcl.toml`.
@@ -248,6 +257,14 @@ impl Config {
         let env = std::env::var("XCL_RAYTRACING").ok();
         let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
         parse_raytracing_tier(mode)
+    }
+}
+
+pub fn parse_device_type(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "lockhart" | "series s" | "series_s" | "xss" | "s" => Some("lockhart"),
+        "anaconda" | "series x" | "series_x" | "xsx" | "x" => Some("anaconda"),
+        _ => None,
     }
 }
 
@@ -375,6 +392,34 @@ mod tests {
             let mut c = Config { title_memory: setting.into(), ..Config::default() };
             c.resolve(m);
             assert_eq!((c.title_memory.as_str(), c.uma_mb), ("advanced", 4095), "{setting}");
+        }
+    }
+
+    #[test]
+    fn device_type_override_cascades_into_resolve() {
+        let manifest = crate::manifest::Manifest {
+            anaconda_memory: Some("Advanced".into()),
+            lockhart_memory: Some("Standard".into()),
+            ..Default::default()
+        };
+        let mut c = Config::default();
+        assert_eq!(c.apply_device_type_override("lockhart"), Some("lockhart"));
+        assert!(c.is_series_s());
+        c.resolve(Some(&manifest));
+        assert_eq!((c.title_memory.as_str(), c.title_memory_mb, c.uma_mb), ("standard", 8_192, 2048));
+
+        for (raw, expected) in [
+            ("Series S", Some("lockhart")),
+            ("xss", Some("lockhart")),
+            ("S", Some("lockhart")),
+            ("anaconda", Some("anaconda")),
+            ("Series X", Some("anaconda")),
+            ("xsx", Some("anaconda")),
+            ("X", Some("anaconda")),
+            ("unknown", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_device_type(raw), expected, "{raw}");
         }
     }
 

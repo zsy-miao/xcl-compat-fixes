@@ -72,12 +72,48 @@ pub struct Init {
     pub vgpr_base: Option<Value>,
     pub entry: Block,
     pub touched: BTreeSet<u32>,
+    /// the compact form: each register's local variable, and the block that loads them now
+    pub slots: HashMap<u32, Value>,
+    pub mem: Option<Block>,
 }
 
 impl Init {
     pub fn load(&mut self, s: &mut Shader, var: u32) -> Value {
+        let Some(b) = self.mem else { return self.first(s, var) };
+        let p = self.slot(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(true);
+        s.m.set_block(b);
+        let v = s.m.load(p, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        v
+    }
+
+    /// The local variable of `var`, made in the entry block with the register's first value.
+    pub fn slot(&mut self, s: &mut Shader, var: u32) -> Value {
+        if let Some(&p) = self.slots.get(&var) {
+            return p;
+        }
+        let v = self.first(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(false);
+        s.m.set_block(self.entry);
+        let i32 = s.m.i32();
+        let p = s.m.alloca(i32, 4);
+        s.m.store(p, v, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        self.slots.insert(var, p);
+        p
+    }
+
+    fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
+        }
+        if var == super::lower_round::VAR_F32_MODE {
+            return s.m.i32c(super::lower_round::MODE_INIT);
         }
         if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
             return s.m.i32c(0);
@@ -151,6 +187,12 @@ pub struct Lw {
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
+    /// cached decoded format descriptors hoisted to `d3`'s defining block
+    pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
+    /// cached single-component format decode parameters hoisted to `d3`'s defining block
+    pub fmt_comp1_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtComp1>,
+    /// cached `IO_UMA_BASE_HI` loaded once in the entry block for multi-window address math
+    pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
     /// the lane's scratch array (an alloca in the entry block)
@@ -161,6 +203,10 @@ pub struct Lw {
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
+    /// the program writes a non-default MODE[1:0]: rounding f32 instructions round by
+    /// `lower_round::VAR_F32_MODE` (`lower_round`)
+    pub f32_rm: bool,
+    pub track_frexp_denorm: bool,
     pub has_f64_round_op: bool,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
@@ -188,6 +234,8 @@ pub struct Lw {
     pub partner: Partner,
     /// mesh mode: the record slots
     pub mesh: Option<MeshCtx>,
+    /// geometry mode (ES+GS)
+    pub geom: Option<super::lower_geom::GeomCtx>,
     /// VS / PS entry
     pub gfx: Option<super::lower_gfx::GfxCtx>,
     /// a wave32 program in 64-lane hardware: this hardware half is the upper one (i1)
@@ -892,6 +940,12 @@ impl Lw {
         if name == "s_sendmsg" && self.mesh.is_some() {
             return self.mesh_sendmsg(d);
         }
+        if self.geom.is_some() && self.geom_inst(d, &name).is_some() {
+            return Ok(());
+        }
+        if name == "s_denorm_mode" && (self.f32_rm || self.track_frexp_denorm) {
+            return self.denorm_mode(Self::fv(d, "SIMM16") as u32);
+        }
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
         }
@@ -955,7 +1009,10 @@ impl Lw {
             "s_round_mode" => {
                 let simm = Self::fv(d, "SIMM16") as u16;
                 let (sp, dp) = ((simm & 3) as u32, ((simm >> 2) & 3) as u32);
-                if sp != 0 {
+                if self.f32_rm {
+                    let v = self.c(sp);
+                    self.mode_write(v, 3);
+                } else if sp != 0 {
                     return err(d, "non-default f32 round mode");
                 }
                 if dp != 0 && self.has_f64_round_op {
@@ -977,6 +1034,22 @@ impl Lw {
     fn setreg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let simm = Self::fv(d, "SIMM16") as u16;
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
+        if self.f32_rm || self.track_frexp_denorm {
+            // the mirrored MODE bits (single-precision round / denormal modes)
+            let (id, offset, width) = decode_hwreg(simm);
+            if id == 1 {
+                let wmask = (if width == 32 { u32::MAX } else { (1u32 << width) - 1 }) << offset;
+                let src = if name == "s_setreg_imm32_b32" {
+                    let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
+                    self.c(imm)
+                } else {
+                    let sd = Self::field(d, "SDST");
+                    self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?
+                };
+                let v = self.shlc(src, offset);
+                self.mode_write(v, wmask);
+            }
+        }
         if sp_mask == 0 && dp_mask == 0 {
             return Ok(());
         }
@@ -984,7 +1057,7 @@ impl Lw {
             let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
             let sp = hwreg_imm_field(imm, off, 0, sp_mask);
             let dp = hwreg_imm_field(imm, off, 2, dp_mask);
-            if sp != 0 {
+            if sp != 0 && !self.f32_rm {
                 return err(d, "non-default f32 round mode");
             }
             if dp_mask != 0 && dp != 0 && self.has_f64_round_op {
@@ -1002,7 +1075,7 @@ impl Lw {
             }
             return Ok(());
         }
-        if sp_mask != 0 {
+        if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
         if self.has_f64_round_op {
@@ -1011,14 +1084,13 @@ impl Lw {
         if self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
-            let sh = 2 - off;
             let v = match dp_mask {
                 3 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     self.andc(x, 3)
                 }
                 1 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     let bit = self.andc(x, 1);
                     let cur = self.rd(VAR_FP16_RM);
                     let keep = self.andc(cur, 2);
@@ -1345,20 +1417,18 @@ impl Lw {
                 let sc = self.scc();
                 let t0 = self.add(a, b);
                 let t = self.add(t0, sc);
-                let (a6, b6, s6) = (self.zext64(a), self.zext64(b), self.zext64(sc));
-                let x = self.add(a6, b6);
-                let x = self.add(x, s6);
-                let lim = self.c64(0xFFFF_FFFF);
-                let c = self.cmp(Pred::UGt, x, lim);
+                let c0 = self.cmp(Pred::ULt, t0, a);
+                let c1 = self.cmp(Pred::ULt, t, t0);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_subb_u32" => {
                 let sc = self.scc();
                 let t0 = self.sub(a, b);
                 let t = self.sub(t0, sc);
-                let (a6, b6, s6) = (self.zext64(a), self.zext64(b), self.zext64(sc));
-                let x = self.add(b6, s6);
-                let c = self.cmp(Pred::UGt, x, a6);
+                let c0 = self.cmp(Pred::ULt, a, b);
+                let c1 = self.cmp(Pred::ULt, t0, sc);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_add_i32" => {
@@ -1384,15 +1454,13 @@ impl Lw {
             "s_lshr_b32" => (self.lshr(a, b), Scc::Nz),
             "s_ashr_i32" => (self.ashr(a, b), Scc::Nz),
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
-                let k = name.as_bytes()[6] - b'0';
-                let s = self.shlc(a, k as u32);
+                let k = (name.as_bytes()[6] - b'0') as u32;
+                let s = self.shlc(a, k);
                 let t = self.add(s, b);
-                let (a6, b6) = (self.zext64(a), self.zext64(b));
-                let kk = self.c64(k as u64);
-                let x = self.bin(BinOp::Shl, a6, kk);
-                let x = self.add(x, b6);
-                let lim = self.c64(0xFFFF_FFFF);
-                let c = self.cmp(Pred::UGt, x, lim);
+                let hi = self.lshrc(a, 32 - k);
+                let c0 = self.nz(hi);
+                let c1 = self.cmp(Pred::ULt, t, b);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_bfm_b32" => (self.bfm(a, b), Scc::No),
@@ -1939,7 +2007,7 @@ pub fn is_f16_rounded_op(name: &str) -> bool {
         name,
         "v_interp_p2_f16" | "v_cvt_f16_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_fma_f16"
             | "v_pk_fmac_f16" | "v_pk_min_f16" | "v_pk_max_f16" | "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_min_f16"
-            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_fmac_f16"
+            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_div_fixup_f16" | "v_fmac_f16"
             | "v_fmamk_f16" | "v_fmaak_f16" | "v_ldexp_f16" | "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_log_f16" | "v_exp_f16"
             | "v_sin_f16" | "v_cos_f16" | "v_fract_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_cvt_f16_u16"
             | "v_cvt_f16_i16"

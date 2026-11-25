@@ -172,10 +172,14 @@ impl CompType {
 pub enum TexKind {
     D1 = 1,
     D2 = 2,
+    /// `Texture2DMS` (SRV only: writable MSAA UAVs need SM 6.7).
+    D2MS = 3,
     D3 = 4,
     Cube = 5,
     D1Array = 6,
     D2Array = 7,
+    /// `Texture2DMSArray` (SRV only).
+    D2MSArray = 8,
     CubeArray = 9,
 }
 
@@ -184,8 +188,8 @@ impl TexKind {
     pub fn coords(self) -> usize {
         match self {
             TexKind::D1 => 1,
-            TexKind::D2 | TexKind::D1Array => 2,
-            TexKind::D3 | TexKind::D2Array | TexKind::Cube => 3,
+            TexKind::D2 | TexKind::D1Array | TexKind::D2MS => 2,
+            TexKind::D3 | TexKind::D2Array | TexKind::Cube | TexKind::D2MSArray => 3,
             TexKind::CubeArray => 4,
         }
     }
@@ -193,7 +197,7 @@ impl TexKind {
     pub fn offsets(self) -> usize {
         match self {
             TexKind::D1 | TexKind::D1Array => 1,
-            TexKind::D2 | TexKind::D2Array => 2,
+            TexKind::D2 | TexKind::D2Array | TexKind::D2MS | TexKind::D2MSArray => 2,
             TexKind::D3 => 3,
             TexKind::Cube | TexKind::CubeArray => 0,
         }
@@ -202,7 +206,7 @@ impl TexKind {
     pub fn grads(self) -> usize {
         match self {
             TexKind::D1 | TexKind::D1Array => 1,
-            TexKind::D2 | TexKind::D2Array => 2,
+            TexKind::D2 | TexKind::D2Array | TexKind::D2MS | TexKind::D2MSArray => 2,
             TexKind::D3 | TexKind::Cube | TexKind::CubeArray => 3,
         }
     }
@@ -516,7 +520,7 @@ impl Shader {
     /// Declares `RWBuffer<comp>` at `u<lower>, space<space>`.
     pub fn typed_uav(&mut self, lower: u32, space: u32, comp: CompType) -> TypedBuffer {
         let id = self.bindings.len();
-        self.bindings.push(super::shader::Binding { comp_type: comp as u32, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::TYPED_BUFFER) });
+        self.bindings.push(super::shader::Binding { comp_type: comp as u32, rov: self.rov, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::TYPED_BUFFER) });
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         let handle = self.annotate(h, kind::TYPED_BUFFER | 0x1000, typed_props(comp, 1));
         TypedBuffer { handle, comp, binding: Some(id) }
@@ -627,7 +631,7 @@ impl Shader {
     pub fn structured_uav(&mut self, lower: u32, space: u32, stride: u32) -> RawUav {
         self.require(Feature::RawAndStructuredBuffers);
         let id = self.bindings.len();
-        self.bindings.push(super::shader::Binding { stride, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::STRUCTURED_BUFFER) });
+        self.bindings.push(super::shader::Binding { stride, rov: self.rov, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::STRUCTURED_BUFFER) });
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         let handle = self.annotate(h, kind::STRUCTURED_BUFFER | 0x1000, stride);
         RawUav { handle, binding: Some(id) }
@@ -735,6 +739,7 @@ impl Shader {
     /// A texture from `ResourceDescriptorHeap[index]` with `ncomp`
     /// components of `comp` (`Texture2D<float4>` = `(D2, false, F32, 4)`).
     pub fn heap_texture(&mut self, index: Value, kind: TexKind, uav: bool, comp: CompType, ncomp: u32, nonuniform: bool) -> Texture {
+        assert!(!(uav && matches!(kind, TexKind::D2MS | TexKind::D2MSArray)), "RWTexture2DMS needs SM 6.7");
         let h = self.handle_from_heap(index, false, nonuniform);
         let handle = self.annotate(h, kind as u32 | if uav { 0x1000 } else { 0 }, typed_props(comp, ncomp));
         Texture { handle, kind, uav, comp }
@@ -790,6 +795,32 @@ impl Shader {
         args.extend(o);
         let r = self.op(66, "textureLoad", Some(t), rt, &args, FnAttrs::ReadOnly);
         self.ret4(r)
+    }
+    /// `TextureLoad` of sample `sample` of a multisampled texture (`D2MS` /
+    /// `D2MSArray`: the op's `mipLevelOrSampleCount` operand is the sample index).
+    pub fn texture_load_sample(&mut self, tex: Texture, sample: Value, coords: &[Value]) -> [Value; 4] {
+        assert!(matches!(tex.kind, TexKind::D2MS | TexKind::D2MSArray) && !tex.uav, "texture_load_sample: a multisampled SRV");
+        self.texture_load(tex, Some(sample), coords, &[])
+    }
+    /// `Texture2DMSGetSamplePosition` (op 75): the position of sample `index`
+    /// relative to the pixel centre (`{x, y}`; (0, 0) for an invalid index).
+    pub fn texture2dms_sample_position(&mut self, tex: Texture, index: Value) -> [Value; 2] {
+        let f32 = self.m.f32();
+        let st = self.m.named_struct("dx.types.SamplePos", &[f32, f32]);
+        let r = self.op(75, "texture2DMSGetSamplePosition", None, st, &[tex.handle, index], FnAttrs::ReadOnly);
+        [self.m.extract(r, 0), self.m.extract(r, 1)]
+    }
+    /// `RenderTargetGetSamplePosition` (op 76, pixel shaders).
+    pub fn render_target_sample_position(&mut self, index: Value) -> [Value; 2] {
+        let f32 = self.m.f32();
+        let st = self.m.named_struct("dx.types.SamplePos", &[f32, f32]);
+        let r = self.op(76, "renderTargetGetSamplePosition", None, st, &[index], FnAttrs::ReadOnly);
+        [self.m.extract(r, 0), self.m.extract(r, 1)]
+    }
+    /// `RenderTargetGetSampleCount` (op 77, pixel shaders).
+    pub fn render_target_sample_count(&mut self) -> Value {
+        let i32 = self.m.i32();
+        self.op(77, "renderTargetGetSampleCount", None, i32, &[], FnAttrs::ReadOnly)
     }
     /// `TextureLoad` on a UAV loading more than one component needs
     /// `TypedUavLoadAdditionalFormats`; call this to declare it.
@@ -928,6 +959,7 @@ impl Shader {
     /// components the resource kind defines (the validator rejects reads of
     /// undefined ones, e.g. `z` of a `Texture2D`). Buffers: `x` = elements
     /// (raw buffers: bytes). `mip` is `None` for UAVs and buffers.
+    /// Multisampled textures: `mip` `None`, the sample count in `w`.
     pub fn get_dimensions(&mut self, handle: Value, mip: Option<Value>) -> Value {
         let i32 = self.m.i32();
         let st = self.m.named_struct("dx.types.Dimensions", &[i32, i32, i32, i32]);

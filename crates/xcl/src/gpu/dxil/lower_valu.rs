@@ -333,6 +333,9 @@ impl Lw {
     }
 
     pub fn valu(&mut self, d: &Decoded, name: &str) -> LResult<()> {
+        if self.f32_rm && super::lower_round::f32_round_unsupported(name) {
+            return err(d, "directed f32 rounding of this instruction");
+        }
         if name.starts_with("v_interp_") {
             return self.interp_gfx(d, name);
         }
@@ -408,6 +411,13 @@ impl Lw {
                 self.fres(&m, e)
             }};
         }
+        if self.f32_rm {
+            if let Some(e) = self.valu_f32_rm(name, &m, &u, cur)? {
+                let res = self.fres(&m, e);
+                self.vwrite(d, &dst, res);
+                return Ok(());
+            }
+        }
         let res: Value = match name {
             "v_mov_b32" | "v_mov_fed_b32" => a,
             "v_not_b32" => self.not(a),
@@ -456,7 +466,7 @@ impl Lw {
                 } else {
                     x
                 };
-                let h = self.to_f16(x);
+                let h = self.to_f16_rounded(x);
                 if m.opsel >> 3 & 1 == 1 {
                     let l = self.andc(cur, 0xFFFF);
                     let hh = self.shlc(h, 16);
@@ -572,10 +582,7 @@ impl Lw {
                 let x = fs!(0);
                 fr!(self.frexp_mant(x))
             }
-            "v_frexp_exp_i32_f32" => {
-                let x = fs!(0);
-                self.frexp_exp(x)
-            }
+            "v_frexp_exp_i32_f32" => self.frexp_exp_f32(a, |lw| lw.fsrc(&m, 0, a)),
             "v_ldexp_f32" => {
                 let x = fs!(0);
                 fr!(self.ldexp_f(x, b))
@@ -1049,6 +1056,126 @@ impl Lw {
         };
         self.vwrite(d, &dst, res);
         Ok(())
+    }
+
+    /// Source bits with abs / neg applied on the bits (no float operation: denormals stay).
+    fn fsrc_bits(&mut self, m: &Mods, i: usize, u: Value) -> Value {
+        let mut s = u;
+        if m.abs[i] {
+            s = self.andc(s, 0x7FFF_FFFF);
+        }
+        if m.neg[i] {
+            let k = self.c(0x8000_0000);
+            s = self.xor(s, k);
+        }
+        s
+    }
+
+    /// The f32 instructions that round by MODE[1:0] in a program directing f32 rounding
+    /// (`lower_round`): the result as a float before output modifiers, None for the rest.
+    fn valu_f32_rm(&mut self, name: &str, m: &Mods, u: &[Src], cur: Value) -> LResult<Option<Value>> {
+        let z = self.c(0);
+        let raw = |i: usize| u.get(i).map(|s| s.w()).unwrap_or(z);
+        let (a, b, c) = (raw(0), raw(1), raw(2));
+        let ba = self.fsrc_bits(m, 0, a);
+        let bb = self.fsrc_bits(m, 1, b);
+        let bc = self.fsrc_bits(m, 2, c);
+        let (fa, fb, fc) = (self.f(ba), self.f(bb), self.f(bc));
+        let legacy_zero = |lw: &mut Lw, x: Value, y: Value| {
+            let zz = lw.fc(0.0);
+            let xz = lw.fcmp(Pred::FOEq, x, zz);
+            let yz = lw.fcmp(Pred::FOEq, y, zz);
+            lw.lor(xz, yz)
+        };
+        Ok(Some(match name {
+            "v_add_f32" => {
+                let n = self.fadd(fa, fb);
+                self.rm_add(ba, bb, n)
+            }
+            "v_sub_f32" | "v_subrev_f32" => {
+                let (x, y) = if name == "v_sub_f32" { (ba, bb) } else { (bb, ba) };
+                let k = self.c(0x8000_0000);
+                let ny = self.xor(y, k);
+                let (fx, fy) = (self.f(x), self.f(y));
+                let n = self.fsub(fx, fy);
+                self.rm_add(x, ny, n)
+            }
+            "v_mul_f32" => {
+                let n = self.fmul(fa, fb);
+                self.rm_mul(ba, bb, n)
+            }
+            "v_mul_legacy_f32" => {
+                let n = self.fmul(fa, fb);
+                let r = self.rm_mul(ba, bb, n);
+                let lz = legacy_zero(self, fa, fb);
+                let zz = self.fc(0.0);
+                self.sel(lz, zz, r)
+            }
+            "v_fma_f32" | "v_div_fmas_f32" => {
+                let n = self.fmad(fa, fb, fc);
+                self.rm_fma(ba, bb, bc, n)
+            }
+            "v_fma_legacy_f32" => {
+                let n = self.fmad(fa, fb, fc);
+                let r = self.rm_fma(ba, bb, bc, n);
+                let lz = legacy_zero(self, fa, fb);
+                self.sel(lz, fc, r)
+            }
+            "v_fmac_f32" | "v_fmac_legacy_f32" => {
+                let fcur = self.f(cur);
+                let n = self.fmad(fa, fb, fcur);
+                let r = self.rm_fma(ba, bb, cur, n);
+                if name == "v_fmac_legacy_f32" {
+                    let lz = legacy_zero(self, fa, fb);
+                    self.sel(lz, fcur, r)
+                } else {
+                    r
+                }
+            }
+            "v_fmamk_f32" => {
+                let fk = self.f(b);
+                let n = self.fmad(fa, fk, fc);
+                self.rm_fma(ba, b, bc, n)
+            }
+            "v_fmaak_f32" => {
+                let fk = self.f(c);
+                let n = self.fmad(fa, fb, fk);
+                self.rm_fma(ba, bb, c, n)
+            }
+            "v_mad_f32" => {
+                let n = self.mad_nf(fa, fb, fc);
+                self.rm_mad(ba, bb, bc, n)
+            }
+            "v_mac_f32" => {
+                let fcur = self.f(cur);
+                let n = self.mad_nf(fa, fb, fcur);
+                self.rm_mad(ba, bb, cur, n)
+            }
+            "v_madmk_f32" => {
+                let fk = self.f(b);
+                let n = self.mad_nf(fa, fk, fc);
+                self.rm_mad(ba, b, bc, n)
+            }
+            "v_madak_f32" => {
+                let fk = self.f(c);
+                let n = self.mad_nf(fa, fb, fk);
+                self.rm_mad(ba, bb, c, n)
+            }
+            "v_cvt_f32_i32" | "v_cvt_f32_u32" => {
+                let signed = name == "v_cvt_f32_i32";
+                let n = if signed { self.sitof(a) } else { self.uitof(a) };
+                self.rm_cvt_int(a, signed, n)
+            }
+            "v_sqrt_f32" => {
+                let n = self.un(op::SQRT, fa);
+                self.rm_sqrt(ba, n)
+            }
+            "v_ldexp_f32" => {
+                let n = self.ldexp_f(fa, b);
+                self.rm_ldexp(ba, b, n)
+            }
+            _ => return Ok(None),
+        }))
     }
 
     pub fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, outs: &[&Operand], u: &[Src], m: &Mods) -> LResult<()> {

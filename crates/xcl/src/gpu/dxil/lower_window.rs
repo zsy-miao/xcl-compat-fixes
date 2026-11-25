@@ -4,7 +4,6 @@
 
 use super::lower::{Lw, VAR_WIN};
 use super::module::{Pred, Value};
-use super::shader::RawUav;
 use crate::gpu::rdna2::Decoded;
 
 /// A term of a 64-bit effective address (`window_at`).
@@ -26,11 +25,29 @@ impl Lw {
         self.mems.len() > 1
     }
 
-    /// The high dword of the UMA base (`IO_UMA_BASE_HI` of the io buffer, `xcl_uma_base`).
+    /// The high dword of the UMA base (`IO_UMA_BASE_HI` of the io buffer, `xcl_uma_base`),
+    /// hoisted to the entry block so multi-window shaders load it once rather than on every
+    /// memory operation.
     fn uma_base(&mut self) -> Value {
+        if let Some(v) = self.uma_base_val {
+            return v;
+        }
         let io = self.init.io.expect("io");
         let off = self.c(crate::gpu::recomp::IO_UMA_BASE_HI as u32 * 4);
-        self.s.raw_load(io, off, 1)[0]
+        let cur = self.cur();
+        let entry = self.init.entry;
+        let v = if cur == entry {
+            self.s.raw_load(io, off, 1)[0]
+        } else {
+            let prev = self.s.m.set_insert_before_term(true);
+            self.s.m.set_block(entry);
+            let v = self.s.raw_load(io, off, 1)[0];
+            self.s.m.set_block(cur);
+            self.s.m.set_insert_before_term(prev);
+            v
+        };
+        self.uma_base_val = Some(v);
+        v
     }
 
     /// Selects the window of an access whose 64-bit effective address is `hi:lo` plus
@@ -127,48 +144,5 @@ impl Lw {
             _ => (self.sreg(saddr), self.sreg(saddr + 1)),
         };
         self.window_at(hi, lo, &[Ea::U(l4), off], write);
-    }
-
-    /// `with_mem` with the windows in the descriptor heap (`Options::heap_windows`): window
-    /// `w` is the raw UAV `ResourceDescriptorHeap[NonUniformResourceIndex(MEM_HEAP_BASE + w)]`
-    /// (`globallycoherent` where the root windows are); a `w` outside the windows does what
-    /// the HLSL accessor does (reads 0, stores and atomics dropped).
-    pub(super) fn with_heap_mem(
-        &mut self,
-        coherent: bool,
-        f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>,
-    ) -> Option<Value> {
-        let windows = self.mems.len() as u32;
-        let w = self.rd(VAR_WIN);
-        let (tl, th) = (self.tmp_var(), self.tmp_var());
-        let z = self.c(0);
-        self.wr(tl, z);
-        self.wr(th, z);
-        let mut kind = 0u8; // 0 none, 1 i32, 2 i64
-        let inside = self.cmpc(Pred::ULt, w, windows);
-        let _ = self.guarded(inside, &mut |lw| {
-            let i = lw.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-            let m = lw.s.heap_raw_buffer_uav(i, coherent);
-            if let Some(v) = f(lw, m) {
-                if lw.s.m.type_of(v) == lw.s.m.i64() {
-                    let (l, h) = lw.unpack64(v);
-                    lw.wr(tl, l);
-                    lw.wr(th, h);
-                    kind = 2;
-                } else {
-                    lw.wr(tl, v);
-                    kind = 1;
-                }
-            }
-            Ok(())
-        });
-        match kind {
-            0 => None,
-            1 => Some(self.rd(tl)),
-            _ => {
-                let (l, h) = (self.rd(tl), self.rd(th));
-                Some(self.pack64(l, h))
-            }
-        }
     }
 }

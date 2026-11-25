@@ -249,8 +249,10 @@ pub struct Module {
     func_ids: HashMap<String, u32>,
     globals: Vec<GlobalDef>,
     insts: Vec<InstDef>,
+    def_block: Vec<Block>,
     blocks: Vec<Vec<u32>>,
     cur: Block,
+    insert_before_term: bool,
     md: Vec<MdDef>,
     named_md: Vec<(String, Vec<Md>)>,
     md_strings: HashMap<String, Md>,
@@ -275,8 +277,10 @@ impl Module {
             func_ids: HashMap::new(),
             globals: Vec::new(),
             insts: Vec::new(),
+            def_block: Vec::new(),
             blocks: vec![Vec::new()],
             cur: Block(0),
+            insert_before_term: false,
             md: Vec::new(),
             named_md: Vec::new(),
             md_strings: HashMap::new(),
@@ -521,6 +525,24 @@ impl Module {
     pub fn current_block(&self) -> Block {
         self.cur
     }
+    /// Block where `v` is defined (entry block for constants, globals and functions).
+    pub fn def_block(&self, v: Value) -> Option<Block> {
+        match v {
+            Value::Inst(i) => {
+                let b = self.def_block[i as usize];
+                (b.0 < self.blocks.len() as u32).then_some(b)
+            }
+            _ => Some(Block(0)),
+        }
+    }
+    /// When enabled, emitting into an already-terminated block inserts immediately
+    /// before its terminator (used for hoisting pure computations to a value's
+    /// defining block). Returns the previous setting.
+    pub fn set_insert_before_term(&mut self, on: bool) -> bool {
+        let prev = self.insert_before_term;
+        self.insert_before_term = on;
+        prev
+    }
     /// Whether the current block already ends in a terminator.
     pub fn terminated(&self) -> bool {
         self.blocks[self.cur.0 as usize].last().is_some_and(|&i| {
@@ -529,12 +551,20 @@ impl Module {
     }
 
     fn push(&mut self, op: Op, ty: Ty) -> Value {
-        if self.terminated() {
+        let terminated = self.terminated();
+        if terminated && !self.insert_before_term {
             self.fail(format!("instruction after a terminator in block {:?}", self.cur));
         }
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op, ty });
-        self.blocks[self.cur.0 as usize].push(id);
+        self.def_block.push(self.cur);
+        let list = &mut self.blocks[self.cur.0 as usize];
+        if terminated && self.insert_before_term {
+            let at = list.len() - 1;
+            list.insert(at, id);
+        } else {
+            list.push(id);
+        }
         Value::Inst(id)
     }
 
@@ -608,6 +638,7 @@ impl Module {
     pub fn phi_at(&mut self, b: Block, ty: Ty) -> Value {
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op: Op::Phi(Vec::new()), ty });
+        self.def_block.push(b);
         let list = &mut self.blocks[b.0 as usize];
         let at = list.iter().position(|&i| !matches!(self.insts[i as usize].op, Op::Phi(_))).unwrap_or(list.len());
         list.insert(at, id);
@@ -618,11 +649,13 @@ impl Module {
     pub fn detached_phi(&mut self, ty: Ty) -> Value {
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op: Op::Phi(Vec::new()), ty });
+        self.def_block.push(Block(u32::MAX));
         Value::Inst(id)
     }
     /// Puts a [`Module::detached_phi`] after the existing phis of block `b`.
     pub fn place_phi(&mut self, b: Block, phi: Value) {
         let Value::Inst(id) = phi else { panic!("not a phi") };
+        self.def_block[id as usize] = b;
         let list = &mut self.blocks[b.0 as usize];
         let at = list.iter().position(|&i| !matches!(self.insts[i as usize].op, Op::Phi(_))).unwrap_or(list.len());
         list.insert(at, id);
@@ -970,10 +1003,11 @@ impl Module {
         w.enter_block(BLOCK_FUNCTION);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
+        let mut operands = Vec::new();
         for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs, &pos);
+                self.write_inst(&mut w, i, inst_id, &abs, &pos, &mut operands);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -1077,9 +1111,19 @@ impl Module {
     /// Replaces every use of `old` by `new` in the entry's instructions and in
     /// metadata (e.g. to drop a trivial phi). `old` itself stays in its block.
     pub fn replace_all_uses(&mut self, old: Value, new: Value) {
+        self.replace_uses(&HashMap::from([(old, new)]));
+    }
+
+    /// `replace_all_uses` for every `old → new` of `map` in one pass over the module: a use
+    /// becomes the end of its chain (`a → b`, `b → c`: a use of `a` becomes `c`), as the same
+    /// calls one at a time in order would leave it.
+    pub fn replace_uses(&mut self, map: &HashMap<Value, Value>) {
+        if map.is_empty() {
+            return;
+        }
         let r = |v: &mut Value| {
-            if *v == old {
-                *v = new;
+            while let Some(&n) = map.get(v) {
+                *v = n;
             }
         };
         for inst in &mut self.insts {
@@ -1114,7 +1158,15 @@ impl Module {
         }
     }
 
-    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &[Option<u32>]) {
+    fn write_inst(
+        &self,
+        w: &mut BitWriter,
+        i: usize,
+        inst_id: u64,
+        abs: &dyn Fn(Value) -> u64,
+        pos: &[Option<u32>],
+        ops: &mut Vec<u64>,
+    ) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
             let a = abs(v);
@@ -1131,13 +1183,14 @@ impl Module {
                 0
             }
         };
+        ops.clear();
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
-                let mut ops = vec![rel(*a), rel(*b), *op as u64];
+                ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64]);
                 if *flags != 0 {
                     ops.push(*flags);
                 }
-                w.record(FUNC_CODE_INST_BINOP, &ops)
+                w.record(FUNC_CODE_INST_BINOP, ops)
             }
             Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
             Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
@@ -1145,18 +1198,18 @@ impl Module {
             Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
                 let fd = &self.funcs[*f as usize];
-                let mut ops = vec![0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))];
+                ops.extend_from_slice(&[0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))]);
                 ops.extend(args.iter().map(|&a| rel(a)));
-                w.record(FUNC_CODE_INST_CALL, &ops)
+                w.record(FUNC_CODE_INST_CALL, ops)
             }
             Op::Phi(inc) => {
-                let mut ops = vec![self.insts[i].ty.0 as u64];
+                ops.push(self.insts[i].ty.0 as u64);
                 // incoming edges from unreachable (unwritten) blocks are dropped
                 for &(v, b) in inc.iter().filter(|(_, b)| pos.get(b.0 as usize).copied().flatten().is_some()) {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_PHI, &ops)
+                w.record(FUNC_CODE_INST_PHI, ops)
             }
             Op::Load(p, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
@@ -1169,9 +1222,9 @@ impl Module {
             Op::Gep(p, idx) => {
                 let pt = self.value_ty(*p);
                 let (src, _) = self.pointee_of(pt).unwrap_or((pt, 0));
-                let mut ops = vec![1, src.0 as u64, rel(*p)];
+                ops.extend_from_slice(&[1, src.0 as u64, rel(*p)]);
                 ops.extend(idx.iter().map(|&v| rel(v)));
-                w.record(FUNC_CODE_INST_GEP, &ops)
+                w.record(FUNC_CODE_INST_GEP, ops)
             }
             Op::AtomicRmw(op, p, v) => {
                 // [ptr, val, op, vol, ordering, synchscope (crossthread = 1)]
@@ -1190,12 +1243,12 @@ impl Module {
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
             Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
             Op::Switch(v, d, cases) => {
-                let mut ops = vec![self.value_ty(*v).0 as u64, rel(*v), bb(*d)];
+                ops.extend_from_slice(&[self.value_ty(*v).0 as u64, rel(*v), bb(*d)]);
                 for &(c, b) in cases {
                     ops.push(abs(c));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_SWITCH, &ops)
+                w.record(FUNC_CODE_INST_SWITCH, ops)
             }
             Op::Ret => w.record(FUNC_CODE_INST_RET, &[]),
             Op::Unreachable => w.record(FUNC_CODE_INST_UNREACHABLE, &[]),
@@ -1372,6 +1425,18 @@ impl Module {
                 InstInfo::Term(c, _) => c.into_iter().collect(),
             };
             ops.into_iter().any(|v| self.value_ty(v) == t)
+        })
+    }
+    /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).
+    pub fn has_rov_handle(&self) -> bool {
+        self.blocks.iter().flatten().any(|&i| {
+            let Op::Call(f, args) = &self.insts[i as usize].op else { return false };
+            if self.funcs[*f as usize].name != "dx.op.annotateHandle" || args.len() < 3 {
+                return false;
+            }
+            let Value::Const(c) = args[2] else { return false };
+            let ConstDef::Aggregate(_, fields) = &self.consts[c as usize] else { return false };
+            fields.first().and_then(|&p0| self.const_u64(p0)).is_some_and(|w| w & 0x2000 != 0)
         })
     }
     /// The integer value of a constant (zero-extended from its width).

@@ -34,6 +34,8 @@ pub enum Feature {
     TiledResources,
     /// Typed UAV loads of multi-component / non-32-bit formats.
     TypedUavLoadAdditionalFormats,
+    /// Rasterizer-Ordered Views (ROVs) in pixel shaders.
+    Rovs,
 }
 
 impl Feature {
@@ -46,6 +48,7 @@ impl Feature {
         1u64 << match self {
             Feature::Doubles => 2,
             Feature::RawAndStructuredBuffers => 4,
+            Feature::Rovs => 18,
             Feature::WaveOps => 19,
             Feature::Int64Ops => 20,
             Feature::NativeLowPrecision => 23,
@@ -64,6 +67,7 @@ impl Feature {
         match self {
             Feature::Doubles => 0x1,
             Feature::RawAndStructuredBuffers => 0,
+            Feature::Rovs => 0x1000,
             Feature::WaveOps => 0x4000,
             Feature::Int64Ops => 0x8000,
             Feature::NativeLowPrecision => 0x40000,
@@ -108,11 +112,13 @@ pub(super) struct Binding {
     pub(super) comparison: bool,
     /// UAVs: `globallycoherent`
     pub(super) coherent: bool,
+    /// UAVs: Rasterizer-Ordered View (`RasterizerOrdered*`, pixel shaders only).
+    pub(super) rov: bool,
 }
 
 impl Binding {
     pub(super) fn new(class: ResClass, space: u32, lower: u32, kind: u32) -> Binding {
-        Binding { class, space, lower, kind, stride: 0, comp_type: 0, atomic64: false, size: 0, comparison: false, coherent: false }
+        Binding { class, space, lower, kind, stride: 0, comp_type: 0, atomic64: false, size: 0, comparison: false, coherent: false, rov: false }
     }
 }
 
@@ -135,6 +141,9 @@ pub struct Shader {
     pub(super) bindings: Vec<Binding>,
     pub(super) handle_ty: Ty,
     props_ty: Ty,
+    /// When enabled on a pixel shader, UAV handles and static UAV bindings
+    /// created afterwards carry the `IsROV` (`0x2000`) property.
+    pub(super) rov: bool,
 }
 
 /// A raw (byte-address) UAV bound at `u<lower>, space<space>`.
@@ -154,7 +163,14 @@ impl Shader {
         let handle_ty = m.named_struct("dx.types.Handle", &[p8]);
         let i32 = m.i32();
         let props_ty = m.named_struct("dx.types.ResourceProperties", &[i32, i32]);
-        Shader { m, stage, sm, entry, features: BTreeSet::new(), bindings: Vec::new(), handle_ty, props_ty }
+        Shader { m, stage, sm, entry, features: BTreeSet::new(), bindings: Vec::new(), handle_ty, props_ty, rov: false }
+    }
+
+    /// Enables Rasterizer-Ordered View (ROV) marking for UAV bindings and
+    /// heap UAV handles created afterwards in this pixel shader.
+    pub fn enable_rov(&mut self) {
+        assert_eq!(self.stage, Stage::Pixel, "ROVs are only valid in pixel shaders");
+        self.rov = true;
     }
 
     pub fn require(&mut self, f: Feature) {
@@ -239,7 +255,7 @@ impl Shader {
     pub fn raw_uav(&mut self, lower: u32, space: u32) -> RawUav {
         self.require(Feature::RawAndStructuredBuffers);
         let id = self.bindings.len();
-        self.bindings.push(Binding::new(ResClass::Uav, space, lower, kind::RAW_BUFFER));
+        self.bindings.push(Binding { rov: self.rov, ..Binding::new(ResClass::Uav, space, lower, kind::RAW_BUFFER) });
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000, 0);
         RawUav { handle, binding: Some(id) }
@@ -249,7 +265,7 @@ impl Shader {
     pub fn raw_uav_coherent(&mut self, lower: u32, space: u32) -> RawUav {
         self.require(Feature::RawAndStructuredBuffers);
         let id = self.bindings.len();
-        self.bindings.push(Binding { coherent: true, ..Binding::new(ResClass::Uav, space, lower, kind::RAW_BUFFER) });
+        self.bindings.push(Binding { coherent: true, rov: self.rov, ..Binding::new(ResClass::Uav, space, lower, kind::RAW_BUFFER) });
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         // resource properties: IsUAV (bit 12) | IsGloballyCoherent (bit 14)
         let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000 | 0x4000, 0);
@@ -278,6 +294,12 @@ impl Shader {
 
     /// `annotateHandle` with resource properties (`{kind | uav<<12 | ..., stride/format}`).
     pub fn annotate(&mut self, h: Value, props0: u32, props1: u32) -> Value {
+        let props0 = if self.rov && (props0 & 0x1000 != 0) {
+            // IsROV (bit 13) for UAV handles in POPS pixel shaders.
+            props0 | 0x2000
+        } else {
+            props0
+        };
         let (a, b) = (self.m.i32c(props0), self.m.i32c(props1));
         let pt = self.props_ty;
         let props = self.m.aggregate(pt, &[a, b]);
@@ -375,6 +397,10 @@ impl Shader {
             let ci = b.class as usize;
             let i32 = m.i32();
             let sname = match (b.class, b.kind) {
+                (ResClass::Uav, kind::RAW_BUFFER) if b.rov => "struct.RasterizerOrderedByteAddressBuffer",
+                (ResClass::Uav, kind::TYPED_BUFFER) if b.rov => "class.RasterizerOrderedBuffer",
+                (ResClass::Uav, kind::STRUCTURED_BUFFER) if b.rov => "struct.RasterizerOrderedStructuredBuffer",
+                (ResClass::Uav, _) if b.rov => "class.RasterizerOrderedTexture",
                 (ResClass::Uav, kind::RAW_BUFFER) => "struct.RWByteAddressBuffer",
                 (ResClass::Uav, kind::TYPED_BUFFER) => "class.RWBuffer",
                 (ResClass::Uav, kind::STRUCTURED_BUFFER) => "struct.RWStructuredBuffer",
@@ -418,9 +444,9 @@ impl Shader {
             let extra = if ext.is_empty() { None } else { Some(m.md_node(&ext)) };
             match b.class {
                 ResClass::Uav => {
-                    let (k, f, gc) = (m.md_i32(b.kind), m.md_i1(false), m.md_i1(b.coherent));
+                    let (k, f, gc, rov) = (m.md_i32(b.kind), m.md_i1(false), m.md_i1(b.coherent), m.md_i1(b.rov));
                     // globallycoherent, hasCounter, rasterizerOrdered.
-                    node.extend([Some(k), Some(gc), Some(f), Some(f), extra]);
+                    node.extend([Some(k), Some(gc), Some(f), Some(rov), extra]);
                 }
                 ResClass::Srv => {
                     let (k, samples) = (m.md_i32(b.kind), m.md_i32(0));
@@ -467,6 +493,9 @@ impl Shader {
         }
         if self.m.uses_double_extensions() {
             self.require(Feature::DoubleExtensions);
+        }
+        if self.bindings.iter().any(|b| b.rov) || self.m.has_rov_handle() {
+            self.require(Feature::Rovs);
         }
     }
 
@@ -584,4 +613,68 @@ pub fn dxc_fn_attrs(op: u32) -> Option<FnAttrs> {
         221 => ReadOnly,                       // isHelperLane
         _ => return Option::None,
     })
+}
+
+#[cfg(test)]
+mod pops_rov_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::{self, PsInterface};
+
+    fn ps_with_pops(pops_wait: bool, write_uav: bool) -> Vec<u8> {
+        let mut code = Vec::new();
+        if pops_wait {
+            // Typical RDNA2 POPS wait reading src_pops_exiting_wave_id (operand 239).
+            code.extend(rdna2::encode("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 18), ("SSRC1", 239)], None).unwrap());
+        }
+        if write_uav {
+            // Heap texture UAV store + flat memory store
+            code.extend(rdna2::encode("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)], None).unwrap());
+            code.extend(rdna2::encode("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 4), ("SADDR", 0x7D), ("OFFSET", 0)], None).unwrap());
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn pops_pixel_shader_marks_uavs_as_rov_and_validates() {
+        let code = ps_with_pops(true, true);
+        let ps = PsInterface::default();
+        // Both static memory windows (u2) and heap memory windows (XCL_HEAP_WINDOWS=1) must validate.
+        for mem_windows in [1u32, 4 | recomp::HEAP_WINDOWS] {
+            let k = kernel::translate_pixel(&code, KernelOptions { wave64: true, split: false, mem_windows, sampler_base: 0 }, &ps)
+                .expect("translate POPS PS");
+            validate::validate(&k.dxil).expect("dxil validate POPS PS");
+            let dis = validate::disassemble(&k.dxil).expect("disassemble POPS PS");
+            assert!(dis.contains("Raster Ordered UAVs"), "expected Raster Ordered UAVs feature flag (mem_windows={mem_windows:#x}):\n{dis}");
+            assert!(dis.contains("ROVTexture2D<"), "expected ROVTexture2D annotation (mem_windows={mem_windows:#x}):\n{dis}");
+            assert!(dis.contains("ROVByteAddressBuffer"), "expected ROVByteAddressBuffer annotation (mem_windows={mem_windows:#x}):\n{dis}");
+            // u0 (SGPRs) is created before enable_rov() and must remain an ordinary RWByteAddressBuffer.
+            assert!(dis.contains("resource: RWByteAddressBuffer"), "expected u0 to remain non-ROV RWByteAddressBuffer:\n{dis}");
+        }
+    }
+
+    #[test]
+    fn pops_pixel_shader_without_uavs_on_heap_windows_validates_cleanly() {
+        let code = ps_with_pops(true, false);
+        let ps = PsInterface::default();
+        let k = kernel::translate_pixel(&code, KernelOptions { wave64: true, split: false, mem_windows: 4 | recomp::HEAP_WINDOWS, sampler_base: 0 }, &ps)
+            .expect("translate POPS PS without UAVs");
+        validate::validate(&k.dxil).expect("dxil validate POPS PS without UAVs");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble POPS PS without UAVs");
+        assert!(!dis.contains("Raster Ordered UAVs"), "POPS PS with no ROV handles must not emit dangling ROV flag:\n{dis}");
+    }
+
+    #[test]
+    fn non_pops_pixel_shader_does_not_mark_rovs() {
+        let code = ps_with_pops(false, true);
+        let ps = PsInterface::default();
+        let k = kernel::translate_pixel(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &ps)
+            .expect("translate normal PS");
+        validate::validate(&k.dxil).expect("dxil validate normal PS");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble normal PS");
+        assert!(!dis.contains("Raster Ordered UAVs"), "non-POPS PS must not require ROVs:\n{dis}");
+        assert!(!dis.contains("ROVTexture2D<"), "non-POPS PS must not mark ROVTexture2D:\n{dis}");
+    }
 }

@@ -3,7 +3,8 @@
 //! The title gets the console's GameInput interfaces (the public GameInput.h of the GDK, v0:
 //! IGameInput, IGameInputDevice, IGameInputReading as COM objects with the methods in that
 //! header's order) with one device: a gamepad that is always connected. A reading is the
-//! state at the moment it is asked for – the PC's first XInput controller, and the keyboard
+//! state at the moment it is asked for – the PC's first XInput controller (else a PlayStation
+//! controller, `playstation`), and the keyboard
 //! while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
 //! arrows the D-pad, Tab View, P Menu). Windows' own GameInput.dll is not used: its
 //! interfaces are not the console's and it reads only for a foreground app of its own.
@@ -301,7 +302,7 @@ fn merge_host_inputs(
 
 /// the gamepad now
 pub fn poll() -> GamepadState {
-    let mut s = xinput_pad().unwrap_or_default();
+    let mut s = xinput_pad().or_else(super::playstation::pad).unwrap_or_default();
     merge_host_inputs(
         &mut s,
         super::kbm::enabled(),

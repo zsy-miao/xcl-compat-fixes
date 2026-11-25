@@ -43,6 +43,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         VirtualFreeEx,
         VirtualProtect,
         VirtualProtectEx,
+        VirtualQuery,
+        VirtualQueryEx,
         XMemAlloc,
         XMemFree,
         XMemAllocDefault,
@@ -56,6 +58,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemFreePhysicalPages,
         XMemTransferMemory,
         XMemGetWorkingSetStatistics,
+        XMemIsToolsMemAvailable,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
         ToolingMemoryStatus,
@@ -182,6 +185,12 @@ pub mod mirrors {
     }
     static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
 
+    /// Whether `(t, p)` is a CPU-inaccessible GPU-view alias reservation (`MEM_64K_PAGES`
+    /// reserve with `PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS`).
+    pub fn is_gpu_view_reservation(t: u32, p: u32) -> bool {
+        t & PAGES_64K == PAGES_64K && t & 0x1000 == 0 && p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS
+    }
+
     /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
     pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
         if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
@@ -253,10 +262,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         return q;
     }
     // the title's own reservations of 64 KiB or large pages: in a sparse window, so the GPU sees
-    // them (GTA VI keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
+    // them. CPU-inaccessible GPU-view mirror reservations stay outside (`mirrors::source`).
+    // (GTA VI keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
     // the windows the GPU faulted on it – a driver timeout)
     let large = t & MEM_64K_PAGES != MEM_64K_PAGES && t & MEM_LARGE_PAGES_X != 0 && p & PAGE_GPU_X != 0;
-    if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) {
+    if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) && !mirrors::is_gpu_view_reservation(t, p) {
         // (large pages: from the highest window down – the title's physical pages, gigabytes
         // in one piece, keep the lower ones)
         let top = |u: &crate::gpu::uma::Uma| (1..crate::gpu::uma::MAX_WINDOWS).rev().find_map(|k| u.sparse_alloc_in(k, size, crate::gpu::uma::GRAIN).map(|(q, _)| q));
@@ -265,6 +275,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -287,7 +298,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q as *mut c_void;
         }
     }
-    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
+    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 && !mirrors::is_gpu_view_reservation(t, p) {
         // on the console all graphics memory is GPU-visible, reserved address space too (titles
         // reserve a range, then commit or map pages and place resources in it): prefer the
         // sparse VRAM windows first so reservations consume zero system RAM until committed
@@ -298,10 +309,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             uma.and_then(|u| u.sparse_reserve(size))
         };
         if let Some(q) = reserved {
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.reserve(size, 0x1_0000)) {
+            mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
@@ -339,7 +352,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             // a pool of their own)
             const KEEP: usize = 96 << 20;
             let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
-            if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
+            if let Some(q) = fits.then(|| u.alloc(size, align)).flatten() {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
@@ -481,6 +494,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         if release {
             u.sparse_release(a);
+            mirrors::released(a);
         }
         return 1;
     }
@@ -696,6 +710,56 @@ pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize,
     VirtualAlloc(addr, size, t, p)
 }
 
+/// Fast-path `VirtualQuery` / `VirtualQueryEx` / `XMemVirtualQuery` for a committed coherent
+/// UMA window: `OpenExistingHeapFromAddress` makes a kernel `VirtualQuery` on a 4 GiB coherent
+/// window walk the whole region (~75–80 ms, holding `MmLockAddressSpace`), stalling
+/// `GetWriteWatch` on other threads. A committed coherent window is `PAGE_READWRITE` as a whole.
+unsafe fn query_committed_window(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> Option<usize> {
+    let need = std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>();
+    if mbi.is_null() || len < need {
+        return None;
+    }
+    let addr = address as usize;
+    let u = crate::gpu::uma::get()?;
+    if !u.in_committed_window(addr, 1) {
+        return None;
+    }
+    let k = u.window_of(addr)?;
+    let (win_base, win_len) = u.window(k);
+    let page_base = addr & !0xFFF;
+    mbi.write_unaligned(mem::MEMORY_BASIC_INFORMATION {
+        BaseAddress: page_base as *mut c_void,
+        AllocationBase: win_base as *mut c_void,
+        AllocationProtect: mem::PAGE_READWRITE,
+        PartitionId: 0,
+        RegionSize: (win_base + win_len).saturating_sub(page_base),
+        State: mem::MEM_COMMIT,
+        Protect: mem::PAGE_READWRITE,
+        Type: mem::MEM_PRIVATE,
+    });
+    Some(need)
+}
+
+fn is_current_process(process: HANDLE) -> bool {
+    process == (-1isize as HANDLE) || process == unsafe { thr::GetCurrentProcess() }
+}
+
+pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    if let Some(n) = query_committed_window(address, mbi, len) {
+        return n;
+    }
+    mem::VirtualQuery(address, mbi, len)
+}
+
+pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    if is_current_process(process) {
+        if let Some(n) = query_committed_window(address, mbi, len) {
+            return n;
+        }
+    }
+    mem::VirtualQueryEx(process, address, mbi, len)
+}
+
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`
 /// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a field
 /// at +48 whose bits 0-1 the caller requires for "CPU-readable memory" – set to 1 (CPU
@@ -706,6 +770,10 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
         return 0;
     }
     let mbi = info as *mut mem::MEMORY_BASIC_INFORMATION;
+    if is_current_process(process) && query_committed_window(address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()).is_some() {
+        *(info as *mut u8).add(48).cast::<u32>() = 1;
+        return 1;
+    }
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
     }
@@ -831,6 +899,12 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
     }
     std::ptr::write_bytes((buf as *mut u8).add(8), 0, 32);
     1
+}
+
+/// `BOOL XMemIsToolsMemAvailable()`: whether tooling (debug) memory is available on the console.
+/// Returns FALSE (0) in retail title execution.
+pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    0
 }
 
 /// Title physical pages (64 KiB). An allocation's pages have a *home*: CPU memory of their own
@@ -1029,6 +1103,24 @@ unsafe fn home_again(home: usize) -> Option<usize> {
     Some(home)
 }
 
+#[cfg(test)]
+/// Whether all of `[a, a + len)` is committed: one VirtualQuery per run of pages in one state
+/// (page by page each asked walked the rest of the run).
+fn committed_range(a: usize, len: usize) -> bool {
+    if len > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(a, len)) {
+        return true;
+    }
+    let mut p = a;
+    while p < a + len {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.State != mem::MEM_COMMIT {
+            return false;
+        }
+        p = m.BaseAddress as usize + m.RegionSize;
+    }
+    true
+}
+
 fn committed_page(a: usize) -> bool {
     committed_page_in(a, &mut StateRun::default())
 }
@@ -1049,6 +1141,9 @@ struct StateRun {
 fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
     if (run.start..run.end).contains(&a) {
         return run.committed;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(a, 1)) {
+        return true;
     }
     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
     // walks the page table to the end of the committed range the page is in (gigabytes of
@@ -2866,6 +2961,11 @@ mod tests {
     }
 
     #[test]
+    fn xmem_is_tools_mem_available_returns_false() {
+        assert_eq!(unsafe { XMemIsToolsMemAvailable() }, 0);
+    }
+
+    #[test]
     fn get_proc_address_and_load_library_ex_reject_null_name() {
         unsafe {
             let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
@@ -3183,6 +3283,61 @@ mod tests {
             fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
             trace_mem("test", 0, 0x1_0000, 0, 0, 0);
             assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
+    #[test]
+    fn virtual_query_fastpath_covers_committed_coherent_window() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let Some(k) = u.committed_window() else { return };
+        let (base, len) = u.window(k);
+        assert!(len >= 0x2000);
+        let addr = (base + 0x1234) as *const c_void;
+        unsafe {
+            let mut mbi: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let n = VirtualQuery(addr, &mut mbi, std::mem::size_of_val(&mbi));
+            assert_eq!(n, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>());
+            assert_eq!(mbi.BaseAddress as usize, base + 0x1000);
+            assert_eq!(mbi.AllocationBase as usize, base);
+            assert_eq!(mbi.RegionSize, len - 0x1000);
+            assert_eq!(mbi.State, mem::MEM_COMMIT);
+            assert_eq!(mbi.Protect, mem::PAGE_READWRITE);
+
+            let mut mbi2: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let n2 = VirtualQueryEx(thr::GetCurrentProcess(), addr, &mut mbi2, std::mem::size_of_val(&mbi2));
+            assert_eq!(n2, n);
+            assert_eq!(mbi2.RegionSize, mbi.RegionSize);
+
+            let mut xinfo = [0u8; 64];
+            assert_eq!(XMemVirtualQuery(thr::GetCurrentProcess(), addr, xinfo.as_mut_ptr() as *mut c_void), 1);
+            assert_eq!(u32::from_ne_bytes(xinfo[48..52].try_into().unwrap()), 1);
+            assert!(committed_range(base + 0x1000, 0x1000));
+            assert!(committed_page(base + 0x1000));
+        }
+    }
+
+    #[test]
+    fn sparse_64k_reservation_registers_gpu_view_mirror_and_releases_cleanly() {
+        unsafe {
+            // Reserve a 64 KiB-page CPU view (lands in sparse UMA when space is available) and
+            // pair it with a PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS GPU view of the same size.
+            let size = 4 << 20;
+            let cpu = VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_READWRITE);
+            assert!(!cpu.is_null());
+            let gpu = VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_NOACCESS | 0x800);
+            assert!(!gpu.is_null());
+            assert_eq!(
+                mirrors::source(gpu as usize + 0x2_0000),
+                Some(cpu as usize + 0x2_0000),
+                "GPU view must resolve to CPU view even when CPU view lives in sparse UMA"
+            );
+            // GPU-view alias must not consume sparse UMA VA.
+            if let Some(u) = crate::gpu::uma::get() {
+                assert!(!u.is_sparse(gpu as usize), "CPU-inaccessible GPU view should stay outside sparse UMA");
+            }
+            assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
+            assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
         }
     }
 }
