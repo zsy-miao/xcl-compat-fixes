@@ -93,9 +93,12 @@ fn console_ms_in_as_slot_and_ms_with_as_are_refused_cleanly() {
     };
     let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("MS in AS slot must be refused");
     assert_eq!(err.code(), E_INVALIDARG);
+    // This fork translates a console MS found alone in the AS slot as the stream's mesh shader
+    // (`mesh_shader_slots`); upstream refuses it as an AS. Either way the synthetic program is
+    // refused cleanly, and the error names which path refused it.
     assert!(
-        real::stats().translation_errors.iter().any(|e| e.contains("in the AS slot")),
-        "expected AS-slot refusal in translation_errors: {:?}",
+        real::stats().translation_errors.iter().any(|e| e.contains("in the AS slot") || e.starts_with("MS:")),
+        "expected AS-slot or MS translation refusal in translation_errors: {:?}",
         real::stats().translation_errors
     );
 
