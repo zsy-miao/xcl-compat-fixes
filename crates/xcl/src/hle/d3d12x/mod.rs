@@ -14,6 +14,7 @@ pub mod bind;
 mod bvh_source;
 pub mod console_heap;
 pub mod console_list;
+pub mod culprit;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;

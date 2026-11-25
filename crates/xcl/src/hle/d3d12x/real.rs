@@ -5236,6 +5236,14 @@ unsafe fn console_compute(desc: *const c_void) -> bool {
 }
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = create_compute_pso(this, desc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() {
+        super::culprit::note_compute(*ppv as usize, desc);
+    }
+    hr
+}
+
+unsafe fn create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     if super::pso_async::lazy_compute() && console_compute(desc) {
