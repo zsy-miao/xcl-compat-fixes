@@ -29,6 +29,8 @@ struct Pending {
     queued: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
+    /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
+    spared: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
 }
 
@@ -184,6 +186,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(BUILD_STACK).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
+                // (released by the title meanwhile)
+                if p.orphan.load(Ordering::Acquire) {
+                    let _ = p.job.lock().unwrap().take();
+                    continue;
+                }
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
@@ -263,6 +270,7 @@ fn pending(standin: usize, compute: bool, job: Job, key: u64) -> Arc<Pending> {
         job: Mutex::new(Some(job)),
         queued: Default::default(),
         late: Default::default(),
+        spared: Default::default(),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -511,6 +519,49 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
+    /// at once, with no budget, the build goes to the workers
+    /// unwanted, and once built the bind gets the real one. Without `image_only` the same bind
+    /// waits until the pipeline is built.
+    #[test]
+    fn a_bind_does_not_wait_for_a_pipeline_that_writes_only_images() {
+        let (spared, waited) = (0x7E57_B0A1usize, 0x7E57_B0A2usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(spared, true, Box::new(move || {
+            let _ = tx.send(wanted_here()());
+            let _ = finish.recv();
+            0x5A5A
+        }), 0);
+        image_only(spared);
+        // (on a thread: a bind that waits would wait for `go`, below)
+        let (bound_tx, bound) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = bound_tx.send((resolve_wait_for(spared, None), resolve_wait_for(spared, None)));
+        });
+        let binds = bound.recv_timeout(std::time::Duration::from_secs(5));
+        if binds.is_err() {
+            let _ = go.send(());
+        }
+        assert_eq!(binds.expect("the binds waited for the build"), (spared, spared), "still being built: the stand-in");
+        assert!(is_pending(spared));
+        assert!(!rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it"), "nobody waits: the build is not wanted");
+        go.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(spared) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(spared, None), 0x5A5A, "built by a worker");
+        // the same build without the mark: the bind waits for it
+        submit_lazy(waited, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            0x5B5B
+        }), 0);
+        assert_eq!(resolve_wait_for(waited, None), 0x5B5B);
+        let _ = released(spared);
+        let _ = released(waited);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -632,6 +683,73 @@ mod used_tests {
         assert!(used::noted(key) && !is_pending(standin));
         assert_eq!(released(standin), 0);
     }
+
+    /// A queued normal worker job whose stand-in was released before a worker starts it is
+    /// skipped as orphaned instead of entering the compiler.
+    #[test]
+    fn a_released_queued_pipeline_is_not_built_by_normal_workers() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut blockers = Vec::with_capacity(n);
+        for k in 0..n {
+            let standin = 0x7E57_9720usize + k;
+            let started_tx = started_tx.clone();
+            let gate = gate.clone();
+            submit(standin, false, Box::new(move || {
+                let _ = started_tx.send(());
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+                0x9720 + k
+            }));
+            blockers.push(standin);
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("normal workers saturated");
+        }
+
+        let target = 0x7E57_97FFusize;
+        let ran = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ran_job = ran.clone();
+        let drop_flag = DropFlag(dropped.clone());
+        submit(target, false, Box::new(move || {
+            let _keep = &drop_flag;
+            ran_job.store(true, Ordering::Release);
+            0x9721
+        }));
+        assert_eq!(released(target), 0);
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dropped.load(Ordering::Acquire), "queued orphan job was never drained");
+        assert!(!ran.load(Ordering::Acquire), "released job reached the compiler");
+
+        for standin in blockers {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -662,6 +780,9 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
+    if p.spared.load(Ordering::Acquire) {
+        return resolve_spared(&p, pso);
+    }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
@@ -740,6 +861,47 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
     pso
+}
+
+/// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
+/// but images (`gpu::effects::big_and_image_only`); its dispatches are left out until a worker
+/// has built it. Off by default: what such a program draws is missing for that long.
+///
+/// A retail title's world start binds one ray-tracing resolve program per material (73 – 118
+/// KiB of console code, about 1 MB of DXIL each): an RDNA2 driver takes 22 – 172 s for each,
+/// one bind at a time, and the title stands still for all of them. `XCL_PSO_WAIT_MS` goes on without every late
+/// program, also the culling passes whose counts an `ExecuteIndirect` reads next – a GPU hang.
+pub fn image_skip() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("XCL_PSO_IMAGE_SKIP").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The compute pipeline behind stand-in `standin` writes nothing but images: binds go on
+/// without it while it is built (`resolve_spared`). Told before the title has the stand-in.
+pub fn image_only(standin: usize) {
+    if let Some(p) = entry(standin) {
+        p.spared.store(true, Ordering::Release);
+    }
+}
+
+/// `resolve_wait` for a pipeline binds do not wait for (`image_only`): the real one once built,
+/// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
+/// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
+fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            send(p.clone());
+            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
+                }
+            }
+            pso
+        }
+        r => r,
+    }
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.

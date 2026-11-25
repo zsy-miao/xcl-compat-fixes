@@ -226,10 +226,18 @@ impl Ir for DxilIr {
     fn whole_needs_exchange(&self) -> bool {
         self.lw.split
     }
+    fn can_wave_branch(&self) -> bool {
+        !self.lw.split
+            || matches!(
+                self.lw.partner,
+                crate::gpu::dxil::lower::Partner::Present | crate::gpu::dxil::lower::Partner::Spin
+            )
+    }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
         if self.lw.split {
             // this half's word from the hardware, the other's through the exchange
             let (lo, hi) = self.lw.ballot(c);
+            self.tails[self.cur] = self.lw.cur();
             return [lo, hi];
         }
         let w = self.lw.s.wave_ballot(c);
@@ -282,7 +290,9 @@ impl Ir for DxilIr {
         if self.lw.split {
             // the lowering's lane reads take the same lane in every lane (readlane,
             // readfirstlane, writelane's source)
-            return self.lw.read_lane_uniform(v, lane);
+            let r = self.lw.read_lane_uniform(v, lane);
+            self.tails[self.cur] = self.lw.cur();
+            return r;
         }
         self.lw.s.wave_read_lane_at(v, lane)
     }
@@ -427,6 +437,7 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
 mod tests {
     use super::super::lower::tests::*;
     use super::super::{dxc, runner, translate, Mode, Options};
+    use std::io::Write;
 
     fn gpu() -> bool {
         if !gpu_waves() {
@@ -700,7 +711,13 @@ mod tests {
                 let (dxil, stale) = match super::kernel(&insts, w64) {
                     Ok(k) => k,
                     Err(e) => {
-                        runner::skip_test(&format!("{name}, wave{lanes}, per-lane form: refused ({e})"));
+                        // An unsupported opcode is a translator limitation, not missing GPU coverage.
+                        let thread = std::thread::current();
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "SKIPPED {}: {name}, wave{lanes}, per-lane form: refused ({e})",
+                            thread.name().unwrap_or("?")
+                        );
                         continue;
                     }
                 };
@@ -794,6 +811,94 @@ mod tests {
             let dxil = super::compute(&decode(&lines), &cs, false).unwrap();
             let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[0; 32]).unwrap();
             assert_eq!(&out[..32], &[expected; 32], "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn split_wave64_wave_branches_on_the_gpu() {
+        for threads in [64u32, 128] {
+            let mut cs = compute_cs();
+            cs.threads = [threads, 1, 1];
+            for (lines, expected) in wave_branch_cases(true) {
+                let dxil = super::compute_split(&decode(&lines), &cs)
+                    .unwrap_or_else(|e| panic!("split threads={threads}, {lines:?}: {e}"));
+                if crate::gpu::dxil::validate::validator_supported() {
+                    crate::gpu::dxil::validate::validate(&dxil)
+                        .unwrap_or_else(|e| panic!("split threads={threads}, {lines:?}: {e}"));
+                }
+                if gpu() {
+                    let out = runner::dispatch(&dxil, [1, 1, 1], &[], &vec![0; threads as usize]).unwrap();
+                    // Wave 0 (lanes 0..63) has lane 63 matching `SRC0 = 63`.
+                    assert_eq!(&out[..64], &[expected; 64], "split threads={threads} wave0, {lines:?}");
+                    if threads == 128 {
+                        // Wave 1 (lanes 64..127) has no lane with v0 == 63, so compare against
+                        // the regular direct split-wave64 translator across all 128 threads.
+                        let bytes: Vec<u8> = lines
+                            .iter()
+                            .flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap())
+                            .collect();
+                        let o = super::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+                        let ref_dxil = crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs).unwrap().dxil;
+                        let ref_out = runner::dispatch(&ref_dxil, [1, 1, 1], &[], &vec![0; 128]).unwrap();
+                        assert_eq!(&out[..128], &ref_out[..128], "split threads=128 parity, {lines:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_wave64_dead_scc_skips_exchange_barrier() {
+        let mut cs = compute_cs();
+        cs.threads = [64, 1, 1];
+        // Case A: `S_AND_SAVEEXEC_B64` writes SCC, immediately overwritten by `S_CMP_EQ_U32`
+        // before any SCC read -> no split-exchange ballot should be emitted.
+        let dead_scc = [
+            ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)][..]), // lanes 32..63
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 137), ("SSRC1", 129)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 6), ("VSRC1", 1)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125)]),
+            ("S_ENDPGM", "ENC_SOPP", &[]),
+        ];
+        // Case B: `S_CSELECT_B32` directly consumes the SCC written by `S_AND_SAVEEXEC_B64`
+        // -> split-exchange ballot MUST be emitted (+2 GROUP_SYNC barriers).
+        let live_scc = [
+            ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)][..]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 137), ("SSRC1", 129)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 6), ("VSRC1", 1)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125)]),
+            ("S_ENDPGM", "ENC_SOPP", &[]),
+        ];
+        let dxil_dead = super::compute_split(&decode(&dead_scc), &cs).unwrap();
+        let dxil_live = super::compute_split(&decode(&live_scc), &cs).unwrap();
+        if crate::gpu::dxil::validate::validator_supported() {
+            crate::gpu::dxil::validate::validate(&dxil_dead).unwrap();
+            crate::gpu::dxil::validate::validate(&dxil_live).unwrap();
+        }
+        if let (Ok(dis_dead), Ok(dis_live)) = (
+            crate::gpu::dxil::validate::disassemble(&dxil_dead),
+            crate::gpu::dxil::validate::disassemble(&dxil_live),
+        ) {
+            let b_dead = dis_dead.matches("@dx.op.barrier(").count();
+            let b_live = dis_live.matches("@dx.op.barrier(").count();
+            assert_eq!(b_live, b_dead + 2, "live SCC should emit one split-exchange (+2 barriers); dead={b_dead}, live={b_live}");
+        }
+        if gpu() {
+            for dxil in [&dxil_dead, &dxil_live] {
+                let out = runner::dispatch(dxil, [1, 1, 1], &[], &[0; 64]).unwrap();
+                // `V_CMP_LE_U32(32, v0)` selects upper half (lanes 32..63): lower gets 0+9, upper gets 7+9.
+                assert_eq!(&out[..32], &[9; 32]);
+                assert_eq!(&out[32..64], &[16; 32]);
+            }
         }
     }
 

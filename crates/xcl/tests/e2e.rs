@@ -48,13 +48,39 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-#[test]
-fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
-    let nonce = std::time::SystemTime::now()
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir(prefix: &str) -> TempDir {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("xcl-exe-{}-{nonce}", std::process::id()));
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    TempDir(path)
+}
+
+#[test]
+fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
+    let root = temp_dir("xcl-exe");
     let game = root.join("game");
     let data = root.join("data");
     let title = data.join("XCL.SelectionTest");
@@ -75,7 +101,6 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
         .env("XCL_DATA_ROOT", &data)
         .output();
     let boot = std::fs::read_to_string(title.join("cache").join("boot.json"));
-    std::fs::remove_dir_all(&root).unwrap();
 
     let output = output.unwrap();
     let boot = boot.unwrap_or_else(|error| panic!("boot record missing: {error}; {output:?}"));
@@ -97,8 +122,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
         dll.display()
     );
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
-    let _ = std::fs::remove_dir_all(&root);
+    let root = temp_dir("e2e");
     let game = root.join("game");
     let data = root.join("data");
     copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
@@ -264,15 +288,15 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
     for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
         if !sys.join(dll).is_file() {
-            eprintln!("SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
             return;
         }
     }
     let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
     let bin_dir = xcl.parent().unwrap();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("..").join("..").join("target").join("e2e-debug-layer");
-    let _ = std::fs::remove_dir_all(&root);
+    let root = temp_dir("e2e-debug-layer");
     let (game, data) = (root.join("game"), root.join("data"));
     copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
     for f in ["xcl_testtitle.exe", "testgame_mw.dll"] {
@@ -280,7 +304,9 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     }
     let out = Command::new(&xcl).arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1").output().expect("spawn xcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end:\n{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit code {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}", out.status.code());
+    assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end:\n{stdout}\n--- stderr ---\n{stderr}");
     let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap();
     assert!(log.contains("D3D12: debug layer enabled"), "the debug layer did not come up");
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("No root signature has been set")).collect();

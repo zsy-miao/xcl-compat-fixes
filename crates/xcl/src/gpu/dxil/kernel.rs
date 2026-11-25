@@ -76,36 +76,47 @@ pub fn compact_mode() -> Option<bool> {
     }
 }
 
+/// Non-default `XCL_DIRECT_COMPACT_NEST` cache tag for the translated cache identity.
+pub fn compact_nest_tag() -> Option<String> {
+    super::compact::nest_mode().cache_tag()
+}
+
 /// `translate_full` in the compact form (`compact = true`) or the plain one.
 #[cfg(test)]
 pub fn translate_full_as(code: &[u8], o: KernelOptions, compact: bool) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, Some(compact))
+    translate_entry(code, o, Entry::Kernel, Some(compact), None)
+}
+
+/// `translate_full` in the compact form with an explicit dispatch nesting policy.
+#[cfg(test)]
+pub fn translate_full_nested(code: &[u8], o: KernelOptions, nest: super::compact::Nest) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest))
 }
 
 pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, compact_mode())
+    translate_entry(code, o, Entry::Kernel, compact_mode(), None)
 }
 
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Mesh(ms.clone()), None)
+    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None)
 }
 
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Vertex(vs.clone()), None)
+    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None)
 }
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()), None)
+    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
 /// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
-    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None)
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None)
 }
 
 /// The entry ABI.
@@ -121,17 +132,23 @@ pub enum Entry {
 
 /// A compute-mode program (the CS ABI of `cs`).
 pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode())
+    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None)
 }
 
-fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
+fn translate_entry(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -155,7 +172,13 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
-fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
+fn translate_on_this_thread(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
@@ -165,6 +188,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
         None => Cfg::build(code)?,
     };
     let kernel = matches!(entry, Entry::Kernel);
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
@@ -288,9 +312,15 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
         lw.edge(Block(0), h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
+    // scalar loads the program repeats keep their first values (compute programs and kernels:
+    // the other stages enter their code by edges the CFG does not hold)
+    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
-        super::compact::emit(&mut lw, &cfg, p, h0, exit)?;
+        match nest {
+            Some(n) => super::compact::emit_with_nest(&mut lw, &cfg, p, h0, exit, n)?,
+            None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
+        }
     }
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
@@ -318,8 +348,10 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
             lw.wr(VAR_BUDGET, l);
         }
         for &i in &cfg.blocks[b].insts {
+            lw.reload = reloads.get(b, i);
             lw.inst(&cfg.insts[i])?;
         }
+        lw.reload = None;
         match cfg.blocks[b].term {
             Term::Jump(t) if es_block && in_gs(t) => {
                 // the ES's s_setpc_b64 into the GS: through the phase switch
@@ -466,6 +498,7 @@ impl Lw {
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
+            reload: None,
             uma_base_val: None,
             ntmp: 0,
             scratch: None,
@@ -476,6 +509,7 @@ impl Lw {
             f32_rm: false,
             track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
+            img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,

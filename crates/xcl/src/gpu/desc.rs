@@ -297,11 +297,14 @@ pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {
         (false, 2) => 3, // max
         _ => 0,
     };
-    let filter = if (mag >= 2 || min >= 2) && aniso > 1 {
+    // XY filter: 0 point, 1 bilinear, 2 aniso point, 3 aniso bilinear. A driver writes aniso
+    // point for a nearest filter with anisotropy on (Mesa's radv_tex_filter); D3D12's
+    // anisotropic filter is linear, so only aniso bilinear becomes it, and aniso point is point
+    let filter = if (mag == 3 || min == 3) && aniso > 1 {
         0x55 | reduction << 7 // D3D12_ENCODE_ANISOTROPIC_FILTER
     } else {
         // D3D12_ENCODE_BASIC_FILTER(min, mag, mip, reduction): linear = 1
-        let lin = |x: u32| (x & 1 == 1 || x >= 2) as u32;
+        let lin = |x: u32| x & 1;
         (lin(min) << 4) | (lin(mag) << 2) | ((mip == 2) as u32) | reduction << 7
     };
     let s5_8 = |v: u32| ((v as i32) << 18 >> 18) as f32 / 256.0;
@@ -591,9 +594,19 @@ mod tests {
         assert_eq!((s.MipLODBias, s.MinLOD, s.MaxLOD, s.BorderColor), (-1.5, 0.0, 13.0, [1.0; 4]));
         assert_eq!(s.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS);
         assert_eq!(sampler_d3d12(&w, true).Filter, D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR);
+        // aniso bilinear (3) min / mag with a ratio above 1: anisotropic
         let mut a = w;
-        a[2] = 2 << 20 | 2 << 22 | 2 << 26;
+        a[2] = 3 << 20 | 3 << 22 | 2 << 26;
         assert_eq!(sampler_d3d12(&a, false).Filter, D3D12_FILTER_ANISOTROPIC);
+        // aniso point (2) min / mag is a nearest filter with anisotropy on: point, not
+        // anisotropic (linear) – with the ratio set or not, and with a linear mip filter
+        let mut p = a;
+        p[2] = 2 << 20 | 2 << 22;
+        assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        p[0] &= !(7 << 9);
+        assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        p[2] |= 2 << 26;
+        assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR);
     }
 
     #[test]

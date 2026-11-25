@@ -46,6 +46,10 @@ struct SegmentBook {
     extra_active: Vec<usize>,
     /// Closed extra PC command lists from earlier recordings, kept for reuse on future splits.
     spares: Vec<usize>,
+    /// A PC command list recording in place of `primary`: at the title's Reset the GPU had not
+    /// finished primary's last submit, and the PC does not let a list be submitted again before
+    /// that (#1452, debug layer id 553). A console does.
+    first: Option<usize>,
 }
 
 /// Wrapper address -> split segment book (populated lazily only for lists that split).
@@ -140,39 +144,51 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     hr
 }
 
-/// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_x`
+/// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_pc`
 /// (calling directly rather than through the dual-dispatch vtable thunk so console state always
 /// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
-/// any extra split segments into the per-list spare pool.
-unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
+/// any extra split segments into the per-list spare pool. While the GPU has not finished
+/// primary's last submit, the new recording goes onto a spare instead (`first`). The newer console
+/// layout's Reset (#139) reaches it through `list_x::reset_x` on the active PC list.
+pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
     let primary = *((this as usize + F_PRIMARY) as *const *mut c_void);
-    let hr = if super::real::is_adopted(primary) {
-        super::list_x::reset_x(primary, alloc, pso)
+    let adopted = super::real::is_adopted(primary);
+    let stand_in = if adopted && super::alloc_pool::in_flight(primary as usize) {
+        super::list_x::reset_stand_in(this, primary, alloc, pso)
+    } else {
+        None
+    };
+    let hr = if stand_in.is_some() {
+        0
+    } else if adopted {
+        super::list_x::reset_pc(primary, alloc, pso)
     } else {
         let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT = std::mem::transmute(pc_slot(primary, 10));
         f(primary, alloc, pso)
     };
     if hr >= 0 {
-        *((this as usize + F_BACKING) as *mut usize) = primary as usize;
+        let active = stand_in.unwrap_or(primary as usize);
+        *((this as usize + F_BACKING) as *mut usize) = active;
         let moved = {
             let mut sg = SEGMENTS.lock().unwrap();
-            sg.as_mut()
-                .and_then(|m| m.get_mut(&(this as usize)))
-                .map(|b| {
-                    let old = std::mem::take(&mut b.extra_active);
-                    b.spares.extend(old.iter().copied());
-                    old
-                })
-                .unwrap_or_default()
-        };
-        if !moved.is_empty() {
-            let mut wg = WRAPPER_OF.lock().unwrap();
-            if let Some(m) = wg.as_mut() {
-                for &seg in &moved {
-                    m.remove(&seg);
-                }
-                m.insert(primary as usize, this as usize);
+            let m = sg.get_or_insert_with(HashMap::new);
+            if stand_in.is_some() || m.contains_key(&(this as usize)) {
+                let b = m.entry(this as usize).or_default();
+                let mut old = std::mem::take(&mut b.extra_active);
+                old.extend(std::mem::replace(&mut b.first, stand_in));
+                b.spares.extend(old.iter().copied());
+                old
+            } else {
+                Vec::new()
             }
+        };
+        if !moved.is_empty() || stand_in.is_some() {
+            let mut wg = WRAPPER_OF.lock().unwrap();
+            let m = wg.get_or_insert_with(HashMap::new);
+            for &seg in moved.iter().chain([primary as usize].iter()) {
+                m.remove(&seg);
+            }
+            m.insert(active, this as usize);
             drop(wg);
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
@@ -219,9 +235,10 @@ pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
     let Some(primary) = backing(list) else {
         return false;
     };
-    out.push(primary);
     let sg = SEGMENTS.lock().unwrap();
-    if let Some(book) = sg.as_ref().and_then(|m| m.get(&(list as usize))) {
+    let book = sg.as_ref().and_then(|m| m.get(&(list as usize)));
+    out.push(book.and_then(|b| b.first).map_or(primary, |f| f as *mut c_void));
+    if let Some(book) = book {
         for &seg in &book.extra_active {
             out.push(seg as *mut c_void);
         }
@@ -245,10 +262,19 @@ pub(super) fn can_split(wrapper: *mut c_void) -> bool {
         .is_none_or(|b| b.extra_active.len() < MAX_EXTRA_SEGMENTS)
 }
 
-/// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse.
+/// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
+/// (the last one whose submits the GPU has finished).
 pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
     let mut sg = SEGMENTS.lock().unwrap();
-    sg.as_mut()?.get_mut(&(wrapper as usize))?.spares.pop().map(|p| p as *mut c_void)
+    let spares = &mut sg.as_mut()?.get_mut(&(wrapper as usize))?.spares;
+    let k = spares.iter().rposition(|&p| !super::alloc_pool::in_flight(p))?;
+    Some(spares.remove(k) as *mut c_void)
+}
+
+/// Give back to `wrapper`'s spare pool a closed PC command list that did not become a segment.
+pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
 }
 
 /// Switch `wrapper` from closed segment `old_pc` to newly opened segment `new_pc`.
@@ -271,15 +297,16 @@ pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void,
 /// For `KickoffX` on an already-split list: returns `(primary, prior_closed_segments, extra_to_reclaim)`
 /// when `active_pc != primary`, switches `F_BACKING` back to `primary`, and moves all extra
 /// segments (including `active_pc`) into `spares` so recording resumes cleanly on `primary`.
+/// (`primary` here is the recording's first segment: `first` when one stands in.)
 pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut c_void, Vec<*mut c_void>, Vec<usize>)> {
     let wrapper = wrapper_of(active_pc)?;
-    let primary = *((wrapper as usize + F_PRIMARY) as *const *mut c_void);
+    let mut sg = SEGMENTS.lock().unwrap();
+    let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
+    let primary = book.first.map_or_else(|| *((wrapper as usize + F_PRIMARY) as *const *mut c_void), |f| f as *mut c_void);
     if primary == active_pc {
         return None;
     }
     let (prior, reclaimed) = {
-        let mut sg = SEGMENTS.lock().unwrap();
-        let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
         let extra = std::mem::take(&mut book.extra_active);
         let mut prior = Vec::with_capacity(extra.len());
         prior.push(primary);
@@ -291,6 +318,7 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
         book.spares.extend(extra.iter().copied());
         (prior, extra)
     };
+    drop(sg);
     *((wrapper as usize + F_BACKING) as *mut usize) = primary as usize;
     {
         let mut wg = WRAPPER_OF.lock().unwrap();
@@ -357,14 +385,14 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             if let Some(m) = wg.as_mut() {
                 m.remove(&(pc as usize));
                 if let Some(ref b) = book {
-                    for &seg in b.extra_active.iter().chain(b.spares.iter()) {
+                    for &seg in b.extra_active.iter().chain(b.spares.iter()).chain(b.first.iter()) {
                         m.remove(&seg);
                     }
                 }
             }
         }
         if let Some(b) = book {
-            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()) {
+            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first) {
                 let raw = seg as *mut c_void;
                 super::bind::forget(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));

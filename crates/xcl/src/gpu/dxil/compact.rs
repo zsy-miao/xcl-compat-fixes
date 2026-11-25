@@ -129,8 +129,70 @@ fn slot(lw: &mut Lw, var: u32) -> Value {
     init.slot(s, var)
 }
 
+/// Default class threshold and inner group size for `Nest::Auto`.
+pub const AUTO_NEST_MIN_CLASSES: usize = 512;
+pub const AUTO_NEST_GROUP_SIZE: usize = 32;
+
+/// Dispatch nesting policy for the direct DXIL compact form (`XCL_DIRECT_COMPACT_NEST`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nest {
+    /// Single flat `switch(class)` with one shared loop latch.
+    Flat,
+    /// Two-level nested switch (groups of [`AUTO_NEST_GROUP_SIZE`]) once class count reaches
+    /// [`AUTO_NEST_MIN_CLASSES`], flat below that.
+    Auto,
+    /// Two-level nested switch with explicit power-of-two inner group size whenever `classes > p`.
+    Fixed(usize),
+}
+
+impl Nest {
+    /// Resolves the inner group size for a program with `classes` distinct block classes,
+    /// returning `None` for flat dispatch.
+    pub fn group_size(self, classes: usize) -> Option<usize> {
+        match self {
+            Nest::Flat => None,
+            Nest::Auto => (classes >= AUTO_NEST_MIN_CLASSES).then_some(AUTO_NEST_GROUP_SIZE),
+            Nest::Fixed(p) => (p >= 2 && p.is_power_of_two() && classes > p).then_some(p),
+        }
+    }
+
+    /// Non-default cache tag folded into the direct-DXIL translated cache identity.
+    pub fn cache_tag(self) -> Option<String> {
+        match self {
+            Nest::Auto => None,
+            Nest::Flat => Some("xcl-direct-compact-nest-0".into()),
+            Nest::Fixed(p) => Some(format!("xcl-direct-compact-nest-{p}")),
+        }
+    }
+}
+
+/// `XCL_DIRECT_COMPACT_NEST`: `auto` or unset nests `>= 512` classes into groups of 32;
+/// `0` / `off` keeps a flat switch; a power of two in `2..=65536` fixes the inner group size.
+pub fn nest_mode() -> Nest {
+    parse_nest(std::env::var("XCL_DIRECT_COMPACT_NEST").ok().as_deref())
+}
+
+pub(crate) fn parse_nest(val: Option<&str>) -> Nest {
+    let Some(raw) = val.map(str::trim) else { return Nest::Auto };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return Nest::Auto;
+    }
+    if raw == "0" || raw.eq_ignore_ascii_case("off") {
+        return Nest::Flat;
+    }
+    match raw.parse::<usize>() {
+        Ok(p) if (2..=65536).contains(&p) && p.is_power_of_two() => Nest::Fixed(p),
+        _ => Nest::Auto,
+    }
+}
+
 /// Lowers the program as one loop from `head` to `exit` that switches to each block's class.
 pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResult<()> {
+    emit_with_nest(lw, cfg, p, head, exit, nest_mode())
+}
+
+/// Like [`emit`], with an explicit [`Nest`] policy.
+pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block, nest: Nest) -> LResult<()> {
     let n = p.order.len();
     let (cb, pb) = p.widths();
     let width = cb + pb;
@@ -173,9 +235,34 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
     let (taken, not_taken) = (lw.add(b, step_t), lw.add(b, step_f));
     let cases: Vec<Block> = p.rep.iter().map(|_| lw.block(Some(0))).collect();
     let latch = lw.block(Some(0));
-    let arms: Vec<(Value, Block)> = cases.iter().enumerate().skip(1).map(|(k, &c)| (lw.c(k as u32), c)).collect();
-    lw.s.m.switch(class, cases[0], &arms);
-    for (&c, &r) in cases.iter().zip(&p.rep) {
+    let group_size = nest.group_size(p.rep.len());
+    let group_latches: Vec<Block> = if let Some(gs) = group_size {
+        let groups = p.rep.len().div_ceil(gs);
+        let shift = gs.trailing_zeros();
+        let entries: Vec<Block> = (0..groups).map(|_| lw.block(Some(0))).collect();
+        let latches: Vec<Block> = (0..groups).map(|_| lw.block(Some(0))).collect();
+        let grp = lw.lshrc(class, shift);
+        let outer_arms: Vec<(Value, Block)> = entries.iter().enumerate().skip(1).map(|(g, &blk)| (lw.c(g as u32), blk)).collect();
+        lw.s.m.switch(grp, entries[0], &outer_arms);
+        for (g, &entry_blk) in entries.iter().enumerate() {
+            let lo = g * gs;
+            let hi = (lo + gs).min(p.rep.len());
+            lw.s.m.set_block(entry_blk);
+            if hi - lo == 1 {
+                lw.s.m.br(cases[lo]);
+            } else {
+                let inner_arms: Vec<(Value, Block)> = (lo + 1..hi).map(|k| (lw.c(k as u32), cases[k])).collect();
+                lw.s.m.switch(class, cases[lo], &inner_arms);
+            }
+        }
+        latches
+    } else {
+        let arms: Vec<(Value, Block)> = cases.iter().enumerate().skip(1).map(|(k, &c)| (lw.c(k as u32), c)).collect();
+        lw.s.m.switch(class, cases[0], &arms);
+        Vec::new()
+    };
+    for (k, (&c, &r)) in cases.iter().zip(&p.rep).enumerate() {
+        let target_latch = group_size.map_or(latch, |gs| group_latches[k / gs]);
         lw.s.m.set_block(c);
         lw.init.mem = Some(c);
         lw.ssa.begin_log();
@@ -189,7 +276,7 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
             lw.s.m.set_block(out);
             let end = lw.c(END);
             lw.s.m.store(to, end, 4);
-            lw.s.m.br(latch);
+            lw.s.m.br(target_latch);
             lw.s.m.set_block(body);
             let one = lw.c(1);
             let l = lw.sub(left, one);
@@ -211,18 +298,37 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
             lw.s.m.store(p, v, 4);
         }
         lw.s.m.store(to, next, 4);
-        lw.s.m.br(latch);
+        lw.s.m.br(target_latch);
     }
-    // the epilogue's reads load here
-    lw.init.mem = Some(latch);
-    lw.s.m.set_block(latch);
-    let next = lw.s.m.load(to, 4);
-    let stop = lw.cmpc(Pred::UGe, next, n as u32);
-    let cont = lw.block(Some(1));
-    lw.cond_br(stop, exit, cont);
-    lw.s.m.set_block(cont);
-    lw.s.m.store(at, next, 4);
-    lw.br(head);
-    lw.seal(head);
+    if group_size.is_some() {
+        // Each group latch performs the loop-exit check rather than forwarding with an empty
+        // unconditional branch, so driver CFG simplification preserves the two-level merge fan-in
+        // during SSA promotion without adding extra runtime instructions.
+        for &gl in &group_latches {
+            lw.s.m.set_block(gl);
+            let nxt = lw.s.m.load(to, 4);
+            let stop = lw.cmpc(Pred::UGe, nxt, n as u32);
+            lw.s.m.cond_br(stop, exit, latch);
+        }
+        // the epilogue's reads load in exit
+        lw.init.mem = Some(exit);
+        lw.s.m.set_block(latch);
+        let next = lw.s.m.load(to, 4);
+        lw.s.m.store(at, next, 4);
+        lw.br(head);
+        lw.seal(head);
+    } else {
+        // the epilogue's reads load here
+        lw.init.mem = Some(latch);
+        lw.s.m.set_block(latch);
+        let next = lw.s.m.load(to, 4);
+        let stop = lw.cmpc(Pred::UGe, next, n as u32);
+        let cont = lw.block(Some(1));
+        lw.cond_br(stop, exit, cont);
+        lw.s.m.set_block(cont);
+        lw.s.m.store(at, next, 4);
+        lw.br(head);
+        lw.seal(head);
+    }
     Ok(())
 }

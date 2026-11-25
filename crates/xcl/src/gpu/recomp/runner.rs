@@ -85,6 +85,10 @@ unsafe fn wait_for_submission(
 
 fn init() -> Result<Gpu, String> {
     unsafe {
+        if crate::state::config().d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+            // The debug layer must be enabled before this runner creates a device.
+            let _ = crate::gpu::agility::enable_debug_layer();
+        }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");
@@ -387,9 +391,9 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 uv.Anonymous.Buffer = D3D12_BUFFER_UAV { NumElements: t.width, ..Default::default() };
             }
         }
-        if !t.uav {
-            dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
-        }
+        // a UAV texture has its SRV too, as D3D12.X gives a console image UAV a companion SRV
+        // (RDNA images have no SRV / UAV distinction: the shader may read the slot)
+        dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
         if t.uav {
             dev.CreateUnorderedAccessView(&r, None::<&ID3D12Resource>, Some(&uv), at(&heap, 2 * i + 1, inc));
         }

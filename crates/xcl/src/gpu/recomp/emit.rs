@@ -35,6 +35,8 @@ pub(super) struct Em {
     ps_done: bool,
     /// PS: program has at least one EXP with VM=1 (pixel survival follows VM rather than DONE)
     has_ps_vm: bool,
+    /// PS: an exp mrtz wrote the sample mask (declare and default-init SV_Coverage)
+    ps_writes_mask: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
@@ -68,6 +70,28 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
+    img_writes: Vec<u64>,
+}
+
+/// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
+/// image_load reads through the UAV (`tw0 + 1`) where the invocation stored to the same image
+/// before (`xcl_iw{srsrc}` holds `tw0 + 1` of the last such store): the SRV need not see a
+/// write of the same dispatch, and RDNA reads its own writes.
+pub fn image_write_srsrcs(insts: &[Decoded]) -> Vec<u64> {
+    let mut v: Vec<u64> = insts
+        .iter()
+        .filter(|d| d.enc.name.starts_with("ENC_MIMG"))
+        .filter(|d| {
+            let n = d.inst.name.to_ascii_lowercase();
+            n.starts_with("image_store") || n.starts_with("image_atomic")
+        })
+        .map(|d| rdna2::field_value(d.enc, &d.words, "SRSRC").unwrap_or(0) * rdna2::register_scale("SRSRC"))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v.truncate(16);
+    v
 }
 
 /// Instructions without an effect in this execution model.
@@ -580,6 +604,7 @@ impl Em {
             ps_modes: BTreeMap::new(),
             ps_done: false,
             has_ps_vm: false,
+            ps_writes_mask: false,
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
@@ -594,6 +619,7 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            img_writes: Vec::new(),
         }
     }
 
@@ -612,6 +638,7 @@ impl Em {
     /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
+        self.img_writes = image_write_srsrcs(insts);
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
@@ -2321,6 +2348,12 @@ impl Em {
                 if en & 1 == 1 && ps.outputs.iter().any(|e| matches!(e.system_value, 65 | 67 | 68)) {
                     st.push(format!("xo.xcl_depth = asfloat({});", srcs[0]));
                 }
+                // the sample mask: z of the 32-bit formats, VSRC1 [15:0] of the compressed one
+                // (Mesa, ac_nir_lower_ps_late.c, emit_ps_mrtz_export)
+                if enabled(2) && ps.outputs.iter().any(|e| e.system_value == 66) {
+                    self.ps_writes_mask = true;
+                    st.push(format!("xo.xcl_mask = {};", Self::exp_comp(srcs, compr, 2)));
+                }
             }
             (Mode::Pixel(_), 9) => {}
             (Mode::Mesh(_), 12) => {
@@ -2762,11 +2795,12 @@ impl Em {
                         self.line(&format!("float4 {t}_m1 = {t}_T.SampleLevel({t}_S, {c1}, (float)({l1}));"));
                         self.line(&format!("float4 {t}_s1 = {t}_T.Sample({t}_S, {});", tail(coord.clone())));
                         // S# word 2: XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26];
-                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso min / mag
-                        // filter, as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
+                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso bilinear (3)
+                        // min / mag filter, and linear = bilinear or aniso bilinear (aniso point is
+                        // point), as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
                         // the mag filter, so mip 0 of a minified sample needs min = mag.
                         self.line(&format!(
-                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag >= 2u || {t}_min >= 2u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || (({t}_mag | ({t}_mag >> 1)) & 1u) == (({t}_min | ({t}_min >> 1)) & 1u));"
+                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag == 3u || {t}_min == 3u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || ({t}_mag & 1u) == ({t}_min & 1u));"
                         ));
                         format!("({t}_pm ? lerp({t}_m0, {t}_m1, {t}_L - {t}_l0) : {t}_s1)")
                     }
@@ -2816,8 +2850,9 @@ impl Em {
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
             let (ty, call) = match dim {
-                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;")),
-                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                // RDNA2 gives 0 for the depth of a DIM without layers (1D, 2D, 2D MSAA)
+                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 0u;")),
+                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 0u;")),
                 2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 // the hardware returns the layers (6 per cube), as for a 2D array
                 3 => ("TextureCubeArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d *= 6u;")),
@@ -2827,7 +2862,24 @@ impl Em {
                 _ => return Err("get_resinfo dim"),
             };
             self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
-            self.line(&format!("if (and({act}, {t}_ok)) {{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}"));
+            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
+            let query = if matches!(dim, 0 | 1) {
+                // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
+                // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
+                // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
+                // the level count to the host (RADV: log2(samples) + 1).
+                let ms = |ty: &str, extra: &str| {
+                    format!("{{ {ty}<float4> {t}_M = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {extra}{t}_s; {t}_M.GetDimensions({t}_w, {t}_h, {extra}{t}_s); {t}_r = uint4({t}_w, {t}_h, 0u, 1u); }}")
+                };
+                format!(
+                    "if (({tw3} >> 28) == 14u) {} else if (({tw3} >> 28) == 15u) {} else {query}",
+                    ms("Texture2DMS", ""),
+                    ms("Texture2DMSArray", &format!("{t}_e, "))
+                )
+            } else {
+                query
+            };
+            self.line(&format!("if (and({act}, {t}_ok)) {{ {query} }}"));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| e.to_string());
             return Ok(());
@@ -2849,17 +2901,35 @@ impl Em {
             return Err("image_load cube");
         }
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
+        if (base.starts_with("store") || base.starts_with("atomic_")) && self.img_writes.contains(&srsrc) {
+            self.line(&format!("if ({t}_ok) xcl_iw{srsrc} = {tw0} + 1u;"));
+        }
         match base {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
                 let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
-                self.line(&format!(
-                    "if (and({act}, {t}_ok)) {{ if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }} }}",
+                let srv = format!(
+                    "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
                     tex("int"),
                     tex("float")
-                ));
+                );
+                // an image this invocation stored to: through the UAV, which sees the store (the
+                // SRV need not within a dispatch); image_load only – a UAV view is one mip
+                let rw: Vec<String> = if base == "load" && dim != 6 { self.img_writes.iter().map(|s| format!("xcl_iw{s} == {tw0} + 1u")).collect() } else { Vec::new() };
+                if rw.is_empty() {
+                    self.line(&format!("if (and({act}, {t}_ok)) {{ {srv} }}"));
+                } else {
+                    let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                    self.line(&format!("bool {t}_rw = {};", rw.join(" || ")));
+                    self.line(&format!(
+                        "if (and({act}, {t}_ok)) {{ if ({t}_rw) {{ if ({t}_cls == 1u) {{ {} {t}_r = {t}_U[{icoord}]; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({t}_U[{icoord}]); }} else {{ {} {t}_r = asuint({t}_U[{icoord}]); }} }} else {{ {srv} }} }}",
+                        uav("uint"),
+                        uav("int"),
+                        uav("float")
+                    ));
+                }
                 let cls = format!("{t}_cls");
                 let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
                 let comps2 = comps.clone();
@@ -4703,6 +4773,9 @@ impl Em {
         if self.track_frexp_denorm {
             h.push_str("static uint xcl_frexp_f32_denorm = 0u;\n");
         }
+        for s in &self.img_writes {
+            let _ = writeln!(h, "static uint xcl_iw{s} = 0u; // tw0 + 1 of the last image store / atomic through s{s}");
+        }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
         let load_sgprs = |h: &mut String| {
@@ -5087,13 +5160,18 @@ impl Em {
                         65 => h.push_str("    float xcl_depth : SV_Depth;\n"),
                         67 => h.push_str("    float xcl_depth : SV_DepthGreaterEqual;\n"),
                         68 => h.push_str("    float xcl_depth : SV_DepthLessEqual;\n"),
+                        66 if self.ps_writes_mask => h.push_str("    uint xcl_mask : SV_Coverage;\n"),
                         _ => {}
                     }
                 }
-                if !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
+                if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
+                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                if self.ps_writes_mask {
+                    h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
+                }
+                h.push_str("    bool xcl_live = false;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
@@ -5283,7 +5361,9 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         h.push_str("        verts[i] = o;\n    }\n");
         let _ = writeln!(h, "    for (uint j = gi; j < np; j += {t}u) {{");
         let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + j) * 4u);");
-        h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+        // RDNA2 EXP PRIM packs 9-bit vertex indices at [8:0], [18:10], [28:20] with
+        // per-edge flags at [9], [19], [29] and null_prim at [31].
+        h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
         h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
         h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
         return h;
@@ -5302,7 +5382,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
-    h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+    h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
     h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
     h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");

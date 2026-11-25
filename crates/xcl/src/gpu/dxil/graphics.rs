@@ -994,8 +994,7 @@ impl Shader {
         let outs = io.place(Dir::Out);
         let prims = io.place(Dir::Prim);
 
-        let mut flags: u64 = self.features.iter().map(|f| f.metadata_bit()).fold(0, |a, b| a | b);
-        let mut sfi0: u64 = self.features.iter().map(|f| f.container_bit()).fold(0, |a, b| a | b);
+        let (mut flags, mut sfi0) = self.feature_flags();
         let rt_vp = outs.iter().chain(&prims).any(|e| matches!(e.e.kind, SemKind::RenderTargetArrayIndex | SemKind::ViewportArrayIndex));
         // DXC sets this for vertex shaders only (not for mesh shaders).
         if rt_vp && self.stage == Stage::Vertex {

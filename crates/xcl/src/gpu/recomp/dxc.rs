@@ -532,6 +532,10 @@ fn compile_now(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     })
 }
 
+/// HLSL longer than this is compiled at -O0 (`compile_here`): a console compute program this big
+/// takes the direct DXIL translator instead (`pso::compile_console_shader`).
+pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
@@ -543,7 +547,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
+        if src.len() > UNOPTIMISED_ABOVE {
             args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
@@ -781,7 +785,7 @@ fn cached_file(file: &Path) -> Option<Vec<u8>> {
 
 /// Cheap validation before handing a cached blob to D3D12. DXIL uses the DXBC
 /// container header: magic, hash, version, total size, chunk count and offsets.
-fn valid_dxil_container(blob: &[u8]) -> bool {
+pub(super) fn valid_dxil_container(blob: &[u8]) -> bool {
     let rd = |at: usize| {
         blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };

@@ -303,6 +303,570 @@ impl Lw {
         self.uitof(c)
     }
 
+    fn smin_i32(&mut self, a: Value, b: Value) -> Value {
+        let lt = self.cmp(Pred::SLt, a, b);
+        self.sel(lt, a, b)
+    }
+
+    fn smax_i32(&mut self, a: Value, b: Value) -> Value {
+        let gt = self.cmp(Pred::SGt, a, b);
+        self.sel(gt, a, b)
+    }
+
+    /// Applies an RDNA2 3-bit `SQ_TEX_CLAMP` address mode (`0..=7`) to integer texel coordinate
+    /// `coord` against mip dimension `size` (`>= 1`). Returns `(in_bounds_coord, is_border)`.
+    fn apply_rdna2_addr_mode(&mut self, coord: Value, size: Value, mode: Value) -> (Value, Value) {
+        let z = self.c(0);
+        let one = self.c(1);
+        let max_c = self.sub(size, one);
+
+        // Wrap (mode 0): Euclidean modulo ((coord % size) + size) % size
+        let rem = self.bin(BinOp::SRem, coord, size);
+        let rem_neg = self.cmp(Pred::SLt, rem, z);
+        let rem_pos = self.add(rem, size);
+        let wrap = self.sel(rem_neg, rem_pos, rem);
+
+        // Mirror (mode 1): period 2*size
+        let period = self.shlc(size, 1);
+        let mrem = self.bin(BinOp::SRem, coord, period);
+        let mneg = self.cmp(Pred::SLt, mrem, z);
+        let mpos = self.add(mrem, period);
+        let m = self.sel(mneg, mpos, mrem);
+        let m_hi = self.cmp(Pred::SGe, m, size);
+        let p_m1 = self.sub(period, one);
+        let m_ref = self.sub(p_m1, m);
+        let mirror = self.sel(m_hi, m_ref, m);
+
+        // Clamp (modes 2, 4, 6): clamp(coord, 0, size - 1)
+        let clamped_hi = self.smin_i32(coord, max_c);
+        let clamped = self.smax_i32(z, clamped_hi);
+
+        // MirrorOnce (modes 3, 5, 7): reflect negative coords (-1 -> 0, -2 -> 1, ...) via ~coord = -1 - coord
+        let c_neg = self.cmp(Pred::SLt, coord, z);
+        let reflected = self.not(coord);
+        let mo_mag = self.sel(c_neg, reflected, coord);
+        let mo_clamped = self.smin_i32(mo_mag, max_c);
+
+        // Select final in-bounds coordinate by mode
+        let is_0 = self.cmpc(Pred::Eq, mode, 0);
+        let is_1 = self.cmpc(Pred::Eq, mode, 1);
+        let is_3 = self.cmpc(Pred::Eq, mode, 3);
+        let is_5 = self.cmpc(Pred::Eq, mode, 5);
+        let is_7 = self.cmpc(Pred::Eq, mode, 7);
+        let is_mo = self.lor(is_3, is_5);
+        let is_mo = self.lor(is_mo, is_7);
+
+        let res = self.sel(is_mo, mo_clamped, clamped);
+        let res = self.sel(is_1, mirror, res);
+        let res = self.sel(is_0, wrap, res);
+
+        // Border detection: mode 6 (ClampBorder) -> coord < 0 || coord >= size;
+        // mode 7 (MirrorOnceBorder) -> mo_mag >= size.
+        let is_6 = self.cmpc(Pred::Eq, mode, 6);
+        let oob_hi = self.cmp(Pred::SGe, coord, size);
+        let oob_6 = self.lor(c_neg, oob_hi);
+        let oob_7 = self.cmp(Pred::UGe, mo_mag, size);
+        let b6 = self.land(is_6, oob_6);
+        let b7 = self.land(is_7, oob_7);
+        let is_border = self.lor(b6, b7);
+
+        (res, is_border)
+    }
+
+    /// Evaluates RDNA2 `SQ_TEX_DEPTH_COMPARE` (`0..=7`, matching `D3D12_COMPARISON_FUNC - 1`):
+    /// `cmp_ref <OP> texel` → `1.0f` or `0.0f`.
+    fn apply_depth_compare(&mut self, cmp_ref: Value, texel: Value, func: Value) -> Value {
+        let f_false = self.s.m.i1c(false);
+        let f_true = self.s.m.i1c(true);
+        let c_lt = self.fcmp(Pred::FOLt, cmp_ref, texel);
+        let c_eq = self.fcmp(Pred::FOEq, cmp_ref, texel);
+        let c_le = self.fcmp(Pred::FOLe, cmp_ref, texel);
+        let c_gt = self.fcmp(Pred::FOGt, cmp_ref, texel);
+        let c_ne = self.fcmp(Pred::FUNe, cmp_ref, texel);
+        let c_ge = self.fcmp(Pred::FOGe, cmp_ref, texel);
+        let mut p = f_false;
+        for (k, cond) in [(1u32, c_lt), (2, c_eq), (3, c_le), (4, c_gt), (5, c_ne), (6, c_ge), (7, f_true)] {
+            let is = self.cmpc(Pred::Eq, func, k);
+            p = self.sel(is, cond, p);
+        }
+        let one = self.fc(1.0);
+        let zero = self.fc(0.0);
+        self.sel(p, one, zero)
+    }
+
+    /// Emulates explicit-LOD `image_gather4_l` / `image_gather4_l_o` (and `_c_` / `_cl` variants)
+    /// on 2D and 2DArray textures via 4 mip-level `textureLoad`s, honoring RDNA2 S# address modes,
+    /// border colors, S# + T# `MIN_LOD` clamping, `UNORM=1` / `FORCE_UNORMALIZED`, `a16`/`d16`, and offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_gather4_lod(
+        &mut self,
+        d: &Decoded,
+        dim: u64,
+        kind: TexKind,
+        tw0: Value,
+        tw1: Value,
+        ssamp: u64,
+        coords: &[Value],
+        lod: Value,
+        cl: Option<Value>,
+        cmp: Option<Value>,
+        ovgpr: Option<Value>,
+        unorm: bool,
+        comps: &[u64],
+        vdata: u64,
+        d16: bool,
+        act: Value,
+        run: Value,
+    ) -> LResult<()> {
+        if comps.len() != 1 {
+            return err(d, "gather4 dmask");
+        }
+        let ch = comps[0] as usize;
+        let s0 = self.sreg(ssamp);
+        let s1 = self.sreg(ssamp + 1);
+        let s2 = self.sreg(ssamp + 2);
+        let s3 = self.sreg(ssamp + 3);
+
+        let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
+        let z = self.c(0);
+        for &t in &tmps {
+            self.wr(t, z);
+        }
+        self.guarded(run, &mut |lw| {
+            let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+
+            // Explicit LOD + S# signed 5.8 LOD_BIAS (s2[13:0] / 256.0), clamped by optional `cl`,
+            // S# [min_lod, max_lod], and raised to T# MIN_LOD (tw1[19:8], u4.8 / 256.0).
+            // When S# MIP_FILTER == none, RDNA2 reads floor(T# MIN_LOD) at every LOD.
+            let scale = lw.fc(1.0 / 256.0);
+            let lb_sh = lw.shlc(s2, 18);
+            let lb_se = lw.ashrc(lb_sh, 18);
+            let lb_f = lw.sitof(lb_se);
+            let lod_bias = lw.fmul(lb_f, scale);
+            let l = lw.fadd(lod, lod_bias);
+            let l = match cl {
+                Some(c) => lw.fmax(l, c),
+                None => l,
+            };
+            let min_u = lw.andc(s1, 0xFFF);
+            let min_f = lw.uitof(min_u);
+            let min_lod = lw.fmul(min_f, scale);
+            let max_u = lw.lshrc(s1, 12);
+            let max_u = lw.andc(max_u, 0xFFF);
+            let max_f = lw.uitof(max_u);
+            let max_lod_raw = lw.fmul(max_f, scale);
+            let t_min_u = lw.lshrc(tw1, 8);
+            let t_min_u = lw.andc(t_min_u, 0xFFF);
+            let t_min_f = lw.uitof(t_min_u);
+            let t_min_lod = lw.fmul(t_min_f, scale);
+            let mip_flt = lw.lshrc(s2, 26);
+            let mip_flt = lw.andc(mip_flt, 3);
+            let mip_none = lw.cmpc(Pred::Eq, mip_flt, 0);
+            let l = lw.fmax(l, min_lod);
+            let l = lw.fmin(l, max_lod_raw);
+            let l = lw.fmax(l, t_min_lod);
+
+            let z0 = lw.c(0);
+            let one = lw.c(1);
+            let dims0 = lw.s.get_dimensions(tex.handle, Some(z0));
+            let num_mips = lw.s.m.extract(dims0, 3);
+            let num_mips = lw.umax(num_mips, one);
+            let max_mip = lw.sub(num_mips, one);
+
+            // RDNA2 mip selection rounds half up via floor(lod + 0.501953125) (257/512)
+            // so LOD 0.5 selects level 1 and 2.5 selects level 3 (unlike ROUND_NE).
+            let zf = lw.fc(0.0);
+            let half_up = lw.fc(0.501953125);
+            let l_biased = lw.fadd(l, half_up);
+            let l_point = lw.un(op::ROUND_NI, l_biased);
+            let l_none = lw.un(op::ROUND_NI, t_min_lod);
+            let l_floor = lw.sel(mip_none, l_none, l_point);
+            let l_pos = lw.fmax(l_floor, zf);
+            let mip_raw = lw.ftoui(l_pos);
+            let mip_i = lw.umin(mip_raw, max_mip);
+
+            let dims = lw.s.get_dimensions(tex.handle, Some(mip_i));
+            let w = lw.s.m.extract(dims, 0);
+            let h = lw.s.m.extract(dims, 1);
+            let w = lw.umax(w, one);
+            let h = lw.umax(h, one);
+
+            // Convert normalized coordinates to texel space unless `UNORM=1` or S# `FORCE_UNORMALIZED` is set.
+            let wf = lw.uitof(w);
+            let hf = lw.uitof(h);
+            let (px, py) = if unorm {
+                (coords[0], coords[1])
+            } else {
+                let force_unorm = lw.lshrc(s0, 15);
+                let force_unorm = lw.andc(force_unorm, 1);
+                let is_unorm = lw.nz(force_unorm);
+                let sx = lw.fmul(coords[0], wf);
+                let sy = lw.fmul(coords[1], hf);
+                (lw.sel(is_unorm, coords[0], sx), lw.sel(is_unorm, coords[1], sy))
+            };
+
+            let half = lw.fc(0.5);
+            let pxm = lw.fsub(px, half);
+            let pym = lw.fsub(py, half);
+            let fx = lw.un(op::ROUND_NI, pxm);
+            let fy = lw.un(op::ROUND_NI, pym);
+            let mut ix = lw.ftosi(fx);
+            let mut iy = lw.ftosi(fy);
+
+            if let Some(o) = ovgpr {
+                let ox = lw.shlc(o, 26);
+                let ox = lw.ashrc(ox, 26);
+                let oy = lw.shlc(o, 18);
+                let oy = lw.ashrc(oy, 26);
+                ix = lw.add(ix, ox);
+                iy = lw.add(iy, oy);
+            }
+
+            let ix1 = lw.add(ix, one);
+            let iy1 = lw.add(iy, one);
+
+            let mode_x = lw.andc(s0, 7);
+            let mode_y = lw.lshrc(s0, 3);
+            let mode_y = lw.andc(mode_y, 7);
+
+            let (x0, bx0) = lw.apply_rdna2_addr_mode(ix, w, mode_x);
+            let (x1, bx1) = lw.apply_rdna2_addr_mode(ix1, w, mode_x);
+            let (y0, by0) = lw.apply_rdna2_addr_mode(iy, h, mode_y);
+            let (y1, by1) = lw.apply_rdna2_addr_mode(iy1, h, mode_y);
+
+            // For Texture2DArray, clamp rounded slice index to [0, array_size - 1].
+            let slice = if dim == 5 {
+                let arr = lw.s.m.extract(dims, 2);
+                let arr = lw.umax(arr, one);
+                let max_s = lw.sub(arr, one);
+                let sr = lw.un(op::ROUND_NE, coords[2]);
+                let si = lw.ftosi(sr);
+                let si = lw.smin_i32(si, max_s);
+                Some(lw.smax_i32(z0, si))
+            } else {
+                None
+            };
+
+            // Sampler border color value for channel `ch` (matches `desc::sampler_d3d12`).
+            let btype = lw.lshrc(s3, 30);
+            let is_white = lw.cmpc(Pred::Eq, btype, 2);
+            let one_f = lw.fc(1.0);
+            let border_val = if ch == 3 {
+                let is_opaque_black = lw.cmpc(Pred::Eq, btype, 1);
+                let is_one = lw.lor(is_white, is_opaque_black);
+                lw.sel(is_one, one_f, zf)
+            } else {
+                lw.sel(is_white, one_f, zf)
+            };
+
+            let cmp_func = lw.lshrc(s0, 12);
+            let cmp_func = lw.andc(cmp_func, 7);
+
+            // Gather4 2x2 texel order: (-,+), (+,+), (+,-), (-,-)
+            let taps = [(x0, y1, bx0, by1), (x1, y1, bx1, by1), (x1, y0, bx1, by0), (x0, y0, bx0, by0)];
+            for (k, (cx, cy, bx, by)) in taps.into_iter().enumerate() {
+                let load_coords = match slice {
+                    Some(sl) => vec![cx, cy, sl],
+                    None => vec![cx, cy],
+                };
+                let loaded = lw.s.texture_load(tex, Some(mip_i), &load_coords, &[]);
+                let is_b = lw.lor(bx, by);
+                let val = lw.sel(is_b, border_val, loaded[ch]);
+                let rv = match cmp {
+                    Some(z_ref) => lw.apply_depth_compare(z_ref, val, cmp_func),
+                    None => val,
+                };
+                let b = lw.bits(rv);
+                lw.wr(tmps[k], b);
+            }
+            Ok(())
+        })?;
+
+        let rb = tmps.map(|t| self.rd(t));
+        let vals: Vec<Value> = rb
+            .iter()
+            .map(|&b| if d16 { let f = self.f(b); self.s.f32_to_f16(f) } else { b })
+            .collect();
+        self.image_result(vdata, &vals, d16, act)
+    }
+
+    /// Lowers non-cube `UNORM=1` sampling / `gather4` (non-`_l`) by converting unnormalized
+    /// texel coordinates (plus optional signed 6-bit texel offsets) to normalized `[0, 1]`
+    /// via `GetDimensions` before invoking the standard DXIL sample/gather op.
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_unorm_sample(
+        &mut self,
+        d: &Decoded,
+        dim: u64,
+        kind: TexKind,
+        tw0: Value,
+        safe_tw0: Value,
+        valid: Value,
+        ssamp: u64,
+        bias: Option<Value>,
+        cmp: Option<Value>,
+        grads: Option<(Vec<Value>, Vec<Value>)>,
+        coords: Vec<Value>,
+        lod: Option<Value>,
+        cl: Option<Value>,
+        ovgpr: Option<Value>,
+        gather: bool,
+        has_c: bool,
+        has_lz: bool,
+        comps: &[u64],
+        vdata: u64,
+        d16: bool,
+        act: Value,
+        run: Value,
+    ) -> LResult<()> {
+        let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
+        let s3 = self.sreg(ssamp + 3);
+        let implicit_lod = ps && !gather && !has_lz && grads.is_none() && lod.is_none();
+        let unorm_body = |lw: &mut Lw, idx: Value| -> LResult<[Value; 4]> {
+            let mut coords = coords.clone();
+            let tex = lw.s.heap_texture(idx, kind, false, CompType::F32, 4, true);
+            let smp: Sampler = lw.mimg_sampler(d.pc, has_c, s3);
+
+            let level = match (&lod, has_lz || gather) {
+                (_, true) => lw.c(0),
+                (Some(l), _) => {
+                    let r = lw.un(op::ROUND_NE, *l);
+                    let z = lw.fc(0.0);
+                    let r = lw.fmax(r, z);
+                    lw.ftoui(r)
+                }
+                _ => lw.c(0),
+            };
+            let dims = lw.s.get_dimensions(tex.handle, Some(level));
+            let one = lw.c(1);
+            let (w, hh, dd) = match dim {
+                0 | 4 => (lw.s.m.extract(dims, 0), one, one),
+                1 | 5 => (lw.s.m.extract(dims, 0), lw.s.m.extract(dims, 1), one),
+                2 => (lw.s.m.extract(dims, 0), lw.s.m.extract(dims, 1), lw.s.m.extract(dims, 2)),
+                _ => (lw.s.m.extract(dims, 0), lw.s.m.extract(dims, 1), one),
+            };
+            let sizes = [lw.umax(w, one), lw.umax(hh, one), lw.umax(dd, one)];
+            let shifts = [26u32, 18, 10];
+            let spatial_n = match dim {
+                0 | 4 => 1usize,
+                2 => 3,
+                _ => 2,
+            };
+            for k in 0..spatial_n.min(coords.len()) {
+                let mut c = coords[k];
+                if let Some(o) = ovgpr {
+                    let x = lw.shlc(o, shifts[k]);
+                    let x = lw.ashrc(x, 26);
+                    let xf = lw.sitof(x);
+                    c = lw.fadd(c, xf);
+                }
+                let sf = lw.uitof(sizes[k]);
+                coords[k] = lw.fdiv(c, sf);
+            }
+            let coord: Vec<Value> = match dim {
+                4 => vec![coords[0], lw.un(op::ROUND_NE, coords[1])],
+                5 => vec![coords[0], coords[1], lw.un(op::ROUND_NE, coords[2])],
+                _ => coords,
+            };
+            let floor = |lw: &mut Lw, l: Value| match cl {
+                Some(c) => lw.fmax(l, c),
+                None => l,
+            };
+            let r: [Value; 4] = if gather {
+                if comps.len() != 1 {
+                    return err(d, "gather4 dmask");
+                }
+                match cmp {
+                    Some(z) => lw.s.gather_cmp(tex, smp, &coord, &[], comps[0] as u32, z),
+                    None => lw.s.gather(tex, smp, &coord, &[], comps[0] as u32),
+                }
+            } else {
+                match (&cmp, &grads, &lod, &bias) {
+                    (Some(z), _, _, _) if has_lz || !ps => {
+                        let v = lw.s.sample_cmp_level_zero(tex, smp, &coord, &[], *z);
+                        [v[0]; 4]
+                    }
+                    (Some(z), _, _, _) => {
+                        let v = lw.s.sample_cmp(tex, smp, &coord, &[], *z, cl);
+                        [v[0]; 4]
+                    }
+                    (None, Some((dx, dy)), _, _) => lw.s.sample_grad(tex, smp, &coord, &[], dx, dy, cl),
+                    (None, None, Some(l), _) => lw.s.sample_level(tex, smp, &coord, &[], *l),
+                    (None, None, None, Some(b)) if ps => lw.s.sample_bias(tex, smp, &coord, &[], *b, cl),
+                    (None, None, None, Some(b)) => {
+                        let l = floor(lw, *b);
+                        lw.s.sample_level(tex, smp, &coord, &[], l)
+                    }
+                    _ if has_lz || !ps => {
+                        let z = lw.fc(0.0);
+                        let l = floor(lw, z);
+                        lw.s.sample_level(tex, smp, &coord, &[], l)
+                    }
+                    _ => lw.s.sample(tex, smp, &coord, &[], cl),
+                }
+            };
+            Ok(r)
+        };
+        let (r, rb): ([Value; 4], [Value; 4]) = if implicit_lod {
+            let raw = unorm_body(self, safe_tw0)?;
+            let zf = self.fc(0.0);
+            let r = raw.map(|v| self.sel(valid, v, zf));
+            let rb = r.map(|v| self.bits(v));
+            (r, rb)
+        } else {
+            let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
+            let z = self.c(0);
+            for &t in &tmps {
+                self.wr(t, z);
+            }
+            self.guarded(run, &mut |lw| {
+                let res = unorm_body(lw, tw0)?;
+                for k in 0..4 {
+                    let b = lw.bits(res[k]);
+                    lw.wr(tmps[k], b);
+                }
+                Ok(())
+            })?;
+            let rb = tmps.map(|t| self.rd(t));
+            let r = rb.map(|b| self.f(b));
+            (r, rb)
+        };
+        let n = if gather { 4 } else { comps.len() };
+        let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
+        let vals: Vec<Value> = sel
+            .iter()
+            .map(|&c| if d16 { self.s.f32_to_f16(r[c]) } else { rb[c] })
+            .collect();
+        self.image_result(vdata, &vals, d16, act)
+    }
+}
+
+#[cfg(test)]
+mod gather4_lod_tests {
+    use super::super::kernel::{translate_full, KernelOptions};
+    use super::super::validate::validate;
+    use crate::gpu::rdna2;
+
+    fn mimg(name: &str, fields: &[(&str, u64)]) -> Vec<u8> {
+        rdna2::encode(name, "ENC_MIMG", fields, None).unwrap()
+    }
+
+    fn endpgm() -> Vec<u8> {
+        rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()
+    }
+
+    fn opts() -> KernelOptions {
+        KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }
+    }
+
+    /// `image_gather4_l` and `image_gather4_l_o` (plus `_c_l`, `_c_l_o`, `UNORM=1`, `A16`, `D16`,
+    /// 2D and 2DArray) emulate explicit-LOD gather via 4 mip-level `textureLoad`s and validate cleanly.
+    #[test]
+    fn gather4_lod_variants_translate_and_validate() {
+        let cases: &[(&str, &[(&str, u64)])] = &[
+            // 2D gather4_l (normalized)
+            ("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+            // 2D gather4_l_o (with texel offset + channel G)
+            ("IMAGE_GATHER4_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 1)]),
+            // 2DArray gather4_l (with UNORM=1 + channel A)
+            ("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x8), ("DIM", 5), ("UNORM", 1)]),
+            // 2DArray gather4_l_o with A16=1 and D16=1
+            ("IMAGE_GATHER4_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x4), ("DIM", 5), ("A16", 1), ("D16", 1)]),
+            // 2D comparison gather4_c_l_o
+            ("IMAGE_GATHER4_C_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+        ];
+        for (name, fields) in cases {
+            let mut code = mimg(name, fields);
+            code.extend(endpgm());
+            let k = translate_full(&code, opts()).unwrap_or_else(|e| panic!("{name} ({fields:?}): {e}"));
+            if let Err(err) = validate(&k.dxil) {
+                panic!("{name} ({fields:?}) DXIL validation failed: {err}");
+            }
+        }
+    }
+
+    /// Non-cube `UNORM=1` sampling (`D1`, `D2`, `D3`, `D1Array`, `D2Array`, `sample_lz`, `sample_l_o`, `gather4_lz`)
+    /// translates cleanly instead of erroring with `MIMG unorm`, and validates with `dxil.dll`.
+    #[test]
+    fn non_cube_unorm_sampling_translates_and_validate() {
+        let cases: &[(&str, &[(&str, u64)])] = &[
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 0), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 2), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 4), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 5), ("UNORM", 1)]),
+            ("IMAGE_GATHER4_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]),
+            ("IMAGE_GATHER4_LZ_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 5), ("UNORM", 1), ("D16", 1)]),
+        ];
+        for (name, fields) in cases {
+            let mut code = mimg(name, fields);
+            code.extend(endpgm());
+            let k = translate_full(&code, opts()).unwrap_or_else(|e| panic!("{name} ({fields:?}): {e}"));
+            if let Err(err) = validate(&k.dxil) {
+                panic!("{name} ({fields:?}) DXIL validation failed: {err}");
+            }
+        }
+    }
+
+    /// Explicit-LOD `gather4_l` adds S# `LOD_BIAS` (`s2[13:0]`, S5.8 / 256.0) before clamping
+    /// and rounds half up via `floor(lod + 0.501953125)` so `LOD 0.5` selects level 1.
+    #[test]
+    fn gather4_lod_emits_bias_and_rdna2_half_up_rounding() {
+        let mut code = Vec::new();
+        // v2 = 0.5f (LOD), s[24:27] = S# with MIP_FILTER=point (1 << 26) and LOD_BIAS = +1.0 (0x100)
+        code.extend(rdna2::encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 240)], None).unwrap()); // 0.5f
+        code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(2 | (2 << 3) | (2 << 6))).unwrap());
+        code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(0xFFF << 12)).unwrap());
+        code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some((1 << 26) | 0x100)).unwrap());
+        code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None).unwrap());
+        code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]));
+        code.extend(endpgm());
+        let k = translate_full(&code, opts()).expect("translate gather4_l with LOD_BIAS + LOD 0.5");
+        if let Err(err) = validate(&k.dxil) {
+            panic!("DXIL validation failed: {err}");
+        }
+        // Verify exact RDNA2 half-up constant 0.501953125f = 257/512 (0x3F00_8000):
+        // LOD 0.5 -> floor(1.001953125) = 1; LOD 2.5 -> floor(3.001953125) = 3.
+        assert_eq!(0.501953125_f32.to_bits(), 0x3F00_8000);
+        assert_eq!((0.5_f32 + 0.501953125_f32).floor() as u32, 1);
+        assert_eq!((2.5_f32 + 0.501953125_f32).floor() as u32, 3);
+        // Verify negative S5.8 LOD_BIAS sign extension: -1.0 = 0x3F00 in s2[13:0].
+        let neg_bias = (((0x3F00_u32 << 18) as i32) >> 18) as f32 / 256.0;
+        assert_eq!(neg_bias, -1.0);
+    }
+
+    /// Explicit-LOD `gather4_l` honors T# `MIN_LOD` (`tw1[19:8]`, u4.8 / 256.0):
+    /// `MIP_FILTER=none` selects `floor(T# MIN_LOD)` at every LOD, and non-none
+    /// `MIP_FILTER` raises the S#-clamped level to `T# MIN_LOD` before half-up rounding.
+    #[test]
+    fn gather4_lod_honors_tsharp_min_lod_and_mip_filter_none() {
+        for (mip_filter, t_min_u48, s_max_u48) in [
+            (0u32, 0x1C0u32, 0xF00u32), // MIP_FILTER=none, T# MIN_LOD=1.75 -> floor(1.75) = 1
+            (0u32, 0x280u32, 0xF00u32), // MIP_FILTER=none, T# MIN_LOD=2.5  -> floor(2.5)  = 2
+            (1u32, 0x1C0u32, 0x100u32), // MIP_FILTER=point, T# MIN_LOD=1.75 over S# MAX_LOD=1.0 -> 2
+        ] {
+            let mut code = Vec::new();
+            // s[16:23] = T# with tw1[19:8] = t_min_u48, s[24:27] = S# with s1[23:12] = s_max_u48, s2[27:26] = mip_filter.
+            code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 17), ("SSRC0", 255)], Some(t_min_u48 << 8)).unwrap());
+            code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(s_max_u48 << 12)).unwrap());
+            code.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(mip_filter << 26)).unwrap());
+            code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]));
+            code.extend(endpgm());
+            let k = translate_full(&code, opts()).expect("translate gather4_l with T# MIN_LOD");
+            if let Err(err) = validate(&k.dxil) {
+                panic!("DXIL validation failed (mip_filter={mip_filter}, t_min={t_min_u48:#x}): {err}");
+            }
+        }
+        // Check exact RDNA2 level arithmetic for the 3 cases above:
+        assert_eq!((0x1C0_u32 as f32 / 256.0).floor() as u32, 1);
+        assert_eq!((0x280_u32 as f32 / 256.0).floor() as u32, 2);
+        let l_clamped = 0.0_f32.max(0.0).min(1.0).max(0x1C0_u32 as f32 / 256.0);
+        assert_eq!((l_clamped + 0.501953125_f32).floor() as u32, 2);
+    }
+}
+
+impl Lw {
+
     pub fn mimg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("TFE") != 0 || f("LWE") != 0 {
@@ -513,8 +1077,57 @@ impl Lw {
         }
 
         if sampling {
-            if f("UNORM") != 0 && dim != 3 {
-                return err(d, "MIMG unorm");
+            let unorm = f("UNORM") != 0;
+            let gather_l = base.starts_with("gather4") && has_l && matches!(dim, 1 | 5);
+            if gather_l || (unorm && dim != 3) {
+                let bias = i_bias.map(|i| compf(self, i));
+                let cmp = i_cmp.map(|i| compf(self, i));
+                let grads = if has_d {
+                    let dx: Vec<Value> = (0..grad_n as usize).map(|k| compf(self, i_grad + k)).collect();
+                    let dy: Vec<Value> = (0..grad_n as usize).map(|k| compf(self, i_grad + grad_n as usize + k)).collect();
+                    Some((dx, dy))
+                } else {
+                    None
+                };
+                let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
+                let lod = i_extra.map(|i| compf(self, i));
+                let cl = i_clamp.map(|i| compf(self, i));
+                let ovgpr = if has_o {
+                    if dim == 3 {
+                        return err(d, "MIMG offset cube");
+                    }
+                    Some(compu(self, 0))
+                } else {
+                    None
+                };
+                if gather_l {
+                    let lod = lod.expect("gather4_l has explicit LOD");
+                    return self.mimg_gather4_lod(d, dim, kind, tw0, tw1, ssamp, &coords, lod, cl, cmp, ovgpr, unorm, &comps, vdata, d16, act, run);
+                }
+                return self.mimg_unorm_sample(
+                    d,
+                    dim,
+                    kind,
+                    tw0,
+                    safe_tw0,
+                    valid,
+                    ssamp,
+                    bias,
+                    cmp,
+                    grads,
+                    coords,
+                    lod,
+                    cl,
+                    ovgpr,
+                    base.starts_with("gather4"),
+                    has_c,
+                    has_lz,
+                    &comps,
+                    vdata,
+                    d16,
+                    act,
+                    run,
+                );
             }
             let bias = i_bias.map(|i| compf(self, i));
             let cmp = i_cmp.map(|i| compf(self, i));
@@ -744,7 +1357,9 @@ impl Lw {
                 let one = lw.c(1);
                 let w = lw.s.m.extract(dims, 0);
                 let hh = lw.s.m.extract(dims, 1);
-                let dd = if dim == 7 { lw.s.m.extract(dims, 2) } else { one };
+                // 2D MSAA: depth 0, as for every DIM without layers (RDNA2)
+                let zero = lw.c(0);
+                let dd = if dim == 7 { lw.s.m.extract(dims, 2) } else { zero };
                 for (k, v) in [w, hh, dd, one].into_iter().enumerate() {
                     lw.wr(tmps[k], v);
                 }
@@ -762,15 +1377,43 @@ impl Lw {
             for &t in &tmps {
                 self.wr(t, z);
             }
+            // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
+            // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
+            // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
+            // the level count to the host (RADV: log2(samples) + 1).
+            let mut run = run;
+            if matches!(dim, 0 | 1) {
+                let rtype = self.lshrc(tw3, 28);
+                for (ty, mkind) in [(14, TexKind::D2MS), (15, TexKind::D2MSArray)] {
+                    let is = self.cmpc(Pred::Eq, rtype, ty);
+                    let go = self.land(run, is);
+                    self.guarded(go, &mut |lw| {
+                        let tex = lw.s.heap_texture(tw0, mkind, false, CompType::F32, 4, true);
+                        let dims = lw.s.get_dimensions(tex.handle, None);
+                        let w = lw.s.m.extract(dims, 0);
+                        let hh = lw.s.m.extract(dims, 1);
+                        let (zero, one) = (lw.c(0), lw.c(1));
+                        for (k, v) in [w, hh, zero, one].into_iter().enumerate() {
+                            lw.wr(tmps[k], v);
+                        }
+                        Ok(())
+                    })?;
+                }
+                let ms_t = self.cmpc(Pred::UGe, rtype, 14);
+                let not_ms = self.lnot(ms_t);
+                run = self.land(run, not_ms);
+            }
             self.guarded(run, &mut |lw| {
                 let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
                 let dims = lw.s.get_dimensions(tex.handle, Some(mipv));
                 let one = lw.c(1);
+                let zero = lw.c(0);
                 let e = |lw: &mut Lw, i: u32| lw.s.m.extract(dims, i);
                 // HLSL GetDimensions outputs per dim; missing ones are 1
                 let (w, hh, dd, n) = match dim {
-                    0 => (e(lw, 0), one, one, e(lw, 3)),
-                    1 => (e(lw, 0), e(lw, 1), one, e(lw, 3)),
+                    // RDNA2 gives 0 for the depth of a DIM without layers (1D, 2D, 2D MSAA)
+                    0 => (e(lw, 0), one, zero, e(lw, 3)),
+                    1 => (e(lw, 0), e(lw, 1), zero, e(lw, 3)),
                     // a cube array: its layers are faces, 6 per cube
                     3 => {
                         let n = e(lw, 2);
@@ -778,6 +1421,8 @@ impl Lw {
                         (e(lw, 0), e(lw, 1), lw.mul(n, k), e(lw, 3))
                     }
                     2 | 5 => (e(lw, 0), e(lw, 1), e(lw, 2), e(lw, 3)),
+                    // a 1D array: RDNA gives its layers in y (and z), as the HLSL path does
+                    4 => (e(lw, 0), e(lw, 1), e(lw, 1), e(lw, 3)),
                     _ => (e(lw, 0), one, e(lw, 1), e(lw, 3)),
                 };
                 for (k, v) in [w, hh, dd, n].into_iter().enumerate() {
@@ -800,6 +1445,16 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        // an image store / atomic records its T# (`tw0 + 1`): a later image_load of the image
+        // reads through the UAV (`recomp::emit::image_write_srsrcs`)
+        if base.starts_with("store") || base.starts_with("atomic_") {
+            if let Some(k) = self.img_writes.iter().position(|&s| s == srsrc) {
+                let var = super::lower::VAR_IMG_WRITE + k as u32;
+                let (cur, t1) = (self.rd(var), self.addc(tw0, 1));
+                let nv = self.sel(valid, t1, cur);
+                self.wr(var, nv);
+            }
+        }
         if ms {
             return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run);
         }
@@ -810,10 +1465,32 @@ impl Lw {
                 for &t in &tmps {
                     self.wr(t, z);
                 }
+                // an image this invocation stored to: through the UAV, which sees the store (the
+                // SRV need not within a dispatch); image_load only – a UAV view is one mip
+                let mut rw = None;
+                if base == "load" && !self.img_writes.is_empty() {
+                    let t1 = self.addc(tw0, 1);
+                    for k in 0..self.img_writes.len() {
+                        let w = self.rd(super::lower::VAR_IMG_WRITE + k as u32);
+                        let e = self.cmp(Pred::Eq, w, t1);
+                        rw = Some(match rw {
+                            Some(r) => self.lor(r, e),
+                            None => e,
+                        });
+                    }
+                }
+                let ui = self.addc(tw0, 1);
                 for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
                     let is = self.cmpc(Pred::Eq, cls, cv);
                     let c = self.land(run, is);
-                    self.guarded(c, &mut |lw| {
+                    let (c_srv, c_uav) = match rw {
+                        Some(r) => {
+                            let nr = self.lnot(r);
+                            (self.land(c, nr), Some(self.land(c, r)))
+                        }
+                        None => (c, None),
+                    };
+                    self.guarded(c_srv, &mut |lw| {
                         let tex: Texture = lw.s.heap_texture(tw0, lkind, false, ct, 4, true);
                         let r = lw.s.texture_load(tex, Some(mip), &ic, &[]);
                         for k in 0..4 {
@@ -822,6 +1499,18 @@ impl Lw {
                         }
                         Ok(())
                     })?;
+                    if let Some(cu) = c_uav {
+                        self.guarded(cu, &mut |lw| {
+                            lw.s.typed_uav_load_additional_formats();
+                            let tex: Texture = lw.s.heap_texture(ui, lkind, true, ct, 4, true);
+                            let r = lw.s.texture_load(tex, None, &ic, &[]);
+                            for k in 0..4 {
+                                let b = lw.bits(r[k]);
+                                lw.wr(tmps[k], b);
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
                 let r: Vec<Value> = tmps.iter().map(|&t| self.rd(t)).collect();
                 let vals: Vec<Value> = if d16 {

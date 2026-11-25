@@ -6,10 +6,13 @@
 //! offset is linear over GF(2): `offset(x, y, z) = ox[x] ^ oy[y] ^ oz[z]`, small tables per
 //! layout. Blocks (256 B / 4 KB / 64 KB) are laid out row-major; `Chain` lays out the mips.
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
 use super::tiling_tables::{NIBBLE01, NIBBLE2, NIBBLE3, NIBBLE4, PATTERNS, PATTERNS_3D};
 
 /// The part of GB_ADDR_CONFIG the XOR modes depend on (number of pipes and packers, log2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PipeConfig {
     pub pipes_log2: u32,
     pub pkrs_log2: u32,
@@ -51,7 +54,7 @@ fn pattern_bits(table: &[(u32, &[[u16; 4]])], mode: u32, elem_log2: u32, cfg: Pi
 
 /// How one tiled surface of `1 << elem_log2`-byte elements (pixels, or 4×4 blocks for BCn)
 /// maps to memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub mode: u32,
     pub elem_log2: u32,
@@ -63,14 +66,34 @@ pub struct Layout {
     /// XORed into every in-block byte offset: the pipe / bank swizzle a T# base address carries
     /// in its low bits (`base & (block_bytes - 1)`), 0 otherwise
     pub base_xor: usize,
-    ox: Vec<u32>,
-    oy: Vec<u32>,
-    oz: Vec<u32>,
+    ox: &'static [u32],
+    oy: &'static [u32],
+    oz: &'static [u32],
     /// the in-block bits the coordinates above the block give (XOR modes with many pipes take
     /// pipe bits from neighbouring blocks' coordinates), by `x >> log2(block_w)` etc.
-    hx: Vec<u32>,
-    hy: Vec<u32>,
-    hz: Vec<u32>,
+    hx: &'static [u32],
+    hy: &'static [u32],
+    hz: &'static [u32],
+}
+
+/// Cached immutable tiling tables keyed by `(is_3d, mode, elem_log2, pipe_cfg)`.
+/// Only valid combinations (bounded by `PATTERNS` / `PATTERNS_3D` + linear mode 0) are inserted.
+static LAYOUT_CACHE: OnceLock<RwLock<HashMap<(bool, u32, u32, PipeConfig), Layout>>> = OnceLock::new();
+
+fn cached_layout(is_3d: bool, mode: u32, elem_log2: u32, cfg: PipeConfig, build: impl FnOnce() -> Option<Layout>) -> Option<Layout> {
+    let key_cfg = if is_xor(mode) { cfg } else { PipeConfig { pipes_log2: 0, pkrs_log2: 0 } };
+    let key = (is_3d, mode, elem_log2, key_cfg);
+    let cache = LAYOUT_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(&l) = cache.read().unwrap().get(&key) {
+        return Some(l);
+    }
+    let mut g = cache.write().unwrap();
+    if let Some(&l) = g.get(&key) {
+        return Some(l);
+    }
+    let l = build()?;
+    g.insert(key, l);
+    Some(l)
 }
 
 impl Layout {
@@ -81,17 +104,19 @@ impl Layout {
         if elem_log2 > 4 {
             return None;
         }
-        if mode == 0 {
-            let bw = 256 >> elem_log2;
-            let ox = (0..bw as u32).map(|x| x << elem_log2).collect();
-            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0], hx: vec![0], hy: vec![0], hz: vec![0] });
-        }
-        let blk = block_log2(mode)?;
-        let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
-        // block size in elements: 256 B micro block, grown evenly in both directions
-        let (w256, h256) = [(4, 4), (4, 3), (3, 3), (3, 2), (2, 2)][elem_log2 as usize];
-        let amp = blk - 8;
-        Some(Self::from_bits(mode, elem_log2, blk, &bits, (w256 + amp / 2, h256 + amp - amp / 2, 0)))
+        cached_layout(false, mode, elem_log2, cfg, || {
+            if mode == 0 {
+                let bw = 256 >> elem_log2;
+                let ox: &'static [u32] = (0..bw as u32).map(|x| x << elem_log2).collect::<Vec<_>>().leak();
+                return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: &[0], oz: &[0], hx: &[0], hy: &[0], hz: &[0] });
+            }
+            let blk = block_log2(mode)?;
+            let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
+            // block size in elements: 256 B micro block, grown evenly in both directions
+            let (w256, h256) = [(4, 4), (4, 3), (3, 3), (3, 2), (2, 2)][elem_log2 as usize];
+            let amp = blk - 8;
+            Some(Self::from_bits(mode, elem_log2, blk, &bits, (w256 + amp / 2, h256 + amp - amp / 2, 0)))
+        })
     }
 
     /// A 3D texture: the thick modes (4KB_S, 64KB_S / S_T, 4KB_S_X, 64KB_S_X, 64KB_D_X) tile
@@ -101,7 +126,7 @@ impl Layout {
     pub fn new_3d(mode: u32, elem_log2: u32, cfg: PipeConfig) -> Option<Layout> {
         match mode {
             0 | 24 | 27 => Self::new(mode, elem_log2, cfg),
-            5 | 9 | 17 | 21 | 25 | 26 if elem_log2 <= 4 => {
+            5 | 9 | 17 | 21 | 25 | 26 if elem_log2 <= 4 => cached_layout(true, mode, elem_log2, cfg, || {
                 let blk = block_log2(mode)?;
                 let bits = pattern_bits(PATTERNS_3D, mode, elem_log2, cfg)?;
                 // a 1 KB micro block (addrlib Block1K_3d), grown evenly in w, h, d
@@ -109,7 +134,7 @@ impl Layout {
                 let (w1k, h1k, d1k) = [(4, 3, 3), (3, 3, 3), (3, 3, 2), (3, 2, 2), (2, 2, 2)][elem_log2 as usize];
                 let (avg, rest) = ((blk - 10) / 3, (blk - 10) % 3);
                 Some(Self::from_bits(mode, elem_log2, blk, &bits, (w1k + avg, h1k + avg + rest / 2, d1k + avg + u32::from(rest != 0))))
-            }
+            }),
             _ => None,
         }
     }
@@ -117,7 +142,7 @@ impl Layout {
     /// The offset tables of a block `1 << wl` × `1 << hl` × `1 << dl` elements.
     fn from_bits(mode: u32, elem_log2: u32, blk: u32, bits: &[u64; 20], (wl, hl, dl): (u32, u32, u32)) -> Layout {
         // the in-block offset bits coordinate `c << lo` gives
-        let table = |n: usize, shift: u32, lo: u32| -> Vec<u32> {
+        let table = |n: usize, shift: u32, lo: u32| -> &'static [u32] {
             (0..n as u32)
                 .map(|c| {
                     let mut off = 0u32;
@@ -127,7 +152,8 @@ impl Layout {
                     }
                     off
                 })
-                .collect()
+                .collect::<Vec<_>>()
+                .leak()
         };
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
         // the pattern masks are 16 bits: coordinates above them do not matter
@@ -885,6 +911,40 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "mode {mode}, {} B elements", 1 << e);
         }
+    }
+
+    #[test]
+    fn layout_cache_shares_tables_and_isolates_base_xor() {
+        let cfg = PipeConfig { pipes_log2: 4, pkrs_log2: 3 };
+        let mut a = Layout::new(25, 4, cfg).unwrap();
+        let b = Layout::new(25, 4, cfg).unwrap();
+        assert!(std::ptr::eq(a.ox, b.ox) && std::ptr::eq(a.oy, b.oy) && std::ptr::eq(a.hx, b.hx));
+        a.base_xor = 0x1000;
+        assert_eq!(a.base_xor, 0x1000);
+        assert_eq!(Layout::new(25, 4, cfg).unwrap().base_xor, 0, "mutating base_xor must not taint cached Layout");
+
+        // Non-XOR mode shares the same cached tables regardless of PipeConfig.
+        let c1 = Layout::new(9, 4, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        let c2 = Layout::new(9, 4, cfg).unwrap();
+        assert!(std::ptr::eq(c1.ox, c2.ox) && std::ptr::eq(c1.oy, c2.oy));
+
+        // 2D and 3D thick layouts of the same mode do not collide in the cache.
+        let d2 = Layout::new(9, 2, cfg).unwrap();
+        let d3 = Layout::new_3d(9, 2, cfg).unwrap();
+        assert_eq!(d2.block_d, 1);
+        assert!(d3.block_d > 1);
+        assert!(!std::ptr::eq(d2.ox, d3.ox));
+        let d3_again = Layout::new_3d(9, 2, cfg).unwrap();
+        assert!(std::ptr::eq(d3.ox, d3_again.ox) && std::ptr::eq(d3.oz, d3_again.oz));
+
+        // Invalid lookups return None without inserting entries into the cache.
+        assert!(Layout::new(99, 2, cfg).is_none());
+        assert!(Layout::new(9, 5, cfg).is_none());
+        assert!(Layout::new_3d(10, 2, cfg).is_none());
+        let g = LAYOUT_CACHE.get().unwrap().read().unwrap();
+        assert!(!g.contains_key(&(false, 99, 2, cfg)));
+        assert!(!g.contains_key(&(false, 9, 5, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
+        assert!(!g.contains_key(&(true, 10, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
     }
 }
 

@@ -29,6 +29,9 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
+/// slots; the recompiler's `xcl_iw{srsrc}`)
+pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
@@ -115,7 +118,7 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -195,6 +198,9 @@ pub struct Lw {
     pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
+    /// the `s_load_dword*` being lowered repeats an earlier one (`reload`): set by the
+    /// translator's loop for that instruction
+    pub reload: Option<super::reload::Reload>,
     /// the lane's scratch array (an alloca in the entry block)
     pub scratch: Option<Value>,
     /// MIMG instructions (pc) whose S# is built from constants in the code: the HLSL
@@ -208,6 +214,8 @@ pub struct Lw {
     pub f32_rm: bool,
     pub track_frexp_denorm: bool,
     pub has_f64_round_op: bool,
+    /// the T# SGPRs of the program's image stores and atomics (`recomp::emit::image_write_srsrcs`)
+    pub img_writes: Vec<u64>,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,

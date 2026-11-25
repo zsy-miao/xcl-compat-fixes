@@ -45,6 +45,7 @@ pub enum State {
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
+static DEBUG_LAYER: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Candidate directories in search order.
 pub(crate) fn candidates(env_override: Option<PathBuf>, exe_dir: Option<PathBuf>, local_app_data: Option<PathBuf>) -> Vec<PathBuf> {
@@ -354,6 +355,16 @@ pub fn configuration_interface<T: Interface>(clsid: &GUID) -> windows::core::Res
             out.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_NOINTERFACE))
         }
     }
+}
+
+/// Enable the debug layer at most once per process. The GPU test runner may create a
+/// device before D3D12.X starts; enabling it again after that removes the device.
+pub fn enable_debug_layer() -> &'static Result<(), String> {
+    DEBUG_LAYER.get_or_init(|| {
+        let debug = configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug).map_err(|e| e.to_string())?;
+        unsafe { debug.EnableDebugLayer() };
+        Ok(())
+    })
 }
 
 #[cfg(test)]

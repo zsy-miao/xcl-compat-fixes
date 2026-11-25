@@ -1092,6 +1092,15 @@ impl Lw {
                 })
                 .collect::<Vec<_>>()
         } else {
+            // a repeat of a load nothing has changed since: its values (`reload`)
+            let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
+            if let (Some(var), Some(true)) = (slot, self.reload.map(|r| r.available)) {
+                for i in 0..count {
+                    let v = self.rd(var + i);
+                    self.write32(&Dst::S(sdata + i as u64), v);
+                }
+                return Ok(());
+            }
             let imm = ((imm << 11) as i32 >> 11) as u32;
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
@@ -1120,6 +1129,12 @@ impl Lw {
             let up = self.upper;
             for (v, o) in vals.iter_mut().zip(other) {
                 *v = self.sel(up, o, *v);
+            }
+        }
+        // (only an `s_load_dword*` without GLC / DLC has a slot)
+        if let Some(r) = self.reload {
+            for (i, &v) in vals.iter().enumerate() {
+                self.wr(super::reload::VAR_RELOAD + 16 * r.slot + i as u32, v);
             }
         }
         for (i, v) in vals.into_iter().enumerate() {

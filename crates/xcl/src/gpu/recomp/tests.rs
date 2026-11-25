@@ -2332,6 +2332,18 @@ fn draw_console_views(
 /// u = v = pixel centre · 2^0.25 / 8 gives LOD 0.25; offset (+1, 0).
 #[test]
 fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
+    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
+    implicit_lod_between_mips([2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0]);
+}
+
+/// The same with an aniso point (2) min / mag filter and a 4× anisotropy ratio: a nearest filter
+/// with anisotropy on (what a driver writes for one), so the texels are the point filter's.
+#[test]
+fn gpu_ps_image_sample_with_an_aniso_point_filter_samples_points() {
+    implicit_lod_between_mips([2 | 2 << 3 | 2 << 6 | 2 << 9, 0xFFF << 12, 2 << 20 | 2 << 22 | 2 << 26, 0]);
+}
+
+fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
     if !gpu_ready() {
         return;
     }
@@ -2372,8 +2384,6 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     };
     srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
     let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 16 };
-    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
-    let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0];
     let mut sgprs = vec![0u32; 32];
     sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
@@ -2906,7 +2916,7 @@ fn gpu_images_sample_load_store_atomic() {
         assert_eq!([fl(20), fl(21), fl(22), fl(23)], [1.5, 0.0, 1.5, 1.0], "lane {l} sample_l linear");
         assert_eq!([fl(40), fl(41), fl(42), fl(43)], [1.0, 2.0, 2.0, 1.0], "lane {l} gather4 red");
         assert_eq!([fl(14), fl(15)], [x, x + 4.0 * y], "lane {l} image_load dmask x,z");
-        assert_eq!(&v[50..54], &[4, 4, 1, 1], "lane {l} get_resinfo");
+        assert_eq!(&v[50..54], &[4, 4, 0, 1], "lane {l} get_resinfo (depth 0: a DIM without layers, as RDNA2)");
     }
     let t1: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     for i in 0..16 {
@@ -2914,6 +2924,62 @@ fn gpu_images_sample_load_store_atomic() {
     }
     assert_eq!(u32::from_le_bytes(r.textures[1][..4].try_into().unwrap()), 63, "image_atomic_umax");
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
+}
+
+/// An image_load of a T# the program also stores through reads through the UAV when the
+/// invocation stored through that T# before (`xcl_iw16`); a program without image stores
+/// keeps the SRV-only load.
+#[test]
+fn image_load_of_a_stored_image_reads_through_the_uav() {
+    let store = ("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)][..], None);
+    let load = ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)][..], None);
+    let t = translate(&prog(&[store, load]), &Options::default()).unwrap();
+    assert!(t.hlsl.contains("static uint xcl_iw16 = 0u;") && t.hlsl.contains("xcl_iw16 = s16 + 1u;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("_rw = xcl_iw16 == s16 + 1u;") && t.hlsl.matches("RWTexture2D<uint4>").count() == 2, "{}", t.hlsl);
+    let t = translate(&prog(&[load]), &Options::default()).unwrap();
+    assert!(!t.hlsl.contains("xcl_iw") && !t.hlsl.contains("RWTexture2D"), "{}", t.hlsl);
+}
+
+/// An image the program stores to and then loads in the same dispatch (in-place accumulation,
+/// in-place blur, TAA history): RDNA2 reads its own write – the same lane right after the
+/// store, a neighbour after the barrier. Each lane stores 1000 + lane to its texel of an 8x8
+/// R32_UINT image, loads that texel back, and after `s_barrier` loads the texel of lane ^ 1.
+#[test]
+fn gpu_image_load_reads_a_store_of_the_same_dispatch() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // T# in s[16:23] (SRSRC = 4): own texel (v0, v1), neighbour's texel (v3, v4)
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap());
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 11), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 20, 9));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let n = l ^ 1;
+        r[0] = (l % 8) as u32;
+        r[1] = (l / 8) as u32;
+        r[2] = 1000 + l as u32;
+        r[3] = (n % 8) as u32;
+        r[4] = (n / 8) as u32;
+    }
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 8, height: 8, depth: 1, texel_bytes: 4, data: vec![0xEE; 8 * 8 * 4], uav: true }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let t: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for l in 0..64 {
+        assert_eq!(t[l], 1000 + l as u32, "image_store texel {l}");
+    }
+    let bad: Vec<String> = (0..64)
+        .filter(|&l| r.vgpr[l][10] != 1000 + l as u32 || r.vgpr[l][11] != 1000 + (l ^ 1) as u32)
+        .map(|l| format!("lane {l}: own {:#x}, neighbour {:#x}", r.vgpr[l][10], r.vgpr[l][11]))
+        .collect();
+    assert!(bad.is_empty(), "image_load after image_store of the same dispatch (want 1000 + lane, 1000 + (lane ^ 1)):\n{}", bad.join("\n"));
 }
 
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
@@ -3450,6 +3516,36 @@ fn gpu_mesh_mode_two_passes() {
         }
         assert_eq!(records, expected, "all compute record words survive the wide mesh pass");
     }
+}
+
+#[test]
+fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
+    use super::{mesh_passthrough, MsInterface};
+    let sig = |name: &str, sv: u32, reg: u32, idx: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: idx,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface {
+        outputs: vec![sig("SV_Position", 1, 0, 0), sig("TEXCOORD", 0, 1, 0)],
+        threads: 128,
+        max_vertices: 128,
+        max_primitives: 128,
+    };
+    let unsplit = mesh_passthrough(&ms);
+    assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
+    assert!(!unsplit.contains("0x3FFu"), "{unsplit}");
+
+    let ins: Vec<_> = (0..16).map(|k| sig("TEXCOORD", 0, k + 1, k)).collect();
+    assert!(super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins))) > 1);
+    let split = super::emit::mesh_passthrough_for(&ms, Some(&ins));
+    assert!(split.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{split}");
+    assert!(!split.contains("0x3FFu"), "{split}");
 }
 
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
@@ -7966,6 +8062,46 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     assert_eq!(r.vgpr[2][0], 0x0000, "mad_nf_f16 cancellation: (1+2^-10)^2-(1+2^-9) -> 0 (not 2^-20)");
 }
 
+/// `exp mrtz` carries the sample mask in z (32-bit formats; Mesa, ac_nir_lower_ps_late.c
+/// `emit_ps_mrtz_export`), or in the low half of VSRC1 when compressed (UINT16_ABGR): it goes
+/// to SV_Coverage when the console's output signature has one. A depth-only PS is as before.
+#[test]
+fn ps_mrtz_sample_mask_writes_sv_coverage() {
+    use super::PsInterface;
+    let ps = |outputs: Vec<crate::gpu::dxbc::SigElement>, mrtz: &[(&str, u64)]| {
+        let code = prog(&[
+            ("EXP", "ENC_EXP", mrtz, None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None };
+        let pt = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        }
+        pt.hlsl
+    };
+    let target = el("SV_Target", 0, 64, 3, 0, 0xF);
+    let h = ps(vec![target.clone(), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(h.contains("    uint xcl_mask : SV_Coverage;\n") && h.contains("    xo.xcl_mask = 0xFFFFFFFFu;\n") && h.contains("xo.xcl_mask = v5;"), "{h}");
+    // compressed: the mask in VSRC1 [15:0] (EN 0xC)
+    let h = ps(vec![target.clone(), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0xC), ("COMPR", 1), ("VSRC0", 6), ("VSRC1", 5)]);
+    assert!(h.contains("    xo.xcl_mask = 0xFFFFFFFFu;\n") && h.contains("xo.xcl_mask = (v5 & 0xFFFFu);"), "{h}");
+    // SV_Coverage in the signature, but mrtz does not enable the mask channel: do not declare it (would zero every sample)
+    let h = ps(vec![target.clone(), el("SV_Depth", 0, 65, 3, 0xFFFF_FFFF, 1), el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4)]);
+    assert!(!h.contains("SV_Coverage") && !h.contains("xcl_mask"), "{h}");
+    // coverage-only PS: XclOut has SV_Coverage and does not need the dummy target
+    let h = ps(vec![el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(h.contains("    uint xcl_mask : SV_Coverage;\n") && !h.contains("xcl_unused"), "{h}");
+    // no SV_Coverage in the signature: nothing written
+    let h = ps(vec![target.clone()], &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)]);
+    assert!(!h.contains("SV_Coverage") && !h.contains("xcl_mask"), "{h}");
+    // depth only: the interface and the depth write of before
+    let h = ps(vec![target, el("SV_Depth", 0, 65, 3, 0xFFFF_FFFF, 1)], &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4)]);
+    assert!(h.contains("struct XclOut {\n    float4 t0 : SV_Target0;\n    float xcl_depth : SV_Depth;\n};\n"), "{h}");
+    assert!(h.contains("{ xo.xcl_depth = asfloat(v4); }") && !h.contains("xcl_mask"), "{h}");
+}
+
 #[test]
 fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
     use super::PsInterface;
@@ -9064,4 +9200,84 @@ fn gpu_scalar_sext_mulhi_and_vector_i24_sub_co_ci_u64_shifts() {
         let subrev = (inp[6] as u64).wrapping_sub(inp[8] as u64).wrapping_sub(borrow_in as u64) as u32;
         assert_eq!(v[22], subrev, "lane {l} v_subrev_co_ci_u32");
     }
+}
+
+/// image_get_resinfo with DIM 1D or 2D on a 2D MSAA T# (TYPE 14) or a 2D MSAA-array T# (TYPE 15)
+/// gives (width, height, 0, 1) on RDNA2 (AnyPS5#25723, gfx1036). A 4x2 texture of 4 samples, and
+/// a 4x2 array of 3 slices of 4 samples. The level count is 1 on every host: queried through a
+/// Texture2D handle, the multisampled view reported log2(samples) + 1 = 3 on RADV.
+#[test]
+fn gpu_image_get_resinfo_dim_2d_of_an_msaa_tsharp() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |vdata: u64, srsrc: u64, dim: u64| encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", 3), ("SRSRC", srsrc), ("DMASK", 0xF), ("DIM", dim)], None).unwrap();
+    // T# 14 in s[16:23], T# 15 in s[24:31]; DIM 2D, then DIM 1D, on each
+    let mut code = Vec::new();
+    code.extend(mimg(20, 4, 1));
+    code.extend(mimg(24, 4, 0));
+    code.extend(mimg(28, 6, 1));
+    code.extend(mimg(32, 6, 0));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 14));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 77, 15));
+    for r in st.vgpr.iter_mut() {
+        r[3] = 0;
+    }
+    let tex = [
+        TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 1, texel_bytes: 16, data: vec![0; 4 * 2 * 4 * 16], uav: false },
+        TestTexture { dim: TexDim::D2MsArray(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 3, texel_bytes: 16, data: vec![0; 3 * 4 * 2 * 4 * 16], uav: false },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    assert_eq!(&r.vgpr[0][20..24], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample T#");
+    assert_eq!(&r.vgpr[0][24..28], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 1D on a 4-sample T#");
+    assert_eq!(&r.vgpr[0][28..32], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample array T#");
+    assert_eq!(&r.vgpr[0][32..36], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 1D on a 4-sample array T#");
+}
+
+/// image_get_resinfo at a mip past the T#'s last level: RDNA2 gives 0 for width, height and
+/// depth or layers and the level count as usual (AnyPS5#22724, gfx1036; D3D12 GetDimensions
+/// zeroes them past the view's levels, so only channels the translators fill in can differ).
+/// Single-level 2D, 2D array, 3D and cube T#s queried at mips 0, 1, 2, 15 and 0xffffffff.
+#[test]
+fn gpu_image_get_resinfo_past_last_level() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |vdata: u64, srsrc: u64, dim: u64| encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", 3), ("SRSRC", srsrc), ("DMASK", 0xF), ("DIM", dim)], None).unwrap();
+    // (name, VDATA, SRSRC, DIM, T# TYPE)
+    let cases: [(&str, u64, u64, u64, u32); 4] = [("2D", 20, 4, 1, 9), ("2D array", 24, 6, 5, 13), ("3D", 28, 8, 2, 10), ("cube", 32, 10, 3, 11)];
+    let mut code = Vec::new();
+    for &(_, vdata, srsrc, dim, _) in &cases {
+        code.extend(mimg(vdata, srsrc, dim));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    for (i, &(_, _, srsrc, _, ty)) in cases.iter().enumerate() {
+        let s = 4 * srsrc as usize;
+        st.sgpr[s..s + 8].copy_from_slice(&tsharp(2 * i as u32, 77, ty));
+    }
+    let mips = [0u32, 1, 2, 15, 0xFFFF_FFFF];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[3] = mips[l % mips.len()];
+    }
+    let t = |dim: TexDim, width: u32, height: u32, depth: u32| TestTexture { dim, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width, height, depth, texel_bytes: 16, data: vec![0; (width * height * depth * 16) as usize], uav: false };
+    let tex = [t(TexDim::D2, 8, 4, 1), t(TexDim::D2Array, 8, 4, 3), t(TexDim::D3, 8, 4, 2), t(TexDim::Cube, 4, 4, 12)];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, &mip) in mips.iter().enumerate() {
+        for &(name, vdata, ..) in &cases {
+            let v = &r.vgpr[l][vdata as usize..vdata as usize + 4];
+            eprintln!("resinfo {name:9} mip {mip:#010x}: {v:?}");
+            if mip >= 1 && v != [0, 0, 0, 1] {
+                bad.push(format!("{name} mip {mip:#x}: {v:?}, RDNA2 gives [0, 0, 0, 1]"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "resinfo past the last level:\n{}", bad.join("\n"));
 }

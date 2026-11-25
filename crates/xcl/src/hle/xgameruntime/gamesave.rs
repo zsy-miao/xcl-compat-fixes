@@ -381,7 +381,11 @@ pub unsafe extern "system" fn XGameSaveEnumerateContainerInfoByName(p: *mut Prov
 }
 
 unsafe fn each_blob(c: &Container, prefix: &str, ctx: *mut c_void, cb: BlobCb) {
-    for (name, _, size) in blobs_of(&c.dir) {
+    let blobs = {
+        let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+        blobs_of(&c.dir)
+    };
+    for (name, _, size) in blobs {
         if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
@@ -1132,6 +1136,52 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn blob_enumeration_sees_one_submitted_update() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-blob-enum-{}-{nonce}", std::process::id())));
+        let dir = root.0.join("slot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let names: Vec<String> = (0..16).map(|n| format!("blob{n:02}")).collect();
+        let ops = |size| names.iter().map(|name| (name.clone(), Some(vec![0u8; size]))).collect::<Vec<_>>();
+        assert_eq!(apply(&dir, None, &ops(8)), S_OK);
+
+        let mut container = Container { magic: MAGIC_CONTAINER, name: "slot".into(), dir: dir.clone() };
+        let address = &mut container as *mut Container as usize;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_done = done.clone();
+        let reader_start = start.clone();
+        let reader = std::thread::spawn(move || {
+            reader_start.wait();
+            let mut reads = 0usize;
+            let mut mixed = 0usize;
+            while !reader_done.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut rows: Vec<(String, u32)> = Vec::new();
+                let hr = unsafe { XGameSaveEnumerateBlobInfo(address as *mut Container, &mut rows as *mut _ as *mut c_void, Some(blob_names)) };
+                assert_eq!(hr, S_OK);
+                reads += 1;
+                if rows.len() != 16 || rows.iter().any(|(_, size)| *size != rows[0].1) {
+                    mixed += 1;
+                }
+            }
+            (reads, mixed)
+        });
+        start.wait();
+        for round in 0..30 {
+            assert_eq!(apply(&dir, None, &ops(if round % 2 == 0 { 16 } else { 8 })), S_OK);
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reads, mixed) = reader.join().unwrap();
+        assert!(reads > 0, "the reader never enumerated blobs");
+        assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
     }
 
 }

@@ -1283,8 +1283,9 @@ fn shader_flags_follow_plain_instruction_types() {
     }
 }
 
-/// Hand-reduced forms of the fuzz seeds that fail only on AMD (RDNA4,
-/// amdxc64), for bisecting on that hardware: `cargo test -p xcl --lib
+/// Hand-reduced forms of the fuzz seeds that fail only on AMD (722 and 1599
+/// on RDNA4, amdxc64; 540 on RDNA2, a gfx1036 iGPU), for bisecting on that
+/// hardware: `cargo test -p xcl --lib
 /// gpu::dxil::fuzz_tests::amd_reduced_seeds -- --ignored --nocapture`.
 /// Prints one PASS / FAIL line per variant (first mismatching dword) and
 /// panics at the end if any failed. `T::I32` value 0 is the lane index.
@@ -1330,12 +1331,26 @@ fn amd_reduced_seeds() {
         let outs = if rev { vec![5, 3, 9, 4] } else { vec![3] };
         Prog { tys, segs: vec![Seg::Load { slot: 0, dsts: vec![1] }, Seg::Insts(insts)], lane: 0, outs, gpu_safe: true }
     };
+    // Seed 540 shape: b = trunc in[lane] to i1; s = sext b to i64 (RDNA2 gives
+    // its high dword 0: 0x00000000_ffffffff for a set b); seed 540 itself goes
+    // on to ashr(s, 63) - (-7), which then reads 7 instead of 6.
+    let s540 = |shift: bool| {
+        let mut insts = vec![ins(2, Op::Cast(CastOp::Trunc, V(1), T::I1)), ins(3, Op::Cast(CastOp::SExt, V(2), T::I64))];
+        if shift {
+            insts.push(ins(4, Op::Bin(BinOp::AShr, V(3), C(T::I64, 63))));
+            insts.push(ins(5, Op::Bin(BinOp::Sub, V(4), C(T::I64, (-7i64) as u64))));
+        }
+        let tys = vec![T::I32, T::I32, T::I1, T::I64, T::I64, T::I64];
+        Prog { tys, segs: vec![Seg::Load { slot: 0, dsts: vec![1] }, Seg::Insts(insts)], lane: 0, outs: vec![if shift { 5 } else { 3 }], gpu_safe: true }
+    };
     let progs = [
         ("722 switch + WaveReadLaneFirst", s722(false)),
         ("722 switch + WaveReadLaneFirst + Countbits.i64 case", s722(true)),
         ("1599 Countbits.i64(const 2)", s1599(false, false)),
         ("1599 Countbits.i64(const 2) -> shift / Bfrev", s1599(false, true)),
         ("1599 Countbits.i64(dynamic 2) -> shift / Bfrev", s1599(true, true)),
+        ("540 sext i1 -> i64", s540(false)),
+        ("540 sext i1 -> i64 -> ashr 63 - (-7)", s540(true)),
     ];
     let mut failed = 0;
     for (name, p) in &progs {
@@ -1351,7 +1366,7 @@ fn amd_reduced_seeds() {
             }
         }
     }
-    for seed in [722u64, 1599] {
+    for seed in [540u64, 722, 1599] {
         let p = generate(seed);
         let c = emit(&p);
         let mem = inputs(seed);

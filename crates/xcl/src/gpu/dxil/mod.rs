@@ -32,6 +32,7 @@ pub mod module;
 pub mod ops;
 pub mod ops_core;
 mod prelude;
+pub mod reload;
 pub mod shader;
 pub mod ssa;
 pub mod validate;

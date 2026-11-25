@@ -326,6 +326,13 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
+/// atlas (`<= 1M` pixels, up to `2048` on either axis, e.g. a retail title's `2048x128` R8 glyph cache).
+fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool {
+    let pixels = w.saturating_mul(h as u64);
+    w <= 2048 && h <= 2048 && (64 * 64..=1024 * 1024).contains(&pixels) && samples <= 1 && flags & 0x2 == 0
+}
+
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     // (a new texture object, or the address of an old one again: its first upload is not left out)
@@ -348,8 +355,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         let (samples, flags) = (u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let off = *OFF.get_or_init(|| std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
-        // (64x64 and up: 1x1 placeholders are not worth an entry; 0x2: a depth buffer)
-        !off && w <= 1024 && h <= 1024 && w * h as u64 >= 64 * 64 && samples <= 1 && flags & 0x2 == 0
+        !off && is_small_cpu_filled_target(w, h, samples, flags)
     };
     if tex.texels().is_none() || (tex.planes.len() != 1 && !small_target) {
         return Err("a render target / depth buffer".into());
@@ -487,9 +493,26 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     if !any() || len == 0 {
         return;
     }
+    let src = mirror_source(va);
+    let gpu_aliases: Vec<usize> = crate::hle::kernelx::mirrors::gpu_views_of(va)
+        .into_iter()
+        .filter(|&g| g != va && mirror_source(g) == va)
+        .collect();
     let (retired, to_unmap) = {
         let mut t = TEXTURES.lock().unwrap();
-        let (delta, retired, unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+        let (mut delta, mut retired, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+        if src != va {
+            let (d2, r2, u2) = t.retire_range(src, src.saturating_add(len));
+            delta += d2;
+            retired += r2;
+            unmap_ptrs.extend(u2);
+        }
+        for g in gpu_aliases {
+            let (d3, r3, u3) = t.retire_range(g, g.saturating_add(len));
+            delta += d3;
+            retired += r3;
+            unmap_ptrs.extend(u3);
+        }
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (retired, clone_resources(&unmap_ptrs))
@@ -1647,6 +1670,18 @@ mod tests {
         for subs in parallel {
             assert!(subs == expected, "parallel detiling must use the bytes that were hashed");
         }
+    }
+
+    #[test]
+    fn small_cpu_filled_target_accepts_wide_glyph_atlas_and_rejects_large_or_depth() {
+        assert!(is_small_cpu_filled_target(2048, 128, 1, 0x300005), "2048x128 R8 glyph atlas must sync");
+        assert!(is_small_cpu_filled_target(1024, 1024, 1, 0x1));
+        assert!(is_small_cpu_filled_target(64, 64, 1, 0x5));
+        assert!(!is_small_cpu_filled_target(1, 1, 1, 0x1), "1x1 placeholders skipped");
+        assert!(!is_small_cpu_filled_target(2560, 1440, 1, 0x1), "full-screen RT skipped");
+        assert!(!is_small_cpu_filled_target(2048, 1024, 1, 0x1), ">1M pixel RT skipped");
+        assert!(!is_small_cpu_filled_target(256, 256, 1, 0x2), "depth buffers skipped");
+        assert!(!is_small_cpu_filled_target(256, 256, 4, 0x1), "MSAA RTs skipped");
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {

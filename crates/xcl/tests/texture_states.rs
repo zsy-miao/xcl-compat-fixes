@@ -48,19 +48,20 @@ unsafe fn transition(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES
 #[test]
 fn uploads_start_from_each_subresources_state() {
     unsafe {
+        use std::io::Write;
         match xcl::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
             Ok(d) => d.EnableDebugLayer(),
             Err(e) => {
-                println!("SKIPPED uploads_start_from_each_subresources_state: no D3D12 debug layer ({e})");
+                let _ = writeln!(std::io::stderr(), "SKIPPED uploads_start_from_each_subresources_state: no D3D12 debug layer ({e})");
                 return;
             }
         }
         let Ok(dev) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
-            println!("SKIPPED uploads_start_from_each_subresources_state: no GPU");
+            xcl::gpu::recomp::runner::skip_test("no GPU");
             return;
         };
         let Ok(q) = dev.cast::<ID3D12InfoQueue>() else {
-            println!("SKIPPED uploads_start_from_each_subresources_state: the device has no debug layer");
+            let _ = writeln!(std::io::stderr(), "SKIPPED uploads_start_from_each_subresources_state: the device has no debug layer");
             return;
         };
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();

@@ -296,3 +296,37 @@ fn shaders_handles_non_console_file_and_missing_path() {
     let stderr = String::from_utf8(err_out.stderr).unwrap();
     assert!(stderr.contains("xcl shaders:"), "{stderr}");
 }
+
+#[test]
+fn shaders_missing_arguments_prints_help_and_exits_two() {
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders")
+        .output()
+        .expect("spawn xcl shaders");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("xcl shaders <file | folder | package.rpf>"), "{stdout}");
+}
+
+#[test]
+fn shaders_required_options_reject_missing_values() {
+    let dir = TempDir::new("val");
+    let file = dir.path().join("plain.bin");
+    std::fs::write(&file, b"not a shader").unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["--export-hlsl"], "--export-hlsl needs a value"),
+        (&["--export-hlsl", "--record-hash", "DEADBEEF"], "--export-hlsl needs a value"),
+        (&["--record-hash"], "--record-hash needs a value"),
+        (&["--record-hash", "--measure-pso", "CAFE"], "--record-hash needs a value"),
+        (&["--measure-pso"], "--measure-pso needs a value"),
+        (&["--measure-pso", "--json"], "--measure-pso needs a value"),
+    ];
+
+    for (args, expected_msg) in cases {
+        let out = run_shaders(&file, args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?} unexpected status: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(expected_msg), "args {args:?}: {stderr}");
+    }
+}

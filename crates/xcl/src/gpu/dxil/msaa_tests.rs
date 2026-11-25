@@ -219,7 +219,7 @@ fn gpu_direct_msaa_image_loads() {
             let want = if s < 4 { (x + 4 * y + 16 * s) as f32 } else { 0.0 };
             assert_eq!(fl(14 + k as usize), want, "lane {l} image_msaa_load sample {s}");
         }
-        assert_eq!(&v[18..22], &[4, 4, 1, 1], "lane {l} resinfo 2D MSAA");
+        assert_eq!(&v[18..22], &[4, 4, 0, 1], "lane {l} resinfo 2D MSAA (depth 0, as RDNA2)");
         let (z, f2) = ((l / 16 % 3) as u32, (l % 2) as u32);
         assert_eq!(v[22], 1000 * z + 100 * f2 + x + 4 * y, "lane {l} image_load 2D MSAA array");
         for k in 0..4u32 {
@@ -337,7 +337,7 @@ fn gpu_direct_image_get_resinfo_d16() {
     }
     let r = run_direct(&code, &st, &[tex2d, ms_array_u32()]);
     assert_eq!(r.vgpr[0][0], 64 | (32 << 16), "2D D16 resinfo v0: {:#x}", r.vgpr[0][0]);
-    assert_eq!(r.vgpr[0][1], 1 | (1 << 16), "2D D16 resinfo v1: {:#x}", r.vgpr[0][1]);
+    assert_eq!(r.vgpr[0][1], 1 << 16, "2D D16 resinfo v1 (depth 0, mips 1): {:#x}", r.vgpr[0][1]);
     assert_eq!((r.vgpr[0][2], r.vgpr[0][3]), (0xDEAD_BEEF, 0xCAFE_BABE), "2D D16 resinfo clobbered v2/v3");
     assert_eq!(r.vgpr[0][4], 4 | (4 << 16), "MSAA array D16 resinfo v4: {:#x}", r.vgpr[0][4]);
     assert_eq!(r.vgpr[0][5], 3 | (1 << 16), "MSAA array D16 resinfo v5: {:#x}", r.vgpr[0][5]);

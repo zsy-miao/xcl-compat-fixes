@@ -59,10 +59,35 @@ extern "system" {
 extern "system" {
     fn CreateEventW(sa: *const c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void;
     fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+    fn CloseHandle(h: *mut c_void) -> i32;
 }
 
 macro_rules! ensure {
     ($c:expr, $($m:tt)*) => { if !$c { return Err(format!($($m)*)); } };
+}
+
+struct EventHandle(*mut c_void);
+
+impl EventHandle {
+    unsafe fn new() -> Result<Self, String> {
+        let h = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        ensure!(!h.is_null(), "CreateEventW");
+        Ok(Self(h))
+    }
+
+    fn handle(&self) -> windows::Win32::Foundation::HANDLE {
+        windows::Win32::Foundation::HANDLE(self.0)
+    }
+}
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 /// An export of `d3d12_xs.dll` (XCL), looked up by name. Not a static import: the `windows`
@@ -155,9 +180,9 @@ fn pso_desc(rs: &ID3D12RootSignature, vs: D3D12_SHADER_BYTECODE, ps: D3D12_SHADE
 fn wait(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: u64) -> Result<(), String> {
     unsafe {
         queue.Signal(fence, value).map_err(e)?;
-        let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-        fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE(ev)).map_err(e)?;
-        ensure!(WaitForSingleObject(ev, 5000) == 0, "GPU fence {value} not reached");
+        let ev = EventHandle::new()?;
+        fence.SetEventOnCompletion(value, ev.handle()).map_err(e)?;
+        ensure!(WaitForSingleObject(ev.0, 5000) == 0, "GPU fence {value} not reached");
         ensure!(fence.GetCompletedValue() >= value, "fence value {}", fence.GetCompletedValue());
         Ok(())
     }
@@ -305,68 +330,72 @@ pub fn present_x_frame() -> Result<(), String> {
         let output = adapter.EnumOutputs(0).ok();
         let output_raw = output.as_ref().map_or(std::ptr::null_mut(), |o| o.as_raw());
         ensure!(set_interval(d, output_raw, 16667, 1, 0) >= 0, "SetFrameIntervalX");
-        ensure!(schedule(d, 0, 0, std::ptr::null(), 0) >= 0, "ScheduleFrameEventX (origin)");
-        let mut token = 0u64;
-        let hr = wait_event(d, 0, 500, std::ptr::null(), 0, &mut token);
-        ensure!(hr == 0 && token != 0, "WaitFrameEventX hr={hr:#x} token={token}");
+        let res = (|| -> Result<(), String> {
+            ensure!(schedule(d, 0, 0, std::ptr::null(), 0) >= 0, "ScheduleFrameEventX (origin)");
+            let mut token = 0u64;
+            let hr = wait_event(d, 0, 500, std::ptr::null(), 0, &mut token);
+            ensure!(hr == 0 && token != 0, "WaitFrameEventX hr={hr:#x} token={token}");
 
-        let (w, h) = (640u32, 360u32);
-        let tex = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: w as u64,
-            Height: h,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-            ..Default::default()
-        };
-        let mut bb: Option<ID3D12Resource> = None;
-        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut bb)
-            .map_err(e)?;
-        let bb = bb.ok_or("no back buffer")?;
-        let heap: ID3D12DescriptorHeap = dev
-            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
-            .map_err(e)?;
-        let start: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(heap.as_raw(), 9));
-        let rtv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start(heap.as_raw()) };
-        dev.CreateRenderTargetView(&bb, None, rtv);
-        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
-        xslot::<ClearRtv>(&list, X_CLEAR_RENDER_TARGET_VIEW)(list.as_raw(), rtv, &[0.1, 0.5, 0.9, 1.0], 0, std::ptr::null());
-        // consoles want the back buffer in COMMON / PRESENT for PresentX
-        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: transmute_copy(&bb),
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    StateAfter: D3D12_RESOURCE_STATE_PRESENT,
-                }),
-            },
-        }]);
-        list.Close().map_err(e)?;
-        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+            let (w, h) = (640u32, 360u32);
+            let tex = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: w as u64,
+                Height: h,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut bb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut bb)
+                .map_err(e)?;
+            let bb = bb.ok_or("no back buffer")?;
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+                .map_err(e)?;
+            let start: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(heap.as_raw(), 9));
+            let rtv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start(heap.as_raw()) };
+            dev.CreateRenderTargetView(&bb, None, rtv);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+            xslot::<ClearRtv>(&list, X_CLEAR_RENDER_TARGET_VIEW)(list.as_raw(), rtv, &[0.1, 0.5, 0.9, 1.0], 0, std::ptr::null());
+            // consoles want the back buffer in COMMON / PRESENT for PresentX
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: transmute_copy(&bb),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        StateAfter: D3D12_RESOURCE_STATE_PRESENT,
+                    }),
+                },
+            }]);
+            list.Close().map_err(e)?;
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
 
-        // plane 0: { u64 frame token; u32 resource count @8; ID3D12Resource** @0x10 }
-        let resources = [bb.as_raw()];
-        let mut plane = [0u8; 0x40];
-        plane[..8].copy_from_slice(&token.to_le_bytes());
-        plane[8..12].copy_from_slice(&1u32.to_le_bytes());
-        plane[0x10..0x18].copy_from_slice(&(resources.as_ptr() as u64).to_le_bytes());
-        let present: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const u8) -> HRESULT = std::mem::transmute(slot(queue.as_raw(), 30));
-        let hr = present(queue.as_raw(), 1, plane.as_ptr(), std::ptr::null());
-        ensure!(hr == 0, "PresentX hr={hr:#x}");
-        let (mut n, mut stats) = (1u32, [0u8; 0x40]);
-        let hr = statistics(d, token, 0, &mut n, stats.as_mut_ptr());
-        ensure!(hr == 0 && n == 1, "GetFrameStatisticsX hr={hr:#x} count={n}");
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        queue.Signal(&fence, 1).map_err(e)?;
-        wait(&queue, &fence, 1)?;
-        ensure!(set_interval(d, std::ptr::null_mut(), 0, 0, 0) >= 0, "stopping the frame clock");
+            // plane 0: { u64 frame token; u32 resource count @8; ID3D12Resource** @0x10 }
+            let resources = [bb.as_raw()];
+            let mut plane = [0u8; 0x40];
+            plane[..8].copy_from_slice(&token.to_le_bytes());
+            plane[8..12].copy_from_slice(&1u32.to_le_bytes());
+            plane[0x10..0x18].copy_from_slice(&(resources.as_ptr() as u64).to_le_bytes());
+            let present: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const u8) -> HRESULT = std::mem::transmute(slot(queue.as_raw(), 30));
+            let hr = present(queue.as_raw(), 1, plane.as_ptr(), std::ptr::null());
+            ensure!(hr == 0, "PresentX hr={hr:#x}");
+            let (mut n, mut stats) = (1u32, [0u8; 0x40]);
+            let hr = statistics(d, token, 0, &mut n, stats.as_mut_ptr());
+            ensure!(hr == 0 && n == 1, "GetFrameStatisticsX hr={hr:#x} count={n}");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+            wait(&queue, &fence, 1)?;
+            Ok(())
+        })();
+        let stop = set_interval(d, std::ptr::null_mut(), 0, 0, 0);
+        res?;
+        ensure!(stop >= 0, "stopping the frame clock");
         Ok(())
     }
 }
@@ -635,79 +664,118 @@ pub fn direct_storage() -> Result<(), String> {
     type Create = unsafe extern "system" fn(*mut c_void, *const u8, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
     type Open = unsafe extern "system" fn(*mut c_void, *const u16, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
     type Status = unsafe extern "system" fn(*mut c_void, u32, *const u8, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    struct ComPtr(*mut c_void);
+    impl ComPtr {
+        fn new(p: *mut c_void, name: &str) -> Result<Self, String> {
+            ensure!(!p.is_null(), "{name}");
+            Ok(Self(p))
+        }
+    }
+    impl Drop for ComPtr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                        std::mem::transmute(*(*(self.0 as *const *const usize)).add(2));
+                    release(self.0);
+                }
+            }
+        }
+    }
+    struct PhysPage([u64; 1], bool);
+    impl PhysPage {
+        unsafe fn alloc() -> Result<Self, String> {
+            let mut count = 1usize;
+            let mut page = [0u64; 1];
+            ensure!(crate::XMemAllocatePhysicalPages(0, &mut count, page.as_mut_ptr()) != 0, "XMemAllocatePhysicalPages");
+            Ok(Self(page, false))
+        }
+        unsafe fn free(mut self) -> Result<(), String> {
+            self.1 = true;
+            ensure!(crate::XMemFreePhysicalPages(1, self.0.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
+            Ok(())
+        }
+    }
+    impl Drop for PhysPage {
+        fn drop(&mut self) {
+            if !self.1 {
+                unsafe {
+                    let _ = crate::XMemFreePhysicalPages(1, self.0.as_mut_ptr());
+                }
+            }
+        }
+    }
     unsafe {
         let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
         let mut f = std::ptr::null_mut();
-        ensure!(DStorageGetFactory(&IID_FACTORY, &mut f) == 0 && !f.is_null(), "DStorageGetFactory");
+        ensure!(DStorageGetFactory(&IID_FACTORY, &mut f) == 0, "DStorageGetFactory");
+        let f = ComPtr::new(f, "DStorageGetFactory")?;
         let mut desc = [0u8; 0x18];
         desc[8..10].copy_from_slice(&16u16.to_le_bytes()); // file source, capacity 16, normal priority
         let mut q = std::ptr::null_mut();
-        ensure!(std::mem::transmute::<usize, Create>(slot(f, 3))(f, desc.as_ptr(), &IID_QUEUE, &mut q) == 0, "CreateQueue");
+        ensure!(std::mem::transmute::<usize, Create>(slot(f.0, 3))(f.0, desc.as_ptr(), &IID_QUEUE, &mut q) == 0, "CreateQueue");
+        let q = ComPtr::new(q, "CreateQueue")?;
         let exe = std::env::current_exe().map_err(|x| x.to_string())?;
         let path: Vec<u16> = exe.to_string_lossy().encode_utf16().chain([0]).collect();
         let mut file = std::ptr::null_mut();
-        ensure!(std::mem::transmute::<usize, Open>(slot(f, 4))(f, path.as_ptr(), &IID_FILE, &mut file) == 0, "OpenFile {}", exe.display());
+        ensure!(std::mem::transmute::<usize, Open>(slot(f.0, 4))(f.0, path.as_ptr(), &IID_FILE, &mut file) == 0, "OpenFile {}", exe.display());
+        let file = ComPtr::new(file, "OpenFile")?;
         let mut status = std::ptr::null_mut();
-        ensure!(std::mem::transmute::<usize, Status>(slot(f, 5))(f, 1, std::ptr::null(), &IID_STATUS, &mut status) == 0, "CreateStatusArray");
+        ensure!(std::mem::transmute::<usize, Status>(slot(f.0, 5))(f.0, 1, std::ptr::null(), &IID_STATUS, &mut status) == 0, "CreateStatusArray");
+        let status = ComPtr::new(status, "CreateStatusArray")?;
 
         let mut dst = vec![0u8; 512];
         let mut req = [0u8; 0x48];
         req[8..16].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
         req[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
-        req[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+        req[0x20..0x28].copy_from_slice(&(file.0 as u64).to_le_bytes());
         req[0x30..0x34].copy_from_slice(&512u32.to_le_bytes());
         let dev = device()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q, 3))(q, req.as_ptr());
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(slot(q, 4))(q, status, 0);
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u64)>(slot(q, 5))(q, fence.as_raw(), 1);
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(slot(q, 6))(q);
-        let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-        fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE(ev)).map_err(e)?;
-        ensure!(WaitForSingleObject(ev, 5000) == 0, "the DirectStorage fence was not signalled");
-        let hr = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u32) -> HRESULT>(slot(status, 4))(status, 0);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q.0, 3))(q.0, req.as_ptr());
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(slot(q.0, 4))(q.0, status.0, 0);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u64)>(slot(q.0, 5))(q.0, fence.as_raw(), 1);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(slot(q.0, 6))(q.0);
+        let ev = EventHandle::new()?;
+        fence.SetEventOnCompletion(1, ev.handle()).map_err(e)?;
+        ensure!(WaitForSingleObject(ev.0, 5000) == 0, "the DirectStorage fence was not signalled");
+        let hr = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u32) -> HRESULT>(slot(status.0, 4))(status.0, 0);
         ensure!(hr == 0, "request status {hr:#x}");
         let disk = std::fs::read(&exe).map_err(|x| x.to_string())?;
         ensure!(dst[..] == disk[..512] && dst.starts_with(b"MZ"), "the read bytes are not the file's");
 
         // Also check physical-page destination (bit 21) and CancelRequestsWithTag.
-        let mut page_count = 1usize;
-        let mut page = [0u64; 1];
-        ensure!(crate::XMemAllocatePhysicalPages(0, &mut page_count, page.as_mut_ptr()) != 0, "XMemAllocatePhysicalPages");
+        let mut page = PhysPage::alloc()?;
         let mut req_phys = [0u8; 0x48];
         req_phys[0..8].copy_from_slice(&(1u64 << 21).to_le_bytes()); // DestinationIsPhysicalPages
-        req_phys[8..16].copy_from_slice(&(page.as_ptr() as u64).to_le_bytes());
+        req_phys[8..16].copy_from_slice(&(page.0.as_ptr() as u64).to_le_bytes());
         req_phys[0x10..0x12].copy_from_slice(&0x80u16.to_le_bytes()); // DestinationPageOffset
         req_phys[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
-        req_phys[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+        req_phys[0x20..0x28].copy_from_slice(&(file.0 as u64).to_le_bytes());
         req_phys[0x30..0x34].copy_from_slice(&512u32.to_le_bytes());
         let mut cancelled_dst = vec![0u8; 512];
         let mut req_cancel = [0u8; 0x48];
         req_cancel[8..16].copy_from_slice(&(cancelled_dst.as_mut_ptr() as u64).to_le_bytes());
         req_cancel[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
-        req_cancel[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+        req_cancel[0x20..0x28].copy_from_slice(&(file.0 as u64).to_le_bytes());
         req_cancel[0x30..0x34].copy_from_slice(&512u32.to_le_bytes());
         req_cancel[0x38..0x40].copy_from_slice(&0xCAFE_0001u64.to_le_bytes()); // CancellationTag
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q, 3))(q, req_phys.as_ptr());
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q, 3))(q, req_cancel.as_ptr());
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u64, u64)>(slot(q, 7))(q, 0xFFFF_0000, 0xCAFE_0000);
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(slot(q, 4))(q, status, 0);
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u64)>(slot(q, 5))(q, fence.as_raw(), 2);
-        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(slot(q, 6))(q);
-        fence.SetEventOnCompletion(2, windows::Win32::Foundation::HANDLE(ev)).map_err(e)?;
-        ensure!(WaitForSingleObject(ev, 5000) == 0, "the second DirectStorage fence was not signalled");
-        let hr2 = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u32) -> HRESULT>(slot(status, 4))(status, 0);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q.0, 3))(q.0, req_phys.as_ptr());
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q.0, 3))(q.0, req_cancel.as_ptr());
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u64, u64)>(slot(q.0, 7))(q.0, 0xFFFF_0000, 0xCAFE_0000);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(slot(q.0, 4))(q.0, status.0, 0);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u64)>(slot(q.0, 5))(q.0, fence.as_raw(), 2);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(slot(q.0, 6))(q.0);
+        fence.SetEventOnCompletion(2, ev.handle()).map_err(e)?;
+        ensure!(WaitForSingleObject(ev.0, 5000) == 0, "the second DirectStorage fence was not signalled");
+        let hr2 = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u32) -> HRESULT>(slot(status.0, 4))(status.0, 0);
         ensure!(hr2 == 0, "physical-page request status {hr2:#x}");
-        let mapped = crate::XMemMapPhysicalPages(std::ptr::null_mut(), 1, page.as_mut_ptr());
+        let mapped = crate::XMemMapPhysicalPages(std::ptr::null_mut(), 1, page.0.as_mut_ptr());
         ensure!(!mapped.is_null(), "XMemMapPhysicalPages");
         let phys_slice = std::slice::from_raw_parts((mapped as *const u8).add(0x80), 512);
         ensure!(phys_slice == &disk[..512], "physical-page DirectStorage read mismatch");
         ensure!(cancelled_dst.iter().all(|&b| b == 0), "cancelled DirectStorage request wrote to destination");
-        ensure!(crate::XMemFreePhysicalPages(1, page.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
-
-        for o in [status, file, q] {
-            std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(slot(o, 2))(o);
-        }
+        page.free()?;
         Ok(())
     }
 }
@@ -1133,10 +1201,10 @@ pub fn mfplat_reset_dxgi_device_manager() -> Result<(), String> {
     type TestDeviceFn = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
 
     unsafe {
+        let dev = device()?;
         let hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
         ensure!(hr >= 0, "MFStartup hr={hr:#x}");
 
-        let dev = device()?;
         let mut token: u32 = 0;
         let mut mgr: *mut c_void = std::ptr::null_mut();
         let hr = MFCreateDXGIDeviceManager(&mut token, &mut mgr);

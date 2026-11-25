@@ -443,7 +443,7 @@ impl<I: Ir> Lower<'_, I> {
             let z = self.c(0);
             let bit = self.ir.icmp(Cmp::Ne, w, z);
             self.write_bit(b, sd, bit);
-            let scc = self.mask_nonzero(bit);
+            let scc = self.mask_nonzero_scc(bit);
             self.write_scc(b, scc);
             return Ok(true);
         }
