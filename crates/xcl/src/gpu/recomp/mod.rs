@@ -203,6 +203,10 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slot of a compute dispatch's loop budget (`dispatch_loop_budget`): the passes the lanes
+/// of one of its thread groups may run together in one entry of a loop, 0 = not known (an
+/// indirect dispatch, a test: 65 536 a lane, as the lane's whole budget).
+pub const IO_LOOP_BUDGET: usize = 113;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -640,11 +644,31 @@ impl Conts {
 }
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
+/// the prelude: 65 536; in a compute program each entry of a loop besides, by the dispatch's
+/// size: `Em::loop_guard`, `dispatch_loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// The passes all the lanes of one compute dispatch may run together in one entry of a loop
+/// before the loop is ended (`Em::loop_guard`). 65 536 passes a lane keep a small dispatch
+/// busy for a moment and a large one for far longer than Windows waits for the GPU (2 s, then
+/// the device is removed): a retail program of 4 x 4 x 4 threads given a loop count that never
+/// comes, dispatched as 16 x 16 x 16 groups on an RTX 3060 Ti, measured 0.47 ms a pass – 31 s
+/// for 65 536 of them, 0.5 s for the 1024 a lane that this many passes in all leave it.
+pub const DISPATCH_LOOP_PASSES: u64 = 1 << 28;
+/// The passes of one entry of a loop a lane has however large its dispatch is: a working
+/// program's loop is not cut short because many threads run it.
+pub const DISPATCH_LOOP_PASSES_MIN: u32 = 1024;
+
+/// What a compute dispatch of `groups` thread groups puts into `IO_LOOP_BUDGET`: its share of
+/// `DISPATCH_LOOP_PASSES` for one group. The program divides it by its threads per group
+/// (between `DISPATCH_LOOP_PASSES_MIN` and 65 536 a lane); never 0, which means "not known".
+pub fn dispatch_loop_budget(groups: [u32; 3]) -> u32 {
+    let n: u64 = groups.iter().map(|&g| g.max(1) as u64).product();
+    (DISPATCH_LOOP_PASSES / n).clamp(1, u32::MAX as u64) as u32
+}
 
 /// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
 /// Each guard of the structured form lists every pending skip flag, so it grows with the
@@ -1023,7 +1047,11 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
+                let (before, guard) = em.loop_guard();
+                if !before.is_empty() {
+                    body.push_str(&format!("{ipad}{before}\n"));
+                }
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {guard}\n"));
                 let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -1144,7 +1172,11 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
+            let (before, guard) = em.loop_guard();
+            if !before.is_empty() {
+                body.push_str(&format!("{pad}{before}\n"));
+            }
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {guard}\n"));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);

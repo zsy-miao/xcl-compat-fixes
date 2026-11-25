@@ -7463,6 +7463,124 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
     }
 }
 
+/// A loop that only ends when its counter wraps to 0, then global_store_dword [v0 * 4], the
+/// counter: the passes a lane ran before the loop was ended.
+fn endless_loop_program() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// The same loop inside one of three passes: global_store_dword [v0 * 4], the sum of the
+/// inner loop's passes over its three entries.
+fn endless_loop_entered_three_times() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),
+        // the outer loop: three passes
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 10)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 131)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 12)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// `IO_LOOP_BUDGET`: one thread group's share of `DISPATCH_LOOP_PASSES` – all of it for a
+/// dispatch of one group, less the more groups there are, and never 0 ("not known").
+#[test]
+fn dispatch_loop_budget_shrinks_with_the_groups() {
+    use super::{dispatch_loop_budget as budget, DISPATCH_LOOP_PASSES};
+    assert_eq!(budget([1, 1, 1]) as u64, DISPATCH_LOOP_PASSES);
+    assert_eq!(budget([16, 16, 16]) as u64, DISPATCH_LOOP_PASSES / 4096);
+    // 64 threads a group: 1024 passes a lane
+    assert_eq!(budget([16, 16, 16]) / 64, 1024);
+    // a count of 0 dispatches nothing: as 1
+    assert_eq!(budget([0, 8, 0]), budget([1, 8, 1]));
+    assert_eq!(budget([65_535, 65_535, 65_535]), 1);
+}
+
+/// Only the loops of a compute program count their own passes against the dispatch's share:
+/// the HLSL of every other program (and with it the DXIL cache's key) is as it was.
+#[test]
+fn only_compute_programs_with_a_loop_read_the_dispatch_loop_budget() {
+    let cs = super::CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let compute = Options { mode: Mode::Compute(cs), wave64: false, ..Default::default() };
+    let looping = translate(&endless_loop_program(), &compute).unwrap();
+    assert!(looping.complete(), "{:?}", looping.unsupported_why);
+    let read = format!("uint xcl_gb = io.Load({}u); if (xcl_gb != 0u) xcl_cap = clamp(xcl_gb / 64u, 1024u, 1u << 16);", super::IO_LOOP_BUDGET * 4);
+    assert_eq!(looping.hlsl.matches(&read).count(), 1, "{}", looping.hlsl);
+    assert_eq!(looping.hlsl.matches("static uint xcl_cap = 1u << 16;").count(), 1, "{}", looping.hlsl);
+    assert!(looping.hlsl.contains("uint xcl_n1 = xcl_cap;"), "{}", looping.hlsl);
+    assert!(looping.hlsl.contains("if (xcl_n1 == 0u) break; xcl_n1--; if (xcl_budget == 0u) break; xcl_budget--;"), "{}", looping.hlsl);
+    // each loop has a count of its own
+    let nested = translate(&endless_loop_entered_three_times(), &compute).unwrap();
+    assert!(nested.hlsl.contains("uint xcl_n1 = xcl_cap;") && nested.hlsl.contains("uint xcl_n2 = xcl_cap;"), "{}", nested.hlsl);
+    // the same program as a kernel, and a compute program without a loop
+    let kernel = translate(&endless_loop_program(), &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(kernel.hlsl.contains("xcl_budget--") && !kernel.hlsl.contains("xcl_cap") && !kernel.hlsl.contains("xcl_gb"), "{}", kernel.hlsl);
+    let straight = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let straight = translate(&straight, &compute).unwrap();
+    assert!(!straight.hlsl.contains("xcl_cap") && !straight.hlsl.contains("xcl_gb") && !straight.hlsl.contains("xcl_budget--"), "{}", straight.hlsl);
+}
+
+/// A compute program's loop that never meets its exit runs the passes its dispatch gives one
+/// entry of a loop: `IO_LOOP_BUDGET` among the group's threads, between 1024 and 65 536 a
+/// lane, the same in every thread (both halves of a split wave64). A dispatch that does not
+/// say (0) leaves it the lane's 65 536. Entered three times the loop runs them three times:
+/// loops inside one another are not cut to one loop's share. The HLSL path: the direct
+/// translator has its own fixed budget.
+#[test]
+fn gpu_compute_loop_passes_follow_the_dispatch() {
+    if !gpu_ready() {
+        return;
+    }
+    let threads = 64u32;
+    let run = |p: &[u8], wave64: bool, slot: u32| -> u32 {
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+        let t = translate(p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut io = [0u32; 128];
+        io[super::IO_LOOP_BUDGET] = slot;
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        for (k, &got) in mem.iter().take(threads as usize).enumerate() {
+            assert_eq!(got, mem[0], "wave{}, slot {slot}: thread {k}", if wave64 { 64 } else { 32 });
+        }
+        mem[0]
+    };
+    for wave64 in [false, true] {
+        // (the slot, passes): not known; 5000 a lane; shares below and above the bounds
+        for (slot, passes) in [(0u32, 65_536u32), (threads * 5000, 5000), (1, 1024), (u32::MAX, 65_536)] {
+            assert_eq!(run(&endless_loop_program(), wave64, slot), passes, "wave64 {wave64}, slot {slot}");
+        }
+        // three entries of 1024 passes; without a share the first entry spends the lane's
+        // budget (but for the outer loop's own pass) and ends the program
+        assert_eq!(run(&endless_loop_entered_three_times(), wave64, 1), 3 * 1024, "wave64 {wave64}");
+        assert_eq!(run(&endless_loop_entered_three_times(), wave64, 0), 65_535, "wave64 {wave64}");
+    }
+}
+
 /// v_fract_f32 at the edges, as RDNA computes it (x - floor(x) kept below 1.0): ±inf gives
 /// NaN and a NaN stays NaN – a `min()` clamp returned 0.99999994 there on NVIDIA (HLSL min
 /// returns its non-NaN operand); a tiny negative value rounds to the largest float below 1.
