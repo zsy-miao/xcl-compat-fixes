@@ -22,7 +22,7 @@ mod lanes;
 pub mod lower;
 mod lower_geom;
 mod lower_gfx;
-mod lower_image;
+pub(crate) mod lower_image;
 mod lower_mem;
 mod lower_round;
 mod lower_valu;

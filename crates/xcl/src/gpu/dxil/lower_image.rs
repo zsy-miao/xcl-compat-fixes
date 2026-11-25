@@ -15,7 +15,7 @@ use crate::gpu::rdna2::{self, Decoded};
 /// (`console_heap::GLOBAL_MAX = 1 << 21`, leaving `index + 1` in-bounds for the paired UAV).
 /// Guarding / clamping dynamic heap indices prevents AMD Tier-3 GPUs from page-faulting
 /// on null, uninitialized, or unpatched console T# descriptors.
-const VIEW_HEAP_MAX_SRV: u32 = (1 << 21) - 1;
+pub(crate) const VIEW_HEAP_MAX_SRV: u32 = crate::hle::d3d12x::console_heap::GLOBAL_MAX - 1;
 /// D3D12 shader-visible sampler heap limit (`2048` samplers: `0..=2047`).
 const SAMPLER_HEAP_MASK: u32 = 0x7FF;
 
@@ -1143,12 +1143,12 @@ mod heap_bounds_tests {
         let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
-        assert!(dis.contains("2097151"), "expected VIEW_HEAP_MAX_SRV guard in direct DXIL:\n{dis}");
+        assert!(dis.contains(&super::VIEW_HEAP_MAX_SRV.to_string()), "expected VIEW_HEAP_MAX_SRV guard in direct DXIL:\n{dis}");
         assert!(dis.contains("2047"), "expected 0x7FF sampler heap mask in direct DXIL:\n{dis}");
 
         let hlsl = recomp::translate(&code, &recomp::Options::default()).expect("hlsl translate");
         assert!(hlsl.complete(), "hlsl unsupported: {:?}", hlsl.unsupported);
-        assert!(hlsl.hlsl.contains("2097151u"), "expected VIEW_HEAP_MAX_SRV check in HLSL");
+        assert!(hlsl.hlsl.contains(&format!("{}u", super::VIEW_HEAP_MAX_SRV)), "expected VIEW_HEAP_MAX_SRV check in HLSL");
         assert!(hlsl.hlsl.contains("& 0x7FFu"), "expected 0x7FFu sampler heap mask in HLSL");
         assert!(!hlsl.hlsl.contains("& 0xFFFu"), "unexpected unclamped 0xFFFu sampler mask in HLSL");
         // Ensure atomic UAV handle creation is inside the guarded `if (and(..., ..._ok))` block.
@@ -1167,11 +1167,11 @@ mod heap_bounds_tests {
         let k = kernel::translate_pixel(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &ps).expect("direct ps translate");
         validate::validate(&k.dxil).expect("dxil ps validate");
         let dis = validate::disassemble(&k.dxil).expect("dxil ps disassemble");
-        assert!(dis.contains("2097151"), "expected VIEW_HEAP_MAX_SRV clamp in PS DXIL:\n{dis}");
+        assert!(dis.contains(&super::VIEW_HEAP_MAX_SRV.to_string()), "expected VIEW_HEAP_MAX_SRV clamp in PS DXIL:\n{dis}");
         assert!(dis.contains("2047"), "expected 0x7FF sampler mask in PS DXIL:\n{dis}");
 
         let hlsl = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Pixel(ps), ..Default::default() }).expect("hlsl ps translate");
         assert!(hlsl.complete(), "hlsl ps unsupported: {:?}", hlsl.unsupported);
-        assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains("2097151u"), "expected convergent clamp in PS HLSL");
+        assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains(&format!("{}u", super::VIEW_HEAP_MAX_SRV)), "expected convergent clamp in PS HLSL");
     }
 }

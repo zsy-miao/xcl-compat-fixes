@@ -94,7 +94,11 @@ static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
 static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
-const GLOBAL_MAX: u32 = 1 << 21;
+pub const GLOBAL_MAX: u32 = 1_000_000;
+// (one million: what every resource binding tier 2+ GPU takes. The translated shaders accept a
+// T# index only below it (`gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV`), so the heap must never be
+// smaller than that bound: an index past the heap's end hangs NVIDIA GPUs, which took 1 000 000
+// while the bound was 2^21 – a raw console T# of a texture at 256–512 MB passed it.)
 
 /// view slots per page of a heap's place in the shared heap (2 PC descriptors each)
 pub const PAGE_SLOTS: u32 = 256;
@@ -133,6 +137,18 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
     Some(*next - count)
 }
 
+/// Descriptors of the shared heap on `dev`: what it takes (OPTIONS19; 1 000 000 without it), at
+/// most `GLOBAL_MAX`.
+unsafe fn global_cap(dev: &ID3D12Device) -> u32 {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    let max = if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.MaxViewDescriptorHeapSize > 0 {
+        o.MaxViewDescriptorHeapSize
+    } else {
+        1_000_000
+    };
+    max.min(GLOBAL_MAX)
+}
+
 /// The shared shader-visible heap, made on first use. False: there is none (it could not be
 /// made) – view heaps then keep their own.
 pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
@@ -142,13 +158,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         if GLOBAL_FAILED.load(Relaxed) {
             return false;
         }
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        let max = if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.MaxViewDescriptorHeapSize > 0 {
-            o.MaxViewDescriptorHeapSize
-        } else {
-            1_000_000
-        };
-        let cap = max.min(GLOBAL_MAX);
+        let cap = global_cap(dev);
         let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
         let heap: ID3D12DescriptorHeap = match dev.CreateDescriptorHeap(&d) {
             Ok(h) => h,
@@ -579,6 +589,23 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every T# index the translated shaders accept, and its UAV at `tw0 + 1`, is inside the
+    /// shared heap this GPU gets: an index past the heap's end hangs NVIDIA GPUs (whose heap is
+    /// 1 000 000, while the shaders accepted indices up to 2^21 - 2).
+    #[test]
+    fn the_shaders_t_sharp_index_bound_fits_the_shared_heap() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let cap = unsafe { global_cap(&dev.unwrap()) };
+        let bound = crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV;
+        // accepted: tw0 < bound, so the highest UAV index is bound - 1 + 1 = bound
+        assert!(bound < cap, "shaders accept indices up to {bound}, the shared heap holds {cap}");
+    }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and
     /// none past its size.

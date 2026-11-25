@@ -2600,7 +2600,7 @@ impl Em {
         // Guard against null / unpatched / OOB T# descriptors so AMD Tier-3 GPUs never page-fault
         // indexing `ResourceDescriptorHeap` (valid XCL T#: type >= 8, BASE_ADDRESS_HI cleared,
         // SRV index < (1 << 21) - 1 so `tw0 + 1` stays in bounds without wrapping).
-        self.line(&format!("bool {t}_ok = (({tw3} >> 28) >= 8u) && ((({tw1}) & 0xFFu) == 0u) && (({tw0}) < 2097151u);"));
+        self.line(&format!("bool {t}_ok = (({tw3} >> 28) >= 8u) && ((({tw1}) & 0xFFu) == 0u) && (({tw0}) < {}u);", crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV));
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
         let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
