@@ -177,7 +177,7 @@ mod tests {
         let request = Request { options: SOURCE_MEMORY_BIT | (7 << BCPACK_SHIFT), source: source.as_ptr() as u64,
             source_size: source.len() as u32, destination: destination.as_ptr() as u64, destination_size: 64, ..Default::default() };
         assert_eq!(request.check(true), Ok(()));
-        assert_eq!(unsafe { execute(&request, None, None, None) }, Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&request, None, None, false, None) }, Err(E_DECOMPRESSION));
         let mut captures = Captures::default();
         let binary = unsafe { capture_to(&directory.0, &mut captures, &request) }.unwrap().unwrap();
         assert_eq!(std::fs::read(&binary).unwrap(), source);
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(metadata["source_kind"], "memory");
         assert_eq!(destination, [0xA5; 64]);
         assert_eq!(request.check(true), Ok(()));
-        assert_eq!(unsafe { execute(&request, None, None, None) }, Err(E_DECOMPRESSION));
+        assert_eq!(unsafe { execute(&request, None, None, false, None) }, Err(E_DECOMPRESSION));
     }
 
     #[test]
@@ -242,7 +242,7 @@ mod tests {
             assert_eq!(metadata["source_offset"], 6);
             assert_eq!(metadata["source_size"], 7);
             assert_eq!(metadata["source_file"], source_path.to_string_lossy().as_ref());
-            assert_eq!(execute(&request, Some(&file), None, None), Err(E_DECOMPRESSION));
+            assert_eq!(execute(&request, Some(&file), None, false, None), Err(E_DECOMPRESSION));
             assert_eq!(destination, [0xA5; 64], "capture must not change the destination or refusal");
             release::<FileInner>(object);
         }
