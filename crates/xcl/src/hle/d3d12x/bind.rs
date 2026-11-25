@@ -939,6 +939,13 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     bind_abi(this, list, pso, false)?;
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
+    if mark != 0 {
+        with(this, |s| {
+            if let Some(l) = s.layout.as_ref() {
+                super::culprit::note_args(mark, s.pso, pso, &l.params, &s.args);
+            }
+        });
+    }
     list.Dispatch(x, y, z);
     super::culprit::after_dispatch(list, mark);
     Ok(())

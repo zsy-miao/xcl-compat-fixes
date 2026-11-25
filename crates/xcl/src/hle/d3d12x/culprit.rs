@@ -47,6 +47,94 @@ pub unsafe fn note_compute(pso: usize, desc: *const c_void) {
     CS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, h);
 }
 
+/// `XCL_GPU_CULPRIT_ARGS=<cs>[,<cs>…]` (with `XCL_GPU_CULPRIT=1`): the console compute shaders,
+/// by the hashes the culprit lines name, whose dispatches also keep their root arguments. A
+/// dispatch of one of them that is started and not done is logged with them: its root
+/// constants, and the first words of each root buffer as recorded and as they are when the
+/// report is made (a title-supplied loop count read from a constant buffer shows here).
+fn args_wanted(cs: u64) -> bool {
+    static WANTED: OnceLock<Vec<u64>> = OnceLock::new();
+    let w = WANTED.get_or_init(|| parse_hashes(&std::env::var("XCL_GPU_CULPRIT_ARGS").unwrap_or_default()));
+    cs != 0 && w.contains(&cs)
+}
+
+fn parse_hashes(list: &str) -> Vec<u64> {
+    list.split([',', ' ', ';'])
+        .filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+/// Words of a root buffer kept per dispatch.
+const ARG_WORDS: usize = 16;
+
+/// What a dispatch's root arguments say: one line, and the root buffers to read again later.
+fn describe_args(params: &[super::console_list::Param], args: &[u8], read: impl Fn(usize, usize) -> Option<Vec<u32>>) -> (String, Vec<usize>) {
+    use super::console_list::Param;
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let mut what = Vec::new();
+    let mut buffers = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        match *p {
+            Param::Constants { at, count } => {
+                let w: Vec<u32> = (0..count as usize).filter_map(|k| word(at as usize + 4 * k)).collect();
+                what.push(format!("p{i} constants {w:x?}"));
+            }
+            Param::Descriptor { at } => {
+                let va = (word(at as usize).unwrap_or(0) as u64 | (word(at as usize + 4).unwrap_or(0) as u64) << 32) as usize;
+                match read(va, ARG_WORDS).filter(|_| va != 0) {
+                    Some(w) => {
+                        what.push(format!("p{i} buffer {va:#x}: {w:x?}"));
+                        buffers.push(va);
+                    }
+                    None => what.push(format!("p{i} buffer {va:#x} (not readable)")),
+                }
+            }
+            Param::Table { at } => what.push(format!("p{i} table {:#x}", word(at as usize).unwrap_or(0))),
+        }
+    }
+    (what.join("; "), buffers)
+}
+
+/// `n` words at title address `va`, when the CPU can read them.
+fn read_words(va: usize, n: usize) -> Option<Vec<u32>> {
+    // SAFETY: `readable` checked the whole range first
+    (va != 0 && crate::gpu::shader::readable(va, 4 * n)).then(|| (0..n).map(|k| unsafe { ((va + 4 * k) as *const u32).read_unaligned() }).collect())
+}
+
+/// Root arguments kept for marked dispatches: number → (arguments as recorded, root buffers).
+static ARGS: Mutex<Option<HashMap<u32, (String, Vec<usize>)>>> = Mutex::new(None);
+
+/// After `before_dispatch` gave a dispatch number `id`: keep its root arguments when its console
+/// CS is one of `XCL_GPU_CULPRIT_ARGS`.
+pub fn note_args(id: u32, title_pso: usize, pso: usize, params: &[super::console_list::Param], args: &[u8]) {
+    if id == 0 || !args_wanted(cs_of(title_pso, pso)) {
+        return;
+    }
+    let kept = describe_args(params, args, read_words);
+    let mut g = ARGS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= 4096 {
+        // the oldest numbers go first: they are the least likely still open
+        let min = *m.keys().min().unwrap();
+        m.remove(&min);
+    }
+    m.insert(id, kept);
+}
+
+/// The kept root arguments of dispatch `id`, with each root buffer's words now.
+fn args_of(id: u32) -> Option<String> {
+    let g = ARGS.lock().unwrap();
+    let (recorded, buffers) = g.as_ref()?.get(&id)?;
+    let now: Vec<String> = buffers
+        .iter()
+        .map(|&va| match read_words(va, ARG_WORDS) {
+            Some(w) => format!("{va:#x} now {w:x?}"),
+            None => format!("{va:#x} now not readable"),
+        })
+        .collect();
+    Some(format!("recorded: {recorded}{}{}", if now.is_empty() { "" } else { "; " }, now.join("; ")))
+}
+
 /// The title's pipeline, or the one it stands for (a background build).
 fn cs_of(title_pso: usize, pso: usize) -> u64 {
     let g = CS.lock().unwrap();
@@ -204,6 +292,9 @@ pub fn on_watchdog_release() {
         crate::xlog_warn!("GPU culprit: list {list:#x}: marker in #{i}, last marker out #{o}; {} of its dispatches not known done:", left.len());
         for (id, s) in left.iter().take(24) {
             crate::xlog_warn!("GPU culprit:   #{id}: {s}");
+            if let Some(a) = args_of(*id) {
+                crate::xlog_warn!("GPU culprit:   #{id} root arguments, {a}");
+            }
         }
     }
 }
@@ -224,6 +315,35 @@ mod tests {
         let what: HashMap<u32, (usize, String)> =
             [(10, (0xB, "b10".to_string())), (11, (0xA, "a11".to_string())), (12, (0xB, "b12".to_string()))].into_iter().collect();
         assert_eq!(not_done(&what, 0xB, 12, 10), vec![(12, "b12")], "11 belongs to another list");
+    }
+
+    /// `XCL_GPU_CULPRIT_ARGS` takes the hashes as the culprit lines print them, with or without
+    /// `0x`, separated by commas, spaces or semicolons; anything else is left out.
+    #[test]
+    fn culprit_args_hashes_parse_as_printed() {
+        assert_eq!(parse_hashes("a542b07e605c8fd7"), vec![0xa542b07e605c8fd7]);
+        assert_eq!(parse_hashes(" 0x777348c43857fdd2, a542b07e605c8fd7;zz "), vec![0x777348c43857fdd2, 0xa542b07e605c8fd7]);
+        assert!(parse_hashes("").is_empty());
+    }
+
+    /// The kept arguments name every root parameter: constants as passed, a root buffer's first
+    /// words (and its address, to read again for the report), an unreadable buffer as such.
+    #[test]
+    fn root_arguments_are_described_with_their_buffers() {
+        use super::super::console_list::Param;
+        let params = [Param::Constants { at: 0, count: 2 }, Param::Descriptor { at: 8 }, Param::Descriptor { at: 16 }, Param::Table { at: 24 }];
+        let mut args = Vec::new();
+        for w in [7u32, 0x14] {
+            args.extend(w.to_le_bytes());
+        }
+        args.extend(0x1_2000_0000u64.to_le_bytes());
+        args.extend(0xdead_0000u64.to_le_bytes());
+        args.extend(0x4000u32.to_le_bytes());
+        let read = |va: usize, n: usize| (va == 0x1_2000_0000).then(|| (0..n as u32).map(|k| if k == 5 { 0xffff_fff0 } else { k }).collect());
+        let (what, buffers) = describe_args(&params, &args, read);
+        assert_eq!(buffers, vec![0x1_2000_0000]);
+        assert!(what.starts_with("p0 constants [7, 14]; p1 buffer 0x120000000: [0, 1, 2, 3, 4, fffffff0,"), "{what}");
+        assert!(what.contains("p2 buffer 0xdead0000 (not readable)") && what.ends_with("p3 table 0x4000"), "{what}");
     }
 
     /// Once every slot is taken, a new list gets none and is not recorded, and the lists that
