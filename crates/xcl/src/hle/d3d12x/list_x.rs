@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,8 @@ const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
+const PC_RS_SET_SHADING_RATE: usize = 77;
+const PC_RS_SET_SHADING_RATE_IMAGE: usize = 78;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
@@ -298,6 +300,8 @@ struct Bindings {
     index_title: Option<(u64, u32, i32)>,
     /// the title set the console's rect list topology
     rect_list: bool,
+    shading_rate: Option<(u32, Option<[u32; 2]>)>,
+    shading_rate_image: Option<usize>,
 }
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
@@ -567,6 +571,12 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
             rt.single,
             if rt.dsv.is_some() { &d } else { std::ptr::null() },
         );
+    }
+    if let Some((base_rate, combiners)) = b.shading_rate {
+        apply_shading_rate_pc(this, base_rate, combiners);
+    }
+    if let Some(image) = b.shading_rate_image {
+        apply_shading_rate_image_pc(this, image);
     }
 }
 
@@ -2785,9 +2795,11 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
-/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
-/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+/// Emit a global UAV barrier on graphics/compute lists (D3D12 forbids UAV barriers on COPY lists).
+unsafe fn emit_global_uav_barrier(this: *mut c_void) {
+    if this.is_null() || list_type(this) == D3D12_COMMAND_LIST_TYPE_COPY {
+        return;
+    }
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -2797,6 +2809,115 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     };
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
+
+/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
+/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+    emit_global_uav_barrier(this);
+}
+
+/// command list #131 FlushGpuCacheRangeX(flags, waitFlags, startVA, size)
+pub(super) unsafe extern "system" fn flush_gpu_cache_range_x(this: *mut c_void, flush_flags: u32, wait_flags: u32, _start_va: u64, size: u64) {
+    if (flush_flags != 0 || wait_flags != 0) && size != 0 {
+        emit_global_uav_barrier(this);
+    }
+}
+
+/// command list #132 FlushShaderCacheRangeX(flags, waitFlags, startVA, size)
+pub(super) unsafe extern "system" fn flush_shader_cache_range_x(this: *mut c_void, flags: u32, wait_flags: u32, _start_va: u64, size: u64) {
+    if (flags != 0 || wait_flags != 0) && size != 0 {
+        emit_global_uav_barrier(this);
+    }
+}
+
+/// Clamp a console `D3D12_SHADING_RATE` to values supported by the PC adapter.
+fn sanitize_shading_rate(base_rate: u32, additional_supported: bool) -> u32 {
+    match base_rate {
+        0 | 1 | 4 | 5 => base_rate,
+        6 | 9 | 10 => if additional_supported { base_rate } else { 5 },
+        _ => 0,
+    }
+}
+
+/// Clamp console `D3D12_SHADING_RATE_COMBINER` values to `[0..=4]`, falling back to `PASSTHROUGH` (0).
+fn sanitize_combiners(raw: [u32; 2]) -> [u32; 2] {
+    [if raw[0] <= 4 { raw[0] } else { 0 }, if raw[1] <= 4 { raw[1] } else { 0 }]
+}
+
+static CL5_SUPPORTED: AtomicI8 = AtomicI8::new(-1);
+
+unsafe fn supports_cl5(list: *mut c_void) -> bool {
+    match CL5_SUPPORTED.load(Ordering::Acquire) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
+    let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else {
+        return false;
+    };
+    let ok = cl.cast::<ID3D12GraphicsCommandList5>().is_ok();
+    CL5_SUPPORTED.store(i8::from(ok), Ordering::Release);
+    ok
+}
+
+unsafe fn vsr_caps_of(list: *mut c_void) -> (u32, bool) {
+    if let Some(caps) = device_x::cached_variable_shading_rate_caps() {
+        return caps;
+    }
+    let Some(dev) = device_of(list) else {
+        return (0, false);
+    };
+    device_x::variable_shading_rate_caps(dev.as_raw())
+}
+
+unsafe fn apply_shading_rate_pc(list: *mut c_void, base_rate: u32, combiners: Option<[u32; 2]>) {
+    if list.is_null() || list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT || !supports_cl5(list) {
+        return;
+    }
+    let (tier, additional) = vsr_caps_of(list);
+    if tier == 0 {
+        return;
+    }
+    let rate = sanitize_shading_rate(base_rate, additional);
+    let comb_ptr = match (tier >= 2, combiners.as_ref()) {
+        (true, Some(c)) => c as *const [u32; 2],
+        _ => std::ptr::null(),
+    };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 2])>(list, PC_RS_SET_SHADING_RATE)(list, rate, comb_ptr);
+}
+
+unsafe fn apply_shading_rate_image_pc(list: *mut c_void, image: usize) {
+    if list.is_null() || list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT || !supports_cl5(list) {
+        return;
+    }
+    if vsr_caps_of(list).0 < 2 {
+        return;
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_RS_SET_SHADING_RATE_IMAGE)(list, image);
+}
+
+/// command list #124 (older) / #126 (newer) RSSetShadingRate(baseRate, combiners)
+pub(super) unsafe extern "system" fn rs_set_shading_rate_x(this: *mut c_void, base_rate: u32, combiners: *const [u32; 2]) {
+    let comb = (!combiners.is_null() && crate::gpu::shader::readable(combiners as usize, 8))
+        .then(|| sanitize_combiners(combiners.read_unaligned()));
+    with_bindings(this, |b| b.shading_rate = Some((base_rate, comb)));
+    apply_shading_rate_pc(this, base_rate, comb);
+}
+
+/// command list #125 (older) / #127 (newer) RSSetShadingRateImage(shadingRateImage)
+pub(super) unsafe extern "system" fn rs_set_shading_rate_image_x(this: *mut c_void, image: usize) {
+    with_bindings(this, |b| b.shading_rate_image = Some(image));
+    apply_shading_rate_image_pc(this, image);
+}
+
+/// command list #73 (older) / #75 (newer) SetPipelineFlagX(enable): per-PSO flag bit
+pub(super) unsafe extern "system" fn set_pipeline_flag_x(_this: *mut c_void, _enable: u32) {}
+
+/// command list #140 (older) / #142 (newer) SetQuadSampleMaskX(mask): 2x2 quad AA sample mask
+pub(super) unsafe extern "system" fn set_quad_sample_mask_x(_this: *mut c_void, _mask: u64) {}
+
+/// command list #99 (older) / #101 (newer) SetClearBatchHintX(mode, enable)
+pub(super) unsafe extern "system" fn set_clear_batch_hint_x(_this: *mut c_void, _mode: u32, _enable: u32) {}
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
@@ -6442,6 +6563,87 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    #[test]
+    fn shading_rate_and_combiner_sanitization() {
+        assert_eq!(sanitize_shading_rate(0, false), 0);
+        assert_eq!(sanitize_shading_rate(1, false), 1);
+        assert_eq!(sanitize_shading_rate(4, false), 4);
+        assert_eq!(sanitize_shading_rate(5, false), 5);
+        assert_eq!(sanitize_shading_rate(6, false), 5);
+        assert_eq!(sanitize_shading_rate(9, false), 5);
+        assert_eq!(sanitize_shading_rate(10, false), 5);
+        assert_eq!(sanitize_shading_rate(6, true), 6);
+        assert_eq!(sanitize_shading_rate(9, true), 9);
+        assert_eq!(sanitize_shading_rate(10, true), 10);
+        assert_eq!(sanitize_shading_rate(2, true), 0);
+        assert_eq!(sanitize_shading_rate(99, false), 0);
+
+        assert_eq!(sanitize_combiners([0, 4]), [0, 4]);
+        assert_eq!(sanitize_combiners([5, 99]), [0, 0]);
+        assert_eq!(sanitize_combiners([3, 8]), [3, 0]);
+    }
+
+    #[test]
+    fn console_list_state_slots_track_and_reset() {
+        #[repr(C)]
+        struct FakeBarrierList {
+            vt: *const usize,
+            ty: i32,
+            barriers: Mutex<Vec<u32>>,
+        }
+        unsafe extern "system" fn fake_get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE((*(this as *const FakeBarrierList)).ty)
+        }
+        unsafe extern "system" fn fake_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            let mut g = (*(this as *const FakeBarrierList)).barriers.lock().unwrap();
+            for i in 0..count as usize {
+                g.push((*barriers.add(i)).Type.0 as u32);
+            }
+        }
+        unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+            0
+        }
+
+        let mut orig_vt = [0usize; 32];
+        orig_vt[PC_GET_TYPE] = fake_get_type as usize;
+        orig_vt[PC_RESET] = fake_reset as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = fake_barrier as usize;
+        let mut ext_vt = [0usize; 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+
+        let mut fake = Box::new(FakeBarrierList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+            barriers: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &mut *fake as *mut FakeBarrierList as *mut c_void;
+
+        unsafe {
+            set_pipeline_flag_x(list_ptr, 1);
+            set_quad_sample_mask_x(list_ptr, 0xFFFF_0000_FFFF_0000);
+            set_clear_batch_hint_x(list_ptr, 2, 1);
+            assert!(fake.barriers.lock().unwrap().is_empty());
+
+            // Flush slots: zero size or zero flags emit no barrier; non-zero on DIRECT/COMPUTE emits 1 UAV barrier.
+            flush_gpu_cache_range_x(list_ptr, 0, 0, 0, 0x1000);
+            flush_gpu_cache_range_x(list_ptr, 0xc3c0, 0, 0, 0);
+            assert!(fake.barriers.lock().unwrap().is_empty());
+
+            flush_gpu_cache_range_x(list_ptr, 0xc3c0, 0x8002_0000, 0, 0xFFFF_FFFF_FF00);
+            flush_shader_cache_range_x(list_ptr, 0x70_0000, 0, 0, 0xFFFF_FFFF_FF00);
+            assert_eq!(*fake.barriers.lock().unwrap(), vec![D3D12_RESOURCE_BARRIER_TYPE_UAV.0 as u32; 2]);
+
+            // COPY lists must not receive UAV barriers.
+            fake.ty = D3D12_COMMAND_LIST_TYPE_COPY.0;
+            flush_gpu_cache_range_x(list_ptr, 0xc3c0, 0, 0, 0xFFFF_FFFF_FF00);
+            flush_shader_cache_range_x(list_ptr, 0x70_0000, 0, 0, 0xFFFF_FFFF_FF00);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 2);
+
+            assert_eq!(reset_x(list_ptr, 0, 0), 0);
+            on_release(list_ptr as usize);
         }
     }
 }
