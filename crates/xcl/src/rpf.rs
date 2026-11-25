@@ -96,20 +96,74 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     atomic_write_with(path, data, |_| Ok(()))
 }
 
+struct RpfOptions {
+    top: usize,
+    force_full: bool,
+    probe: bool,
+    find: Option<String>,
+    extract: Option<String>,
+    out: Option<PathBuf>,
+    probe_conflict: Option<&'static str>,
+}
+
+fn parse_args(args: &[String]) -> Result<RpfOptions, String> {
+    let mut opts = RpfOptions {
+        top: 30,
+        force_full: false,
+        probe: false,
+        find: None,
+        extract: None,
+        out: None,
+        probe_conflict: None,
+    };
+    let mut p = crate::cli::Parser::new(args);
+    while let Some(arg) = p.next_arg() {
+        match arg {
+            "--top" => opts.top = p.parse_usize("--top")?,
+            "--full" => {
+                opts.force_full = true;
+                opts.probe_conflict.get_or_insert("--full");
+            }
+            "--probe" => opts.probe = true,
+            "--find" => {
+                opts.find = Some(p.value("--find")?.to_string());
+                opts.probe_conflict.get_or_insert("--find");
+            }
+            "--extract" => {
+                opts.extract = Some(p.value("--extract")?.to_string());
+                opts.probe_conflict.get_or_insert("--extract");
+            }
+            "--out" => {
+                opts.out = Some(PathBuf::from(p.value("--out")?));
+                opts.probe_conflict.get_or_insert("--out");
+            }
+            other => return Err(crate::cli::Parser::unexpected(other)),
+        }
+    }
+    if opts.probe {
+        if let Some(conflict) = opts.probe_conflict {
+            return Err(format!("--probe cannot be combined with {conflict}"));
+        }
+    }
+    Ok(opts)
+}
+
 pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
-    let top: usize = opt("--top").and_then(|v| v.parse().ok()).unwrap_or(30);
-    let force_full = args.iter().any(|arg| arg == "--full");
-    if args.iter().any(|arg| arg == "--probe") {
-        if let Some(conflict) = args.iter().find(|arg| matches!(arg.as_str(), "--full" | "--find" | "--extract" | "--out")) {
-            eprintln!("xcl rpf: --probe cannot be combined with {conflict}");
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("xcl rpf: {e}");
             return 2;
         }
+    };
+    let top = opts.top;
+    let force_full = opts.force_full;
+    if opts.probe {
         return crate::rpf_probe::run(path, top);
     }
-    let find = opt("--find");
-    let extract = opt("--extract");
-    let out = opt("--out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rpf_out"));
+    let find = opts.find;
+    let extract = opts.extract;
+    let out = opts.out.unwrap_or_else(|| PathBuf::from("rpf_out"));
     let len = match std::fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) => {

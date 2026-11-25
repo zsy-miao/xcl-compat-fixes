@@ -18,6 +18,7 @@
 //!            +0x18 zlib stream → FSSM
 //! FSSM       +0 "FSSM"  +4 u32 version (0x101)  +8 u32 size of everything after the 16-B header
 //!            +0xC0 u64 code offset, +0xC8 u64 code size (offsets relative to +0x10)
+//!            +0xD4 u32 flags: bit 5 = the code is for 32-lane waves (wave32)
 //!            +0x100 hardware-stage descriptor u64 0x000000C0_0002_AAHH
 //!                   (HH = PAL hardware stage, AA = API stage; one more every 0x88 B,
 //!                   e.g. GS + its VS copy shader); unused fields are 0xDEADBEEF.
@@ -141,6 +142,13 @@ impl Fssm {
             Some((o, l)) => &self.data[o..o + l],
             None => &[],
         }
+    }
+
+    /// The header says the code is for 32-lane waves: bit 5 of the flags word at +0xD4
+    /// (measured on a retail pack: set for every program with 32-bit EXEC writes, clear for
+    /// every one with 64-bit ones). An unused field (0xDEADBEEF) says nothing.
+    pub fn wave32(&self) -> bool {
+        self.version == 0x101 && rd32(&self.data, 0xD4).is_some_and(|w| w != 0xDEAD_BEEF && w & 0x20 != 0)
     }
 
     pub fn stage_label(&self) -> String {
@@ -587,6 +595,175 @@ pub fn header_qwords(f: &Fssm, limit: usize) -> Vec<(usize, u64)> {
     (0..end / 8).map(|i| (i * 8, rd64(&f.data, i * 8).unwrap())).filter(|&(_, q)| q != 0 && q != 0xDEAD_BEEF_DEAD_BEEF).collect()
 }
 
+/// Type of a root-layout entry (u32 at +0 of a 20-byte entry, see [`root_layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    Constants,
+    Descriptor,
+    /// one entry per descriptor range of the table
+    Table,
+    StaticSampler,
+    /// 32-bit address of the CBV/SRV/UAV heap set on the list, which the program indexes itself
+    ViewHeap,
+    /// 32-bit address of the sampler heap set on the list
+    SamplerHeap,
+}
+
+impl RootKind {
+    fn from_raw(t: u32) -> Option<RootKind> {
+        Some(match t {
+            0 => RootKind::Constants,
+            1 => RootKind::Descriptor,
+            3 => RootKind::Table,
+            4 => RootKind::StaticSampler,
+            5 => RootKind::ViewHeap,
+            6 => RootKind::SamplerHeap,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RootKind::Constants => "constants",
+            RootKind::Descriptor => "root descriptor",
+            RootKind::Table => "table",
+            RootKind::StaticSampler => "static sampler",
+            RootKind::ViewHeap => "view heap",
+            RootKind::SamplerHeap => "sampler heap",
+        }
+    }
+}
+
+/// A root parameter the program reads from its user data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootSlot {
+    pub slot: u8,
+    pub kind: RootKind,
+    /// first user-data dword
+    pub dword: u8,
+    /// user SGPRs it takes (table 1, root descriptor 2, constants 1 per 32-bit value)
+    pub sgprs: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Srv,
+    Sampler,
+    Cbv,
+    Uav,
+}
+
+/// A resource the program accesses (entry of the used-resource table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsedResource {
+    pub kind: ResourceKind,
+    /// how the program reaches it
+    pub via: RootKind,
+    /// offset in the descriptor table, in dwords
+    pub offset: u32,
+    pub register: u32,
+    /// size of its descriptor in dwords (4: buffer or sampler, 8: image)
+    pub dwords: u8,
+    pub dword: u8,
+    pub slot: u8,
+}
+
+/// The user data a stage expects, as the console compiler recorded it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootLayout {
+    /// root parameters by slot (tables, root descriptors, constants)
+    pub slots: Vec<RootSlot>,
+    pub static_samplers: usize,
+    /// user-data dword of the view heap's / the sampler heap's address
+    pub view_heap: Option<u8>,
+    pub sampler_heap: Option<u8>,
+    pub used: Vec<UsedResource>,
+}
+
+const LAYOUT_ENTRY: usize = 20;
+/// More entries than any stage has (the largest bindless tables have a few hundred ranges).
+const MAX_LAYOUT_ENTRIES: usize = 4096;
+
+/// SGPR of user-data dword `dword` in a stage of hardware type `hw`: dword i is s(i) in VS,
+/// PS and CS, s(i + 8) in NGG (mesh) stages. None for the stages where it was not checked.
+pub fn user_sgpr(hw: u8, dword: u8) -> Option<u32> {
+    match hw {
+        4..=6 => Some(dword as u32),
+        7 => Some(dword as u32 + 8),
+        _ => None,
+    }
+}
+
+/// Entries of one of the stage record's tables: u64 offset (from FSSM+0x10) at `rec + at`,
+/// u32 count at `rec + count_at`.
+fn layout_entries<'a>(d: &'a [u8], rec: usize, at: usize, count_at: usize, what: &str) -> Result<Vec<&'a [u8]>, String> {
+    let n = rd32(d, rec + count_at).ok_or_else(|| format!("{what}: count past the end of the FSSM"))? as usize;
+    if n == 0 {
+        return Ok(Vec::new()); // the offset is then often 0xDEADBEEF
+    }
+    if n > MAX_LAYOUT_ENTRIES {
+        return Err(format!("{what}: {n} entries (more than {MAX_LAYOUT_ENTRIES})"));
+    }
+    let off = rd64(d, rec + at).ok_or_else(|| format!("{what}: offset past the end of the FSSM"))?;
+    let start = usize::try_from(off).ok().and_then(|o| o.checked_add(0x10));
+    match start.and_then(|s| Some((s, s.checked_add(n * LAYOUT_ENTRY)?))) {
+        Some((s, e)) if e <= d.len() => Ok(d[s..e].chunks_exact(LAYOUT_ENTRY).collect()),
+        _ => Err(format!("{what}: {n} entries at +{off:#x} do not fit in the FSSM ({} B)", d.len())),
+    }
+}
+
+/// The root layout of `stage` in the FSSM `d`, from the stage record that starts 0x40 before
+/// the stage descriptor: +0x28 / +0x30 u64 offsets (from FSSM+0x10) of the root-layout and
+/// used-resource tables, +0x38 / +0x3C u32 their entry counts. Both tables have 20-byte entries:
+///
+/// ```text
+/// root layout    u32 type | u32 offset in the table (dwords) | u32 user SGPRs | u32 base register
+///                | u8 first user-data dword | u8 root slot | u16 0
+///                type: 0 constants, 1 root descriptor, 3 table (one entry per range),
+///                4 static sampler, 5 view-heap address, 6 sampler-heap address
+/// used resource  u8 kind (0 SRV, 1 sampler, 2 CBV, 3 UAV) | u8 root type | u16 0
+///                | u32 offset in the table (dwords) | u32 register | u32 ?
+///                | u8 descriptor dwords | u8 first user-data dword | u8 root slot | u8 0
+/// ```
+///
+/// Worked out from every stage of a retail title's shader pack (no entry outside
+/// these types; the heap addresses always follow the last root argument, the view heap's first).
+pub fn root_layout(d: &[u8], stage: &HwStage) -> Result<RootLayout, String> {
+    let rec = stage.offset.checked_sub(0x40).ok_or("stage record before the start of the FSSM")?;
+    let root = layout_entries(d, rec, 0x28, 0x38, "root-layout table")?;
+    let used = layout_entries(d, rec, 0x30, 0x3C, "used-resource table")?;
+    let mut l = RootLayout::default();
+    for (i, e) in root.iter().enumerate() {
+        let t = rd32(e, 0).unwrap();
+        let kind = RootKind::from_raw(t).ok_or_else(|| format!("root-layout entry {i}: unknown type {t}"))?;
+        let (dword, slot) = (e[16], e[17]);
+        match kind {
+            RootKind::StaticSampler => l.static_samplers += 1,
+            RootKind::ViewHeap => {
+                l.view_heap.get_or_insert(dword);
+            }
+            RootKind::SamplerHeap => {
+                l.sampler_heap.get_or_insert(dword);
+            }
+            _ if l.slots.iter().any(|s| s.slot == slot) => {} // another range of a table
+            _ => l.slots.push(RootSlot { slot, kind, dword, sgprs: rd32(e, 8).unwrap() }),
+        }
+    }
+    l.slots.sort_by_key(|s| s.slot);
+    for (i, e) in used.iter().enumerate() {
+        let kind = match e[0] {
+            0 => ResourceKind::Srv,
+            1 => ResourceKind::Sampler,
+            2 => ResourceKind::Cbv,
+            3 => ResourceKind::Uav,
+            k => return Err(format!("used-resource entry {i}: unknown kind {k}")),
+        };
+        let via = RootKind::from_raw(e[1] as u32).ok_or_else(|| format!("used-resource entry {i}: unknown root type {}", e[1]))?;
+        l.used.push(UsedResource { kind, via, offset: rd32(e, 4).unwrap(), register: rd32(e, 8).unwrap(), dwords: e[16], dword: e[17], slot: e[18] });
+    }
+    Ok(l)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -799,6 +976,25 @@ pub(crate) mod tests {
         assert!(f.programs.iter().any(|p| p.offset == 0x308), "{:?}", f.programs);
     }
 
+    /// A wave32 program without an EXEC write (nothing in its code tells the wave size) is
+    /// wave32 by its header; a clear flag or an unused field leaves it to the code.
+    #[test]
+    fn wave_size_comes_from_the_header_flag() {
+        let wave64 = |flags: u32| {
+            let mut f = fssm(&CODE, &[(6, 5)]);
+            f[0xD4..0xD8].copy_from_slice(&flags.to_le_bytes());
+            let sh = parse(&sample(5, &[f])).unwrap();
+            let f = &sh.fssm[0];
+            let p = &f.programs[0];
+            (f.wave32(), crate::gpu::recomp::fssm_wave64(f, &f.data[p.offset..p.offset + p.len]))
+        };
+        assert!(crate::gpu::recomp::detect_wave64(&CODE), "the code alone reads as wave64");
+        assert_eq!(wave64(0x20), (true, false));
+        assert_eq!(wave64(0x1F | 0x40), (false, true));
+        assert_eq!(wave64(0), (false, true));
+        assert_eq!(wave64(0xDEAD_BEEF), (false, true));
+    }
+
     #[test]
     fn pc_shaders_are_not_xbox() {
         assert!(parse(&container(&[(b"DXIL", b"\x66\0\0\0\x04\0\0\0DXIL\0\0\0\0")])).is_none());
@@ -820,6 +1016,124 @@ pub(crate) mod tests {
         let mut st = InstStats::default();
         st.add_code(&code[8..24]);
         assert_eq!((st.instructions, st.undecoded), (3, 1));
+    }
+
+    /// 20-byte root-layout entry: type, offset in the table, user SGPRs, register, dword, slot
+    fn root_entry(t: u32, off: u32, sgprs: u32, reg: u32, dword: u8, slot: u8) -> Vec<u8> {
+        let mut v = Vec::new();
+        for x in [t, off, sgprs, reg] {
+            le32(&mut v, x);
+        }
+        v.extend_from_slice(&[dword, slot, 0, 0]);
+        v
+    }
+
+    /// 20-byte used-resource entry: kind, root type, offset, register, descriptor dwords, dword, slot
+    fn used_entry(kind: u8, via: u8, off: u32, reg: u32, dwords: u8, dword: u8, slot: u8) -> Vec<u8> {
+        let mut v = vec![kind, via, 0, 0];
+        for x in [off, reg, 1] {
+            le32(&mut v, x);
+        }
+        v.extend_from_slice(&[dwords, dword, slot, 0]);
+        v
+    }
+
+    /// `fssm` with the two tables appended and the first stage's record (descriptor - 0x40)
+    /// pointing at them; offsets and counts can be overridden for the error cases.
+    fn with_layout(mut f: Vec<u8>, root: &[Vec<u8>], used: &[Vec<u8>], counts: Option<(u32, u32)>, root_at: Option<u64>) -> Vec<u8> {
+        let rec = 0x100 - 0x40;
+        let at = (f.len() - 0x10) as u64;
+        let used_at = at + (root.len() * LAYOUT_ENTRY) as u64;
+        f.extend(root.iter().chain(used).flatten());
+        let (nr, nu) = counts.unwrap_or((root.len() as u32, used.len() as u32));
+        f[rec + 0x28..rec + 0x30].copy_from_slice(&root_at.unwrap_or(at).to_le_bytes());
+        f[rec + 0x30..rec + 0x38].copy_from_slice(&used_at.to_le_bytes());
+        f[rec + 0x38..rec + 0x3C].copy_from_slice(&nr.to_le_bytes());
+        f[rec + 0x3C..rec + 0x40].copy_from_slice(&nu.to_le_bytes());
+        f
+    }
+
+    fn layout_of(f: Vec<u8>, kind: u32) -> Result<RootLayout, String> {
+        let sh = parse(&sample(kind, &[f])).unwrap();
+        let f = &sh.fssm[0];
+        root_layout(&f.data, &f.stages[0])
+    }
+
+    #[test]
+    fn reads_the_root_layout_of_a_compute_stage() {
+        // [table (two ranges), 2 constants] + view heap, two static samplers, as a culling CS has
+        let root = [
+            root_entry(3, 0, 1, 0x42, 4, 0),
+            root_entry(3, 8, 1, 0x02, 4, 0),
+            root_entry(0, 0, 2, 0x1f4, 5, 1),
+            root_entry(4, 0, 0, 0, 0, 0),
+            root_entry(4, 0, 0, 1, 0, 1),
+            root_entry(5, 0, 1, 0, 7, 0),
+        ];
+        let used = [used_entry(0, 3, 8, 0x02, 8, 4, 0), used_entry(2, 0, 0, 0x1f4, 4, 5, 1), used_entry(1, 4, 0, 1, 4, 0, 1)];
+        let l = layout_of(with_layout(fssm(&CODE, &[(6, 3)]), &root, &used, None, None), 5).unwrap();
+        assert_eq!(
+            l.slots,
+            vec![RootSlot { slot: 0, kind: RootKind::Table, dword: 4, sgprs: 1 }, RootSlot { slot: 1, kind: RootKind::Constants, dword: 5, sgprs: 2 }]
+        );
+        assert_eq!((l.static_samplers, l.view_heap, l.sampler_heap), (2, Some(7), None));
+        assert_eq!(l.used.len(), 3);
+        assert_eq!(l.used[0], UsedResource { kind: ResourceKind::Srv, via: RootKind::Table, offset: 8, register: 2, dwords: 8, dword: 4, slot: 0 });
+        assert_eq!((l.used[1].kind, l.used[1].via), (ResourceKind::Cbv, RootKind::Constants));
+        assert_eq!((l.used[2].kind, l.used[2].via), (ResourceKind::Sampler, RootKind::StaticSampler));
+        assert_eq!(user_sgpr(6, 7), Some(7));
+    }
+
+    #[test]
+    fn mesh_stage_heaps_follow_the_arguments() {
+        // [t, t, t, root descriptor, 2 constants] + both heaps from dword 8: s16..s24 in NGG
+        let root = [
+            root_entry(3, 0, 1, 0, 8, 0),
+            root_entry(3, 0, 1, 0, 9, 1),
+            root_entry(3, 0, 1, 0, 10, 2),
+            root_entry(1, 0, 2, 0, 11, 3),
+            root_entry(0, 0, 2, 0, 13, 4),
+            root_entry(5, 0, 1, 0, 15, 0),
+            root_entry(6, 0, 1, 0, 16, 0),
+        ];
+        let l = layout_of(with_layout(fssm(&CODE, &[(7, 6)]), &root, &[], None, None), 13).unwrap();
+        assert_eq!(l.slots.iter().map(|s| (s.kind, s.dword, s.sgprs)).collect::<Vec<_>>()[3], (RootKind::Descriptor, 11, 2));
+        assert_eq!(l.slots.len(), 5);
+        assert_eq!((l.view_heap, l.sampler_heap), (Some(15), Some(16)));
+        assert_eq!((user_sgpr(7, 8), user_sgpr(7, 15), user_sgpr(7, 16)), (Some(16), Some(23), Some(24)));
+        assert_eq!(user_sgpr(3, 8), None);
+        // no tables at all (counts 0, offsets filler): an empty layout
+        assert_eq!(layout_of(fssm(&CODE, &[(5, 1)]), 0), Ok(RootLayout::default()));
+        let f = with_layout(fssm(&CODE, &[(5, 1)]), &[], &[], None, Some(0xDEAD_BEEF));
+        assert_eq!(layout_of(f, 0), Ok(RootLayout::default()));
+    }
+
+    #[test]
+    fn bad_root_layouts_are_errors() {
+        let root = [root_entry(3, 0, 1, 0, 8, 0), root_entry(1, 0, 2, 0, 9, 1)];
+        let cs = || fssm(&CODE, &[(6, 3)]);
+        // a count that runs past the end of the FSSM (truncated table)
+        let e = layout_of(with_layout(cs(), &root, &[], Some((3, 0)), None), 5).unwrap_err();
+        assert!(e.contains("root-layout table: 3 entries"), "{e}");
+        let e = layout_of(with_layout(cs(), &root, &[used_entry(0, 3, 0, 0, 4, 8, 0)], Some((2, 2)), None), 5).unwrap_err();
+        assert!(e.contains("used-resource table: 2 entries"), "{e}");
+        // counts that would overflow the size computation
+        let e = layout_of(with_layout(cs(), &root, &[], Some((u32::MAX, 0)), None), 5).unwrap_err();
+        assert!(e.contains("more than"), "{e}");
+        // offsets out of bounds, including one that overflows when the 0x10 header is added
+        for at in [0xDEAD_BEEF, u64::MAX - 4] {
+            let e = layout_of(with_layout(cs(), &root, &[], None, Some(at)), 5).unwrap_err();
+            assert!(e.contains("do not fit"), "{e}");
+        }
+        // types outside the known ones
+        let e = layout_of(with_layout(cs(), &[root_entry(2, 0, 1, 0, 4, 0)], &[], None, None), 5).unwrap_err();
+        assert_eq!(e, "root-layout entry 0: unknown type 2");
+        let e = layout_of(with_layout(cs(), &root, &[used_entry(4, 3, 0, 0, 4, 8, 0)], None, None), 5).unwrap_err();
+        assert_eq!(e, "used-resource entry 0: unknown kind 4");
+        let e = layout_of(with_layout(cs(), &root, &[used_entry(0, 7, 0, 0, 4, 8, 0)], None, None), 5).unwrap_err();
+        assert_eq!(e, "used-resource entry 0: unknown root type 7");
+        // a stage descriptor too close to the start for a record
+        assert!(root_layout(&cs(), &HwStage { offset: 0x38, hw: 6, api: 3 }).is_err());
     }
 }
 

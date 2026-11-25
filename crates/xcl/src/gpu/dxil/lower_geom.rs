@@ -174,11 +174,8 @@ impl Lw {
             let nv = lw.umin(tv, a);
             let b = lw.c(maxp);
             let np = lw.umin(tt, b);
-            let k4 = lw.c(4);
-            let o0 = lw.mul(rec, k4);
-            let o1 = lw.addc(o0, 4);
-            lw.s.raw_store(res, o0, &[nv]);
-            lw.s.raw_store(res, o1, &[np]);
+            let o0 = lw.shlc(rec, 2);
+            lw.s.raw_store(res, o0, &[nv, np]);
             Ok(())
         });
         // vertices: k < emitted (and a GS-phase LDS store happened), vb + k < maxv
@@ -203,15 +200,16 @@ impl Lw {
             let dst = lw.addc(rec, MESH_HEADER as u32);
             let dst = lw.add(dst, dv);
             for (slot, &r) in regs.iter().enumerate() {
+                let mut vals = [z; 4];
                 for c in 0..4u32 {
                     let a = lw.addc(src, 16 * r + 4 * c);
                     let i = lw.lshrc(a, 2);
                     let i = lw.andc(i, 8191);
-                    let v = lw.s.gs_load(lds, i);
-                    let o = lw.addc(dst, 4 * slot as u32 + c);
-                    let o = lw.shlc(o, 2);
-                    lw.s.raw_store(res, o, &[v]);
+                    vals[c as usize] = lw.s.gs_load(lds, i);
                 }
+                let o = lw.addc(dst, 4 * slot as u32);
+                let o = lw.shlc(o, 2);
+                lw.s.raw_store(res, o, &vals);
             }
         });
         // triangles: j < ntri, tb + j < maxp

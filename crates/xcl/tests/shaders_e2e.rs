@@ -155,6 +155,16 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 #[test]
+fn help_lists_shader_precompile_options() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let help = String::from_utf8(out.stdout).unwrap();
+    for flag in ["--precompile", "--only", "--pipelines", "--used-only"] {
+        assert!(help.contains(flag), "missing {flag} in xcl --help");
+    }
+}
+
+#[test]
 fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
     let dir = TempDir::new("single");
     let file = dir.path().join("ps.bin");
@@ -328,5 +338,47 @@ fn shaders_required_options_reject_missing_values() {
         assert_eq!(out.status.code(), Some(2), "args {args:?} unexpected status: {out:?}");
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert!(stderr.contains(expected_msg), "args {args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn shaders_rejects_unknown_options_missing_values_and_mistyped_values() {
+    let dir = TempDir::new("badopts");
+    let file = dir.path().join("plain.bin");
+    std::fs::write(&file, b"not a shader").unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["--fnid", "foo"], "unknown option: --fnid"),
+        (&["-x"], "unknown option: -x"),
+        (&["stray"], "unexpected argument: stray"),
+        (&["--top"], "--top needs a value"),
+        (&["--top", "abc"], "invalid value for --top: abc"),
+        (&["--compile", "nope"], "invalid value for --compile: nope"),
+        (&["--windows", "four"], "invalid value for --windows: four"),
+        (&["--split", "2"], "invalid value for --split: 2"),
+        (&["--min-kb", "abc"], "invalid value for --min-kb: abc"),
+        (&["--count", "abc"], "invalid value for --count: abc"),
+        (&["--repeat", "abc"], "invalid value for --repeat: abc"),
+        (&["--limit", "abc"], "invalid value for --limit: abc"),
+        (&["--only"], "--only needs a value"),
+        (&["--only", "--pipelines"], "--only needs a value"),
+        (&["--example"], "--example needs a value"),
+        (&["--direct", "--sample", "abc"], "invalid value for --sample: abc"),
+        (&["--direct", "--seed", "abc"], "invalid value for --seed: abc"),
+        (&["--direct", "--threads", "abc"], "invalid value for --threads: abc"),
+        (&["--direct", "--max-bytes", "abc"], "invalid value for --max-bytes: abc"),
+        (&["--direct", "--timeout", "abc"], "invalid value for --timeout: abc"),
+        (&["--direct", "--hash"], "--hash needs a value"),
+        (&["--direct", "--hash", "0xZZ"], "--hash:"),
+        (&["--direct", "--dump"], "--dump needs a value"),
+    ];
+
+    for (args, expected_msg) in cases {
+        let out = run_shaders(&file, args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?} unexpected status: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("xcl shaders:"), "args {args:?}: {stderr}");
+        assert!(stderr.contains(expected_msg), "args {args:?}: expected {expected_msg:?} in {stderr:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
     }
 }

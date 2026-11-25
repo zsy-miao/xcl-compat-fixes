@@ -471,6 +471,15 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
+    if super::vram::level_pages() {
+        // (a texture whose levels get their pages one by one: all of them before the GPU's write)
+        let p = res as *mut c_void;
+        unsafe {
+            if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+                super::vram::map_levels(r, None);
+            }
+        }
+    }
     let mut marked = false;
     {
         let mut t = TEXTURES.lock().unwrap();
@@ -550,6 +559,10 @@ pub fn forget(res: usize) {
         LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         unsafe {
             super::vram::remap_if_unmapped(r);
+            // (lazy levels: one the GPU wrote is not uploaded again, so all of it has pages)
+            if super::vram::level_pages() && TEXTURES.lock().unwrap().by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
+                super::vram::map_levels(r, None);
+            }
         }
     }
     if removed {
@@ -1142,6 +1155,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
+            if super::vram::level_pages() {
+                // (the queue waits for these mappings before the copies: `vram::before_execute` below)
+                map_levels_with_texels(&r, &subs);
+            }
             batch.push((r, subs, states, res_key, h));
         }
         let d = device as *mut c_void;
@@ -1175,6 +1192,27 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             Err(e) => warn(&e),
         }
     }
+}
+
+/// (`vram::level_pages`) Before an upload of title texture `r`: its levels with texels in `subs`
+/// (its subresources as they go up) get their video memory pages if they have none - a texture
+/// placed with lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
+/// texture's larger levels before the title has memory behind them (read as zeros,
+/// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
+/// to tiles that are not mapped, which drops it (tiled resources tier 2).
+unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
+    if !super::vram::has_lazy_levels(r.as_raw() as usize) {
+        return;
+    }
+    // (one slice: its subresources are its levels)
+    let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+    super::vram::map_levels(r, Some(&present));
+}
+
+/// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
+fn all_zero(b: &[u8]) -> bool {
+    let mut words = b.chunks_exact(8);
+    words.all(|w| u64::from_ne_bytes(w.try_into().unwrap()) == 0) && words.remainder().iter().all(|&x| x == 0)
 }
 
 /// `XCL_TRACE_FRAME`: how much of a title texture's top level is not zero, each time it is
@@ -1548,8 +1586,8 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
         use windows_sys::Win32::System::Memory as mem;
 
-        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if super::super::backend() != super::super::Backend::Real {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
@@ -1789,7 +1827,7 @@ mod tests {
     /// submission order, each time it is; a Reset forgets them; other resources are not noted.
     #[test]
     fn transitions_apply_when_their_list_is_submitted() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // RGBA8 64×64, 3 mips, 2 slices (6 subresources), 4KB_S
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -1980,8 +2018,8 @@ mod tests {
     /// chains (including packed mips), cubemap arrays (`extra_pages`) and 3D volumes upload intact.
     #[test]
     fn placed_title_textures_share_vram_and_preserve_pixels() {
-        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
@@ -2200,8 +2238,27 @@ mod tests {
                 assert_eq!(read_sub(r, 0), subresources(base + off, &xg::Texture::new(&d).unwrap())[0].data, "4 KiB neighbour at +{off:#x} crosstalk");
             }
             let pages_before_reuse = dev_pages();
+            // Binding sweeps pages idle for two seconds, so the device-wide count can fall
+            // here even when this placement shares the extra tile it already has.
+            let first = adj[1].as_raw() as usize;
+            let before = super::super::vram::mapped_tiles_for(dev_key, first);
             let reused = place_tex(base + 0x4000, &d16);
-            assert_eq!(dev_pages(), pages_before_reuse, "reusing unaligned va must share extra_pages tile");
+            if super::super::vram::is_placed_texture(first) {
+                let before = before.expect("the first unaligned placement is mapped");
+                assert!(!before.1.is_empty(), "a 16 KiB texture in a 64 KiB page uses an extra tile");
+                assert_eq!(
+                    super::super::vram::mapped_tiles_for(dev_key, first).as_ref(),
+                    Some(&before),
+                    "the first placement keeps its tiles when the va is placed again",
+                );
+                assert_eq!(
+                    super::super::vram::mapped_tiles_for(dev_key, reused.as_raw() as usize).as_ref().map(|t| &t.1),
+                    Some(&before.1),
+                    "reusing unaligned va must share extra_pages tile",
+                );
+            } else {
+                assert_eq!(dev_pages(), pages_before_reuse, "reusing unaligned va must share extra_pages tile");
+            }
             // Overwrite the first 64 KiB (covering +0x0000, +0x4000 (both adj[1] & reused), +0x8000, +0xC000)
             // WITHOUT releasing adj/reused: dead extra_pages (+0x4000, +0x8000) must drop immediately!
             let cover = place_tex(base, &d64);
@@ -2401,6 +2458,144 @@ mod tests {
 
         forget(res_id);
         forget(gpu_res_id);
+    }
+
+    /// Real GPU, `vram::level_pages` (`XCL_TEXTURE_LEVEL_PAGES=1`): a sampled texture placed on the
+    /// shared pages gets the pages of a level when an upload has texels for it. Its memory has
+    /// every level but the largest at first, as a title streams a texture: no page before the
+    /// first upload, then pages for those levels only and their texels right, zeros where there
+    /// are none. With memory under the largest level too, a texture placed there again (as a
+    /// title does) takes that level's pages - the others are shared - and holds all of it. A
+    /// texture the GPU writes gets the pages of all its levels.
+    #[test]
+    fn a_placed_texture_gets_the_pages_of_a_level_with_its_texels() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const NAME: &str = "a_placed_texture_gets_the_pages_of_a_level_with_its_texels";
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return println!("SKIPPED {NAME}: software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return println!("SKIPPED {NAME}: no D3D12 device") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return println!("SKIPPED {NAME}: tiled tier < 2");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // 1024x1024 RGBA8, 11 levels, 64 KiB blocks: 5.4 MiB on the console
+            let d = console_desc(3, 1024, 1024, 1, 11, 28, 0x109);
+            let place_tex = |va: usize| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, d.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let read_sub = |r: &ID3D12Resource, sub: u32| -> Vec<u8> {
+                let rd = r.GetDesc();
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+                dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+                let mut rb: Option<ID3D12Resource> = None;
+                let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                let rb = rb.unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+                for y in 0..rows as usize {
+                    out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+                }
+                rb.Unmap(0, None);
+                out
+            };
+            let tex = xg::Texture::new(&d).unwrap();
+            let surface = tex.texels().unwrap();
+            let (size, chain) = (tex.size() as usize, &surface.chain);
+            // the whole texture as the title will have it (no byte of a level zero), and what its
+            // levels then hold
+            let mut whole = vec![0u8; size];
+            for (m, l) in chain.levels.iter().enumerate() {
+                let pat: Vec<u8> = (0..l.width * l.height * surface.bpe as usize).map(|k| 1 + ((m * 7 + k * 13) % 251) as u8).collect();
+                chain.tile_level(&mut whole[..chain.slice_bytes], m, 0, &pat);
+            }
+            let want = subresources(whole.as_ptr() as usize, &tex);
+            assert_eq!(want.len(), 11);
+            // its place in the title's memory: everything below mip 0 is there (the levels follow
+            // each other from the smallest to mip 0, `tiling::Chain`)
+            let at = VirtualAlloc(std::ptr::null(), size.next_multiple_of(0x1_0000), MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            let top = chain.levels[0].offset;
+            assert!(top > 0 && top % 0x1000 == 0 && top < size, "mip 0 is the last part of the slice: from {top:#x} of {size:#x}");
+            assert!(!VirtualAlloc(at as *const c_void, top, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::copy_nonoverlapping(whole.as_ptr(), at as *mut u8, top);
+
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            let dev_key = dev.as_raw() as usize;
+            let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
+            let p0 = dev_pages();
+            let small = place_tex(at);
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            if !super::super::vram::has_lazy_levels(small.as_raw() as usize) {
+                // (not reserved, or a tiling that does not add up: it has its pages as before)
+                drop(small);
+                VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+                return println!("SKIPPED {NAME}: this adapter's texture was not placed with lazy levels");
+            }
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            assert_eq!(dev_pages(), p0, "no pages before the first upload");
+            // the tiles of mip 0 and of all of it, as this driver lays them out
+            let (mut all, mut n, mut mip0) = (0u32, 1u32, D3D12_SUBRESOURCE_TILING::default());
+            dev.GetResourceTiling(&small, Some(&mut all), None, None, Some(&mut n), 0, &mut mip0);
+            let top_tiles = mip0.WidthInTiles * mip0.HeightInTiles as u32 * mip0.DepthInTiles as u32;
+            assert!(n == 1 && top_tiles > 0 && top_tiles < all, "mip 0 has tiles of its own: {top_tiles} of {all}");
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, ((all - top_tiles) as usize) << 16, "pages for the levels with texels, none for mip 0");
+            for sub in 1..11u32 {
+                assert!(read_sub(&small, sub) == want[sub as usize].data, "level {sub} after the first upload");
+            }
+            assert!(read_sub(&small, 0).iter().all(|&b| b == 0), "a level without pages reads as zeros");
+            // the title maps memory under mip 0 and fills it
+            assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
+            let full = place_tex(at);
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, (all as usize) << 16, "mip 0's pages come with its texels; the other levels' are shared");
+            for sub in 0..11u32 {
+                assert!(read_sub(&full, sub) == want[sub as usize].data, "level {sub} once all of it is there");
+            }
+            // what the GPU writes needs pages under all of the texture: the first one's mip 0 gets
+            // the pages of its address, which hold what the second one's upload put there
+            note_gpu_write(small.as_raw() as usize);
+            assert_eq!(dev_pages() - p0, (all as usize) << 16, "the same pages");
+            assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            drop((small, full));
+            VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     /// `read_committed` copies committed pages and leaves uncommitted gaps zeroed, including

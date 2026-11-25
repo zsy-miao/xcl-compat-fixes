@@ -121,6 +121,22 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
 }
 
+/// A submit is about to wait for the pipeline `this` has bound.
+pub(super) fn want_bound(this: *mut c_void) {
+    super::pso_async::want(with(this, |s| s.pso));
+}
+
+/// A put-off dispatch that could not be recorded.
+pub(super) fn dispatch_dropped() {
+    count(DISPATCHES_SKIPPED);
+}
+
+/// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
+pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
+    let arena = with(from, |s| std::mem::take(&mut s.arena));
+    with(to, |s| s.arena = arena);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -253,7 +269,12 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let raw_pso = with(this, |s| s.pso);
+    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        return super::pso_async::need_by_submit(raw_pso);
+    }
+    let pso = super::pso_async::resolve_wait(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -262,7 +283,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+        if super::pso_async::is_pending(raw_pso) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -289,11 +310,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // as for Dispatch. The PC call would run it with the list's compute root signature, which
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
-        if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+        // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
+        // the driver pipeline `resolve_wait` returned.)
+        if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({raw_pso:#x}) skipped");
             }
             return;
         }
@@ -853,7 +876,11 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let pso = with(this, |s| s.pso);
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+        return super::pso_async::need_by_submit(pso);
+    }
+    let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1038,7 +1065,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -1126,6 +1153,7 @@ mod tests {
         use std::mem::{transmute_copy, ManuallyDrop};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
 
         const TRIES: u32 = 40;
         // mode 0: write (x, 1, 1) at a[0..12]; mode 1: count the groups
@@ -1141,13 +1169,35 @@ void main(uint t : SV_GroupIndex) {
     if (mode == 0u) a.Store3(0, uint3(x, 1u, 1u)); else c.InterlockedAdd(0, 1u);
 }
 "#;
+        if crate::gpu::recomp::dxc::location().is_err() {
+            skip_test("no DXC");
+            return;
+        }
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                skip_test("no GPU");
-                return;
-            }
-            let dev = dev.unwrap();
+            let setup = || -> Result<(ID3D12Device, String), String> {
+                let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI factory unavailable: {e}"))?;
+                let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+                let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
+                    (factory.EnumWarpAdapter().map_err(|e| format!("WARP unavailable: {e}"))?, "WARP (software renderer)".into())
+                } else {
+                    let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next()
+                        .ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                    (adapter, crate::gpu::adapter::name(&desc))
+                };
+                let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_11_0).map_err(|e| format!("{name}: D3D12 device unavailable ({e})"))?;
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+                dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
+                    .map_err(|e| format!("{name}: cannot query SM 6.6 ({e})"))?;
+                if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                    return Err(crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state()));
+                }
+                Ok((dev, name))
+            };
+            let (dev, name) = match setup() {
+                Ok(selected) => selected,
+                Err(reason) => { skip_test(&reason); return; }
+            };
+            println!("ExecuteIndirect adapter: {name}");
             let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
             let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
             let cs = D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() };
@@ -1506,6 +1556,110 @@ void main(uint t : SV_GroupIndex) {
         real::forget_pso_for_test(real_ok);
         real::forget_pso_for_test(standin_fail);
         assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
+    }
+
+    #[test]
+    fn execute_indirect_skips_failed_shared_console_compute_standin() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+
+        // With shared stand-ins (`standin::shell`), `dev_create_compute_pso` registers the
+        // title-facing shell in `CONSOLE_COMPUTE`, while `pso_async::resolve_wait` returns the
+        // shared driver pipeline when the background build fails.
+        let shell_fail = 0x7210_0001usize;
+        let shell_ok = 0x7210_0002usize;
+        let shared_driver = 0x7210_0003usize;
+        let real_ok = 0x7210_0004usize;
+        let sig_dispatch = 0x7210_00F8usize;
+        let sig_root_changing = 0x7210_00F0usize;
+        note_signature_dispatches(sig_dispatch, true);
+        note_root_changing_signature(sig_root_changing);
+
+        pso_async::submit_lazy(shell_fail, true, Box::new(|| 0), 0);
+        pso_async::shared(shell_fail, shared_driver);
+        real::register_console_compute_for_test(shell_fail);
+
+        pso_async::submit_lazy(
+            shell_ok,
+            true,
+            Box::new(move || {
+                real::register_translated_compute_for_test(real_ok);
+                real_ok
+            }),
+            0,
+        );
+        pso_async::shared(shell_ok, shared_driver);
+        real::register_console_compute_for_test(shell_ok);
+
+        assert_eq!(pso_async::resolve_wait(shell_fail), shared_driver);
+        assert!(!pso_async::is_pending(shell_fail));
+        assert!(real::is_console_compute(shell_fail));
+        assert!(!real::is_console_compute(shared_driver));
+
+        // 1. Failed shared console compute stand-in with a Dispatch signature must be skipped,
+        // never forwarded to PC ExecuteIndirect with the shared driver pipeline.
+        reset(list_ptr, 0x7210_0100, shell_fail);
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            0,
+            "failed shared console compute stand-in must not reach PC ExecuteIndirect"
+        );
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+
+        // 2. Another shell sharing the same driver pipeline whose build succeeds still takes the
+        // translated path (caught here by the root-changing guard rather than falling through to PC).
+        reset(list_ptr, 0x7210_0100, shell_ok);
+        unsafe {
+            execute_indirect(list_ptr, sig_root_changing, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+
+        // 3. Releasing `shell_fail` forgets its `CONSOLE_COMPUTE` entry so a native PC compute
+        // pipeline later allocated at the same address still reaches PC ExecuteIndirect.
+        let _ = pso_async::released(shell_fail);
+        real::forget_pso_for_test(shell_fail);
+        assert!(!real::is_console_compute(shell_fail));
+        reset(list_ptr, 0x7210_0100, shell_fail);
+        unsafe {
+            execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            1,
+            "native PC pipeline at a released shell's address must still reach PC ExecuteIndirect"
+        );
+
+        forget(list_ptr);
+        note_signature_dispatches(sig_dispatch, false);
+        let _ = pso_async::released(shell_ok);
+        real::forget_pso_for_test(shell_ok);
+        real::forget_pso_for_test(real_ok);
     }
 
     #[test]

@@ -274,7 +274,12 @@ impl Ir for DxilIr {
         // the registers `Lw` touches for `d` alone
         let before = std::mem::take(&mut self.lw.init.touched);
         self.lw.pc = d.pc;
+        // the per-lane form reads back only this lane's bit of a mask `d` writes: in the split
+        // form a ballot of this half is enough, and an exchange there would wait at a barrier
+        // for a half that is elsewhere when only one half reaches this block
+        self.lw.local_masks = true;
         let r = self.lw.inst_guarded(d, guard, None);
+        self.lw.local_masks = false;
         let used = std::mem::replace(&mut self.lw.init.touched, before);
         self.lw.init.touched.extend(&used);
         r?;
@@ -1107,6 +1112,57 @@ mod tests {
                 for r in 1..=8 {
                     assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
                 }
+            }
+        }
+    }
+
+    /// A float compare bridged to #1426's lowering in a block only the lower half of a split
+    /// wave64 group reaches (Pipodi's point 5 on #1745): a nested `if` whose condition goes to
+    /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange, a group
+    /// barrier the upper half never reaches. The bridge reads back only each lane's bit, so this
+    /// half's ballot is enough, and the only barrier left is the one at the start.
+    #[test]
+    fn a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier() {
+        let lines: &[I] = &[
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)]),
+            // lanes 0–31: the lower hardware half
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 4)]),
+            // 0 < f32(lane): every lane in EXEC but lane 0
+            ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 1)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 133)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 10)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 8)]),
+            ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 135)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        // one console wave per group: the halves meet at a group barrier (`Partner::Present`)
+        let cs = compute_cs();
+        let dxil = super::compute_split(&decode(lines), &cs).unwrap_or_else(|e| panic!("{e}"));
+        if dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+        let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
+        assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");
+        if !gpu() {
+            return;
+        }
+        let mem = vec![0u32; 256];
+        let gpu = runner::dispatch(&dxil, [2, 1, 1], &[100, 0], &mem).unwrap();
+        // the console's v7 (the CPU `Interp` has no #1426 bridge): 5 in lanes 1–31, else 0
+        for g in 0..2 {
+            for l in 0..64 {
+                assert_eq!(gpu[g * 128 + l], if (1..32).contains(&l) { 5 } else { 0 }, "group {g}, lane {l}");
             }
         }
     }

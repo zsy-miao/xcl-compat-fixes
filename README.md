@@ -250,6 +250,22 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - With `XCL_TEXTURE_PAGES_SYSTEM_MEMORY=1`, title texture page pools use system memory (D3D12 L0).
   On discrete GPUs, this reduces local VRAM use at the cost of GPU memory bandwidth.
+- **Switches for how a title runs** (set them in the environment of `xcl run`):
+  - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
+    intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
+    `off`, `false` or `no`; `all` also skips looping movies; any other value (`1`, `intro` …)
+    skips the ones that do not loop.
+  - `XCL_MUTE_TTS`: the title gets no Windows speech synthesis: its XAccessibility requests are
+    answered by XCL's own object, which has closed captions and high contrast only. Off by
+    default; any value except empty, `0`, `off` or `false` (in any case) turns it on.
+  - `XCL_FRAME_INTERVAL_US`: changes the console frame clock. Unset, the title's own frame
+    interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` removes the cap, so
+    `WaitFrameEventX` returns at once with a fresh token. A number of microseconds is an upper
+    bound on the interval, never below 1000: `8333` for 120 Hz, `4167` for 240 Hz.
+  - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
+    for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
+    watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
+    default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Pipelines used in an earlier run are normally built ahead of first use. `XCL_PSO_PRELOAD=graphics`

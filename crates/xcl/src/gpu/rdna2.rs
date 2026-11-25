@@ -304,14 +304,17 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
         // SDWA / DPP: the real src0 lives in the extension dword
         let ext = *d.words.get(1)?;
         let v = (ext & 0xff) as u64;
-        return Some(if d.variant == Variant::Sdwa {
-            sdwa_source(v, o.size, ext >> 16)
-        } else {
-            reg_range("v", v, o.size)
+        return Some(match d.variant {
+            Variant::Sdwa => sdwa_source(v, o.size, ext >> 16),
+            Variant::Dpp16 => dpp_source(v, o.size, ext >> 20),
+            _ => reg_range("v", v, o.size),
         });
     }
     if f == "VSRC1" && d.variant == Variant::Sdwa {
         return Some(sdwa_source(field_value(d.enc, &d.words, f)?, o.size, *d.words.get(1)? >> 24));
+    }
+    if f == "VSRC1" && d.variant == Variant::Dpp16 {
+        return Some(dpp_source(field_value(d.enc, &d.words, f)?, o.size, *d.words.get(1)? >> 22));
     }
     let v = field_value(d.enc, &d.words, f)? * register_scale(f);
     let width = d.enc.field_width(f);
@@ -392,6 +395,53 @@ fn sdwa_modifiers(d: &Decoded, s: &mut String) {
 fn sdwa_compare_destination(d: &Decoded) -> Option<String> {
     let ext = *d.words.get(1)?;
     (d.variant == Variant::Sdwa && d.enc.name == "ENC_VOPC" && ext >> 15 & 1 == 1).then(|| scalar_operand((ext >> 8 & 0x7f) as u64, 32, None))
+}
+
+/// A DPP16 source: a VGPR inside its NEG (bit 0 of `m`) and ABS (bit 1), as LLVM writes them.
+fn dpp_source(v: u64, size: u16, m: u32) -> String {
+    let mut s = reg_range("v", v, size);
+    if m >> 1 & 1 == 1 {
+        s = format!("|{s}|");
+    }
+    if m & 1 == 1 {
+        s.insert(0, '-');
+    }
+    s
+}
+
+/// What the DPP extension dword adds after the operands, in LLVM's words and order. DPP16: the
+/// control (where each lane's first source comes from), the rows and banks that are written,
+/// `bound_ctrl:1` and `fi:1`; a control RDNA2 has no name for stays a number. DPP8: the source
+/// lane of each of a row's 8 lanes, and `fi:1` (the encoding with SRC0 = 0xEA).
+fn dpp_modifiers(d: &Decoded, s: &mut String) {
+    let Some(&ext) = d.words.get(1) else { return };
+    if d.variant == Variant::Dpp8 {
+        let lanes: Vec<String> = (0..8).map(|i| (ext >> (8 + 3 * i) & 7).to_string()).collect();
+        let _ = write!(s, " dpp8:[{}]", lanes.join(","));
+        if d.words[0] & 0x1ff == 0xEA {
+            s.push_str(" fi:1");
+        }
+        return;
+    }
+    let ctrl = ext >> 8 & 0x1ff;
+    let _ = match ctrl {
+        0x000..=0x0ff => write!(s, " quad_perm:[{},{},{},{}]", ctrl & 3, ctrl >> 2 & 3, ctrl >> 4 & 3, ctrl >> 6 & 3),
+        0x101..=0x10f => write!(s, " row_shl:{}", ctrl & 15),
+        0x111..=0x11f => write!(s, " row_shr:{}", ctrl & 15),
+        0x121..=0x12f => write!(s, " row_ror:{}", ctrl & 15),
+        0x140 => write!(s, " row_mirror"),
+        0x141 => write!(s, " row_half_mirror"),
+        0x150..=0x15f => write!(s, " row_share:{}", ctrl & 15),
+        0x160..=0x16f => write!(s, " row_xmask:{}", ctrl & 15),
+        _ => write!(s, " dpp_ctrl:{ctrl:#x}"),
+    };
+    let _ = write!(s, " row_mask:{:#x} bank_mask:{:#x}", ext >> 28, ext >> 24 & 15);
+    if ext >> 19 & 1 == 1 {
+        s.push_str(" bound_ctrl:1");
+    }
+    if ext >> 18 & 1 == 1 {
+        s.push_str(" fi:1");
+    }
 }
 
 /// Fields that hold a scalar register number in units of several SGPRs: SMEM SBASE is
@@ -712,8 +762,10 @@ pub fn format(d: &Decoded) -> String {
             let _ = write!(s, " ; lit {lit:#010x}");
         }
     }
-    if d.variant == Variant::Sdwa {
-        sdwa_modifiers(d, &mut s);
+    match d.variant {
+        Variant::Sdwa => sdwa_modifiers(d, &mut s),
+        Variant::Dpp16 | Variant::Dpp8 => dpp_modifiers(d, &mut s),
+        Variant::Plain => {}
     }
     match d.enc.name {
         // `s_load_dword s5, s[2:3], 0x64` (immediate offset), or `s0 offset:0x12345` (SGPR offset,
@@ -952,7 +1004,9 @@ mod tests {
         // same with S0 set: src0 = s2
         assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x86, 0x00]), "v_mov_b32_sdwa v1, s2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD");
         // v_mov_b32_dpp v1, v3
-        assert_eq!(dis(&[0xfa, 0x02, 0x02, 0x7e, 0x03, 0x1b, 0x00, 0xff]), "v_mov_b32_dpp v1, v3");
+        assert_eq!(dis(&[0xfa, 0x02, 0x02, 0x7e, 0x03, 0x1b, 0x00, 0xff]), "v_mov_b32_dpp v1, v3 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf");
+        // a control RDNA2 has no name for (wave_shl:1 before it) stays a number
+        assert_eq!(dis(&[0xfa, 0x02, 0x02, 0x7e, 0x03, 0x30, 0x01, 0xff]), "v_mov_b32_dpp v1, v3 dpp_ctrl:0x130 row_mask:0xf bank_mask:0xf");
     }
 
     #[test]
@@ -1154,6 +1208,48 @@ mod tests {
         assert!(unexpected.is_empty(), "instructions RDNA2 should know but failed to decode: {unexpected:?}");
         assert_eq!(len_ok, decoded, "instruction length mismatches: {worst:?}");
         assert_eq!(name_ok, decoded, "mnemonic mismatches: {worst:?}");
+    }
+
+    /// Every line of LLVM's gfx10 DPP16 and DPP8 tests reads as LLVM writes it: the control or
+    /// the lane selects, the masks, `bound_ctrl` / `fi` and the sources' neg / abs. Not compared:
+    /// the `vcc` / `vcc_lo` operands LLVM names (implicit here as in the plain forms), and the
+    /// suffix, where LLVM has `_dpp` for DPP8 too.
+    #[test]
+    fn llvm_gfx10_dpp_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut wrong) = ([0usize; 2], Vec::new());
+        let mut controls = std::collections::HashSet::new();
+        for file in ["gfx10_vop1_dpp16.txt", "gfx10_vop2_dpp16.txt", "gfx10_vop1_dpp8.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let Some((mnemonic, rest)) = asm.trim().split_once(' ') else { continue };
+                // the operands end where the control starts: no operand has a ':' or starts with "row_"
+                let words: Vec<&str> = rest.split(' ').collect();
+                let at = words.iter().position(|w| w.contains(':') || w.starts_with("row_")).unwrap();
+                let operands = words[..at].join(" ");
+                let mut operands: Vec<&str> = operands.split(", ").collect();
+                if mnemonic.contains("_co_ci_") {
+                    assert!(matches!(operands.remove(1), "vcc" | "vcc_lo"), "{line}");
+                }
+                if mnemonic.contains("_co_ci_") || mnemonic.starts_with("v_cndmask") {
+                    assert!(matches!(operands.pop(), Some("vcc" | "vcc_lo")), "{line}");
+                }
+                let d = decode(&bytes, 0).unwrap();
+                assert!(matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) && d.len == bytes.len(), "{line}");
+                let dpp8 = d.variant == Variant::Dpp8;
+                let want = format!("{mnemonic}{} {} {}", if dpp8 { "8" } else { "" }, operands.join(", "), words[at..].join(" "));
+                let got = format(&d);
+                let renamed = got.split_once(' ').is_some_and(|(m, r)| renamed_in_rdna2(mnemonic.trim_end_matches("_dpp"), m.trim_end_matches("_dpp")) && want.ends_with(r));
+                total[dpp8 as usize] += 1;
+                controls.insert(words[at].split(':').next().unwrap().to_string());
+                if got != want && !renamed {
+                    wrong.push(format!("{got}  (LLVM: {})", asm.trim()));
+                }
+            }
+        }
+        assert!(total[0] > 2000 && total[1] > 100 && controls.len() >= 9, "the DPP tests are not all there: {total:?} lines, controls {controls:?}");
+        assert!(wrong.is_empty(), "{} of {total:?} DPP lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     /// Every line of LLVM's gfx10 SDWA tests reads as LLVM writes it: the sources with their

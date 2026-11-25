@@ -436,6 +436,9 @@ impl Lw {
 
     /// The program's ballot of `cond` → (lo, hi) mask words.
     pub fn ballot(&mut self, cond: Value) -> (Value, Value) {
+        if self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
+            return self.ballot_ps(cond);
+        }
         let w = self.s.wave_ballot(cond);
         if !self.wave64 {
             let z = self.c(0);
@@ -454,6 +457,68 @@ impl Lw {
         let lo = self.sel(u, o, m);
         let hi = self.sel(u, m, o);
         (lo, hi)
+    }
+
+    /// Pixel-shader ballot from a precomputed 4-bit quad mask `q` (bit `p` = member `p`'s
+    /// predicate, identical across all 4 lanes of each quad; parity with HLSL `ballot_px_quad`
+    /// in `recomp/emit.rs`): 4 `WaveActiveBallot` passes spread each quad's member `p` from
+    /// its live lane(s) back to bit `4k + p`.
+    pub fn ballot_ps_quad(&mut self, q: Value) -> (Value, Value) {
+        let z = self.c(0);
+        if self.s.m.const_u64(q) == Some(0) {
+            return (z, z);
+        }
+        let need_hi = self.wave64 || self.gfx_half.is_some();
+        let mut m0 = z;
+        let mut m1 = z;
+        for p in 0..4u32 {
+            let qp = self.lshrc(q, p);
+            let qp = self.andc(qp, 1);
+            let bit = self.nz(qp);
+            let w = self.s.wave_ballot(bit);
+            let spread = |lw: &mut Lw, mut v: Value| -> Value {
+                let s1 = lw.lshrc(v, 1);
+                v = lw.or(v, s1);
+                let s2 = lw.lshrc(v, 2);
+                v = lw.or(v, s2);
+                let v = lw.andc(v, 0x1111_1111);
+                lw.shlc(v, p)
+            };
+            let b0 = spread(self, w[0]);
+            m0 = self.or(m0, b0);
+            if need_hi {
+                let b1 = spread(self, w[1]);
+                m1 = self.or(m1, b1);
+            }
+        }
+        if !self.wave64 {
+            if let Some(h) = self.gfx_half {
+                return (self.sel(h, m1, m0), z);
+            }
+            return (m0, z);
+        }
+        (m0, m1)
+    }
+
+    /// Pixel-shader ballot including helper lanes (parity with HLSL `ballot_px` in
+    /// `recomp/emit.rs`): each quad collects its 4 bits through `QuadReadAcross*`
+    /// (which see helper lanes) and feeds them to [`Lw::ballot_ps_quad`]. Entry `EXEC` in
+    /// `setup_pixel` runs before `self.gfx` is set, so it stays live-lanes-only.
+    fn ballot_ps(&mut self, cond: Value) -> (Value, Value) {
+        let z = self.c(0);
+        if self.s.m.const_u64(cond) == Some(0) {
+            return (z, z);
+        }
+        let qbit = self.andc(self.lane, 3);
+        let own_b = self.u(cond);
+        let own = self.bin(BinOp::Shl, own_b, qbit);
+        let qx = self.s.quad_op(own, super::ops::QuadDir::ReadAcrossX);
+        let qy = self.s.quad_op(own, super::ops::QuadDir::ReadAcrossY);
+        let qd = self.s.quad_op(own, super::ops::QuadDir::ReadAcrossDiagonal);
+        let q0 = self.or(own, qx);
+        let q1 = self.or(qy, qd);
+        let q = self.or(q0, q1);
+        self.ballot_ps_quad(q)
     }
 
     /// The hardware lane of console lane `l` (`l + 32 · xcl_half` for a wave32 program in
@@ -560,5 +625,194 @@ impl Lw {
         let hv = self.sel(hnz, fh, z);
         let lnz = self.nz(lo);
         self.sel(lnz, fl, hv)
+    }
+}
+
+#[cfg(test)]
+mod ps_ballot_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::dxbc::SigElement;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{dxc, runner, PsInterface};
+
+    const V: u64 = 256;
+
+    fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> SigElement {
+        SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
+    }
+
+    fn ps_interface() -> PsInterface {
+        PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None }
+    }
+
+    /// Pixel shader exercising `s_wqm`, `v_cndmask` + DPP `ddx`, `s_and_saveexec` + DPP `ddy`,
+    /// and a waterfall loop over `v_readfirstlane` of `pos.x` (parity with
+    /// `recomp::tests::helper_lane_masks_ps`).
+    fn helper_lane_masks_ps_code(wave64: bool) -> Vec<u8> {
+        let (mov, wqm, and_save, xor) = if wave64 {
+            ("S_MOV_B64", "S_WQM_B64", "S_AND_SAVEEXEC_B64", "S_XOR_B64")
+        } else {
+            ("S_MOV_B32", "S_WQM_B32", "S_AND_SAVEEXEC_B32", "S_XOR_B32")
+        };
+        let sop1 = |n: &'static str, d: u64, s: u64| (n, "ENC_SOP1", vec![("SDST", d), ("SSRC0", s)], None);
+        type Inst = (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>);
+        let head: Vec<Inst> = vec![
+            sop1(mov, 20, 126),
+            sop1(wqm, 126, 126),
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", V + 5), ("VSRC1", 4)], None),
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 3)], None),
+            sop1(and_save, 22, 106),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", V + 3)], None),
+            sop1(mov, 126, 22),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 8), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 9), ("SRC0", V + 8), ("VSRC1", 7)], None),
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 8), ("SSRC0", 128)], None),
+            sop1(mov, 24, 126),
+        ];
+        let body: Vec<Inst> = vec![
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", V + 2)], None),
+            ("V_CMP_EQ_F32", "ENC_VOPC", vec![("SRC0", 4), ("VSRC1", 2)], None),
+            sop1(and_save, 26, 106),
+            ("S_ADD_U32", "ENC_SOP2", vec![("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None),
+            (xor, "ENC_SOP2", vec![("SDST", 126), ("SSRC0", 26), ("SSRC1", 126)], None),
+        ];
+        let tail: Vec<Inst> = vec![
+            sop1(mov, 126, 24),
+            ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 8)], None),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 242)], None),
+            sop1(mov, 126, 20),
+            ("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+        ];
+        let enc = |l: &[Inst]| -> Vec<u8> { l.iter().flat_map(|(n, e, f, x)| encode(n, e, f, *x).unwrap_or_else(|err| panic!("{n}: {err}"))).collect() };
+        let body_code = enc(&body);
+        let back = (-((body_code.len() as i64 + 4) / 4)) as u16 as u64;
+        let mut ps_code = enc(&head);
+        ps_code.extend(&body_code);
+        ps_code.extend(encode("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        ps_code.extend(enc(&tail));
+        ps_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        ps_code
+    }
+
+    #[test]
+    fn direct_ps_ballot_uses_quad_ops_and_keeps_entry_exec_live_only() {
+        let psi = ps_interface();
+        for wave64 in [false, true] {
+            let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let k = kernel::translate_pixel(&helper_lane_masks_ps_code(wave64), opt, &psi).expect("translate PS");
+            validate::validate(&k.dxil).expect("validate PS");
+            let dis = validate::disassemble(&k.dxil).expect("disassemble PS");
+            // #134: VOPC masks quad-read the VGPR operands (`quadReadLaneAt`), never the
+            // compare predicate (`quadOp`), avoiding AMD RDNA2/3/4 amdxc64 PSO crashes.
+            assert!(dis.contains("dx.op.quadReadLaneAt.i32"), "wave64 {wave64}: PS VOPC must quad-read VGPR operands via quadReadLaneAt:\n{dis}");
+            assert!(!dis.contains("dx.op.quadOp"), "wave64 {wave64}: PS VOPC must not emit quadOp on compare results (#134):\n{dis}");
+
+            // Standalone VOPC with no DPP / readfirstlane (so `rla` is never called):
+            // proves VOPC itself emits the 4 VGPR operand `quadReadLaneAt` reads and zero `quadOp`.
+            let mut vopc_only = Vec::new();
+            vopc_only.extend(encode(if wave64 { "S_WQM_B64" } else { "S_WQM_B32" }, "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None).unwrap());
+            vopc_only.extend(encode("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 2)], None).unwrap());
+            vopc_only.extend(encode("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 128), ("VSRC1", 2)], None).unwrap());
+            vopc_only.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 3), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None).unwrap());
+            vopc_only.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let kv = kernel::translate_pixel(&vopc_only, opt, &psi).expect("translate VOPC-only PS");
+            validate::validate(&kv.dxil).expect("validate VOPC-only PS");
+            let vdis = validate::disassemble(&kv.dxil).expect("disassemble VOPC-only PS");
+            assert_eq!(vdis.matches("call i32 @dx.op.quadReadLaneAt.i32(").count(), 4, "wave64 {wave64}: expected 4 operand quad reads for V_CMP_LT_F32(0, v2):\n{vdis}");
+            assert!(!vdis.contains("dx.op.quadOp"), "wave64 {wave64}: VOPC-only PS must not emit quadOp:\n{vdis}");
+
+            // Entry EXEC alone (no post-entry ballot) must stay live-lanes-only (no quad reads).
+            let mut trivial = Vec::new();
+            trivial.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 2), ("VSRC1", 3), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None).unwrap());
+            trivial.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let kt = kernel::translate_pixel(&trivial, opt, &psi).expect("translate trivial PS");
+            validate::validate(&kt.dxil).expect("validate trivial PS");
+            let tdis = validate::disassemble(&kt.dxil).expect("disassemble trivial PS");
+            assert!(
+                !tdis.contains("dx.op.quadOp") && !tdis.contains("dx.op.quadReadLaneAt"),
+                "wave64 {wave64}: entry EXEC ballot must stay live-lanes-only:\n{tdis}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_ps_constant_false_ballot_skips_quad_ops() {
+        let psi = ps_interface();
+        let mut code = Vec::new();
+        code.extend(encode("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None).unwrap());
+        code.extend(encode("V_CMP_F_F32", "ENC_VOPC", &[("SRC0", V + 2), ("VSRC1", 3)], None).unwrap());
+        code.extend(encode("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 128), ("VSRC1", 2)], None).unwrap());
+        code.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 3), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let k = kernel::translate_pixel(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &psi).expect("translate false-cmp PS");
+        validate::validate(&k.dxil).expect("validate false-cmp PS");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble false-cmp PS");
+        assert!(
+            !dis.contains("dx.op.quadOp") && !dis.contains("dx.op.quadReadLaneAt"),
+            "constant-false PS ballot should short-circuit to 0:\n{dis}"
+        );
+    }
+
+    #[test]
+    fn direct_ps_non_vopc_carry_ballot_uses_quad_op() {
+        let psi = ps_interface();
+        let mut code = Vec::new();
+        code.extend(encode("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None).unwrap());
+        code.extend(encode("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 106), ("SRC0", V + 2), ("SRC1", V + 3)], None).unwrap());
+        code.extend(encode("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 128), ("VSRC1", 4)], None).unwrap());
+        code.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 5), ("VSRC1", 3), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let k = kernel::translate_pixel(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &psi).expect("translate carry PS");
+        validate::validate(&k.dxil).expect("validate carry PS");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble carry PS");
+        assert!(dis.contains("dx.op.quadOp.i32"), "non-VOPC PS carry ballot must preserve helper lanes via quadOp:\n{dis}");
+    }
+
+    #[test]
+    fn gpu_direct_ps_masks_hold_helper_lanes_on_triangle_edges() {
+        match (runner::adapter(), runner::wave64_programs_supported(), dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, w, d) => {
+                runner::skip_test(if a.is_err() || w.is_err() {
+                    "no GPU"
+                } else if d.is_err() {
+                    "no DXC"
+                } else {
+                    "no wave64"
+                });
+                return;
+            }
+        }
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+        let vs = dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+        let psi = ps_interface();
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        for wave64 in [true, false] {
+            let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let ps = kernel::translate_pixel(&helper_lane_masks_ps_code(wave64), opt, &psi).expect("translate PS");
+            let px = runner::draw(&vs, &ps.dxil, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+            let lanes = if wave64 { 64.0 } else { 32.0 };
+            let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size)
+                .filter(|&i| {
+                    let p = px[i];
+                    p[0].abs() != 1.0 || p[1].abs() != 1.0 || !(1.0..=lanes).contains(&p[2]) || p[3] != 1.0
+                })
+                .map(|i| (i % size, i / size, px[i]))
+                .collect();
+            let count = |k: usize, ok: &dyn Fn(f32) -> bool| px.iter().filter(|p| !ok(p[k])).count();
+            let (dx, dy, it) = (count(0, &|v| v.abs() == 1.0), count(1, &|v| v.abs() == 1.0), count(2, &|v| (1.0..=lanes).contains(&v)));
+            assert!(
+                bad.is_empty(),
+                "wave64 {wave64}: {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}), first {:?}",
+                bad.len(),
+                &bad[..bad.len().min(6)]
+            );
+        }
     }
 }

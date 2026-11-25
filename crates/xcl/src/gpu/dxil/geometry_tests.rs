@@ -4,7 +4,7 @@
 use super::kernel::{translate_geometry, KernelOptions};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::encode;
-use crate::gpu::recomp::{dxc, mesh_passthrough, runner, translate_geometry as hlsl_geometry, GsInterface, IO_GS_PRIMS, MESH_HEADER};
+use crate::gpu::recomp::{dxc, mesh_passthrough, runner, translate_geometry as hlsl_geometry, GsInterface, HEAP_WINDOWS, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
 
 fn sig(name: &str, sv: u32, reg: u32, ty: u32) -> SigElement {
     SigElement { name: name.into(), index: 0, system_value: sv, component_type: ty, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 }
@@ -165,4 +165,73 @@ fn gpu_geometry_direct_records() {
         let (_, got) = runner::mesh_draw(&hlsl, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
         check(&format!("HLSL, split {split}"), &got);
     }
+}
+
+/// The GS epilogue coalesces the 2-dword header store and each 4-dword vertex attribute store
+/// into wide `rawBufferStore` calls (mask 3 and mask 15) instead of per-dword scalar stores.
+#[test]
+fn geometry_epilogue_coalesces_header_and_vertex_stores() {
+    let (code, g) = branchy_program();
+    let k = translate_geometry(&code, opts(true, 1), &g).expect("translate geometry");
+    super::validate::validate(&k.dxil).expect("validate geometry");
+    let dis = super::validate::disassemble(&k.dxil).expect("disassemble geometry");
+    let stores: Vec<&str> = dis.lines().filter(|l| l.contains("call void @dx.op.rawBufferStore.i32(")).collect();
+    // 1 two-dword header store (mask 3), 2 four-dword vertex register stores (mask 15), 1 triangle store (mask 1).
+    let mask_count = |mask: u8| stores.iter().filter(|l| l.contains(&format!(", i8 {mask}, i32 4)"))).count();
+    assert_eq!(mask_count(3), 1, "expected 1 coalesced 2-dword header store:\n{}", stores.join("\n"));
+    assert_eq!(mask_count(15), 2, "expected 2 coalesced 4-dword vertex stores:\n{}", stores.join("\n"));
+    assert_eq!(mask_count(1), 1, "expected only 1 scalar store (triangle index):\n{}", stores.join("\n"));
+    assert_eq!(stores.len(), 4, "expected 4 total rawBufferStore calls:\n{}", stores.join("\n"));
+}
+
+/// ES+GS with pre-fetched ES vertex inputs (`v9..v12`) under `HEAP_WINDOWS`: `geom_init`
+/// must load pre-fetched vertices from window 0 in the descriptor heap (`MEM_HEAP_BASE`)
+/// rather than the placeholder `lw.mems[0]` handle.
+#[test]
+fn geometry_es_inputs_validate_and_run_with_heap_windows() {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // ES: compute byte offset = 0x100 + v5 * 4, store fetched v9 to window 0 (`hi = base_hi`),
+    // then jump to GS (which ends immediately).
+    let mut code = Vec::new();
+    code.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 130), ("VSRC1", 5)], None)); // v20 = v5 * 4
+    code.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 255), ("VSRC1", 20)], Some(0x100))); // v20 += 0x100
+    code.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 21), ("SRC0", 128)], None)); // v21 = 0 (hi = uma_base_hi = 0)
+    code.extend(e("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 20), ("DATA", 9), ("SADDR", 0x7D), ("OFFSET", 0)], None));
+    code.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None));
+    let gs_start = code.len() as u64;
+    code.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None));
+    code.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
+
+    let g = GsInterface {
+        es_inputs: vec![sig("POSITION", 0, 0, 3)],
+        es_outputs: vec![sig("SV_Position", 1, 0, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3)],
+        max_vertex_count: 3,
+        gs_start: Some(gs_start),
+    };
+
+    for split in [false, true] {
+        translate_geometry(&code, opts(split, 4 | HEAP_WINDOWS), &g)
+            .unwrap_or_else(|err| panic!("split {split}, 4 heap windows: {err}"));
+    }
+
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU / wave64");
+        return;
+    }
+    let split = runner::split_wave64();
+    let dxil = translate_geometry(&code, opts(split, 4 | HEAP_WINDOWS), &g).unwrap().dxil;
+    let mut io = vec![0u32; 128];
+    io[IO_GS_PRIMS] = 1; // 1 primitive = 3 vertices
+    io[IO_GS_VERTICES] = 0; // pre-fetched vertices start at byte 0 of window 0
+    let mut mem = vec![0u32; 128];
+    // 3 vertices, 1 register (16 bytes = 4 dwords) each; component 0 is v9.
+    mem[0] = 0x1111_0001;
+    mem[4] = 0x2222_0002;
+    mem[8] = 0x3333_0003;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap();
+    assert_eq!(out[0x100 / 4], 0x1111_0001, "vertex 0 v9 fetched via heap window 0");
+    assert_eq!(out[0x100 / 4 + 1], 0x2222_0002, "vertex 1 v9 fetched via heap window 0");
+    assert_eq!(out[0x100 / 4 + 2], 0x3333_0003, "vertex 2 v9 fetched via heap window 0");
+    assert_eq!(out[0x100 / 4 + 3], 0, "lane past nv gets 0");
 }

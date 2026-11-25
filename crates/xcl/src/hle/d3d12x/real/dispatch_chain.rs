@@ -136,6 +136,14 @@ pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
 }
 
+/// `to` records right after `from` on the same allocator: its chains go on in `from`'s scratch.
+pub(in crate::hle::d3d12x) fn list_follows(from: usize, to: usize) {
+    let mut shared = SHARED.lock().unwrap();
+    if let Some(e) = shared.get(&from).cloned() {
+        shared.insert(to, e);
+    }
+}
+
 /// The scratch of all recordings alive together, `XCL_SPLIT_SCRATCH_TOTAL_MB` (384). A recording
 /// keeps its scratch until its allocator is reset, and a title that records ahead of the GPU has
 /// many: with a bound on one dispatch alone a retail title's world took 1.2 GB and went on growing.
@@ -230,6 +238,33 @@ mod tests {
     use super::{scratch_bytes, LEAST};
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn a_list_recorded_after_another_goes_on_in_its_scratch() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
+            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+        }
+        let dev = dev.unwrap();
+        let (a, b, c, alloc) = (0x7E57_5C01usize, 0x7E57_5C02usize, 0x7E57_5C03usize, 0x7E57_5CA0usize);
+        let (first, used) = unsafe { super::scratch_for(&dev, a, alloc, MB, 4096) }.unwrap();
+        assert!(!used);
+        super::list_follows(a, b);
+        let (second, used) = unsafe { super::scratch_for(&dev, b, alloc, MB, 4096) }.unwrap();
+        assert!(used && std::sync::Arc::ptr_eq(&first, &second), "the list after it made a scratch of its own");
+        let (third, _) = unsafe { super::scratch_for(&dev, c, alloc, MB, 4096) }.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
+        for list in [a, b, c] {
+            super::list_reset(list);
+        }
+    }
 
     #[test]
     fn a_chains_scratch_is_bounded_by_what_all_recordings_hold() {

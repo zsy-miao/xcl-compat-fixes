@@ -260,6 +260,10 @@ pub struct Lw {
     /// When set, the wave-wide mask cross-lane instructions see (DPP source lanes,
     /// readfirstlane, ds_swizzle / bpermute) instead of the SSA EXEC.
     pub mask_override: Option<(Value, Value)>,
+    /// split form: a mask an instruction writes is built from this half's ballot alone, as
+    /// when it is never read whole. Set by a caller that reads back only each lane's own bit
+    /// (the per-lane form's bridge), so no exchange meets the other half.
+    pub local_masks: bool,
 }
 
 impl Lw {
@@ -908,7 +912,8 @@ impl Lw {
         // split form: a mask only ever read lane by lane (or going nowhere, or 0 anyway)
         // needs only this half's word (`recomp::x64_masks`, the HLSL `xcl_x_ballot_local`)
         let local = self.split
-            && (self.s.m.const_u64(cond) == Some(0)
+            && (self.local_masks
+                || self.s.m.const_u64(cond) == Some(0)
                 || match *dst {
                     Dst::S(n) => n < 126 && self.whole_live.get(&self.pc).is_some_and(|live| live & (3u128 << n) == 0),
                     Dst::Null => true,
@@ -1086,10 +1091,10 @@ impl Lw {
         if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
-        if self.has_f64_round_op {
+        if dp_mask != 0 && self.has_f64_round_op {
             return err(d, "dynamic f64 round mode");
         }
-        if self.dyn_rm {
+        if dp_mask != 0 && self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
             let v = match dp_mask {
@@ -1227,14 +1232,6 @@ impl Lw {
         // SOP1 / SOP2
         let saveexec = name.contains("saveexec") || name.contains("wrexec");
         if saveexec {
-            // a b32 source is one register (m0, a 32-bit constant): no 64-bit pair to read
-            let s0 = if name.ends_with("_b32") {
-                let lo = self.read(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
-                (lo, self.c(0))
-            } else {
-                self.read64(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?
-            };
-            let (el, eh) = (self.sreg(126), self.sreg(127));
             let opn = base.split('_').nth(1).unwrap_or("").to_string();
             let op = |s: &mut Self, a: Value, e: Value| -> Option<Value> {
                 Some(match opn.as_str() {
@@ -1272,15 +1269,21 @@ impl Lw {
                     _ => return None,
                 })
             };
-            let t0 = op(self, s0.0, el).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
-            let t1 = op(self, s0.1, eh).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
             let wrexec = name.contains("wrexec");
             if !self.wave64 || name.ends_with("_b32") {
+                // a b32 or wave32 source is one register (m0, a 32-bit constant): no 64-bit pair or EXEC_HI
+                let s0 = self.read(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
+                let el = self.sreg(126);
+                let t0 = op(self, s0, el).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
                 self.wr(126, t0);
                 let c = self.nz(t0);
                 self.set_scc(c);
                 self.write32(&dst, if wrexec { t0 } else { el });
             } else {
+                let s0 = self.read64(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let t0 = op(self, s0.0, el).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
+                let t1 = op(self, s0.1, eh).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
                 self.wr(126, t0);
                 self.wr(127, t1);
                 let o = self.or(t0, t1);
@@ -2072,4 +2075,122 @@ fn fold_bin(op: BinOp, x: u64, y: u64, w: u32) -> Option<u64> {
         BinOp::URem if y != 0 => x % y,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod saveexec_tests {
+    use std::collections::BTreeSet;
+
+    use super::Lw;
+    use crate::gpu::dxil::kernel::{self, Entry, KernelOptions};
+    use crate::gpu::dxil::validate;
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::runner;
+
+    fn asm(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in list {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn touched_for(code: &[u8], wave64: bool) -> BTreeSet<u32> {
+        let insts = [rdna2::decode(code, 0).expect("decode saveexec/wrexec")];
+        let leaders: BTreeSet<u64> = [0].into_iter().collect();
+        let ko = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&insts, &leaders, ko, &Entry::Kernel);
+        lw.inst(&insts[0]).expect("lower single saveexec/wrexec");
+        lw.init.touched
+    }
+
+    /// Wave32 and `_b32` saveexec / wrexec forms must read a single 32-bit source (allowing
+    /// 32-bit-only encodings such as `m0` and avoiding bogus `s[n+1]` reads) and must not touch
+    /// `EXEC_HI` (s127), matching HLSL #191.
+    #[test]
+    fn direct_wave32_and_b32_saveexec_skip_read64_and_exec_hi() {
+        let ko32 = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let ko64 = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+        // Wave32 S_AND_SAVEEXEC_B64 with 32-bit-only M0 (SSRC0 = 124) must translate & validate.
+        let m0_code = asm(&[("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 124)])]);
+        let m0_dxil = kernel::translate(&m0_code, ko32).expect("wave32 S_AND_SAVEEXEC_B64 s0, m0");
+        if validate::validator_supported() {
+            validate::validate(&m0_dxil).expect("validate wave32 m0 saveexec");
+        }
+
+        // Wave32 _b64, wave32 wrexec _b64, and wave64 _b32 must touch neither s11 nor EXEC_HI (127).
+        for (inst, wave64) in [
+            ("S_AND_SAVEEXEC_B64", false),
+            ("S_ANDN2_WREXEC_B64", false),
+            ("S_AND_SAVEEXEC_B32", false),
+            ("S_AND_SAVEEXEC_B32", true),
+            ("S_ANDN1_WREXEC_B32", true),
+        ] {
+            let code = asm(&[(inst, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)])]);
+            let touched = touched_for(&code, wave64);
+            assert!(touched.contains(&10) && touched.contains(&126), "{inst} wave64={wave64} touched={touched:?}");
+            assert!(!touched.contains(&11), "{inst} wave64={wave64} must not read bogus s11: {touched:?}");
+            assert!(!touched.contains(&127), "{inst} wave64={wave64} must not touch EXEC_HI (s127): {touched:?}");
+        }
+
+        // Disassembly check: wave32 S_AND_SAVEEXEC_B64 s0, s10 emits only one `and i32` (EXEC_LO).
+        let s10_code = asm(&[("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)])]);
+        let s10_dxil = kernel::translate(&s10_code, ko32).expect("wave32 S_AND_SAVEEXEC_B64 s0, s10");
+        if validate::validator_supported() {
+            validate::validate(&s10_dxil).expect("validate wave32 s10 saveexec");
+            let dis = validate::disassemble(&s10_dxil).expect("disassemble wave32 s10 saveexec");
+            let ands = dis.lines().filter(|l| l.contains(" = and i32 ")).count();
+            assert_eq!(ands, 1, "wave32 saveexec should only AND EXEC_LO (got {ands}):\n{dis}");
+        }
+
+        // Control: wave64 S_AND_SAVEEXEC_B64 still reads s10:s11 and updates EXEC_LO + EXEC_HI.
+        let touched64 = touched_for(&s10_code, true);
+        assert!(
+            touched64.contains(&10) && touched64.contains(&11) && touched64.contains(&126) && touched64.contains(&127),
+            "wave64 S_AND_SAVEEXEC_B64 must touch s10, s11, EXEC_LO, EXEC_HI: {touched64:?}"
+        );
+        let dxil64 = kernel::translate(&s10_code, ko64).expect("wave64 S_AND_SAVEEXEC_B64 s0, s10");
+        if validate::validator_supported() {
+            validate::validate(&dxil64).expect("validate wave64 s10 saveexec");
+        }
+    }
+
+    /// Wave32 Direct DXIL GPU execution of `S_AND_SAVEEXEC_B64` (with `m0`), `S_OR_SAVEEXEC_B32`,
+    /// and `S_ANDN2_WREXEC_B64`, checking EXEC_LO / SCC / destination SGPRs and confirming high
+    /// halves (`s1`, `s5`) and `EXEC_HI` (`s127`) remain unmodified.
+    #[test]
+    fn gpu_direct_wave32_saveexec_and_wrexec() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        let code = asm(&[
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 124)]),
+            ("S_OR_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 10)]),
+            ("S_ANDN2_WREXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 12)]),
+        ]);
+        let dxil = kernel::translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
+        let mut st = runner::KernelState::default();
+        st.sgpr[1] = 0x1111_2222;
+        st.sgpr[5] = 0x3333_4444;
+        st.sgpr[126] = 0xFFFF_00FF;
+        st.sgpr[127] = 0xCAFE_BABE;
+        st.sgpr[124] = 0x0F0F_FFFF;
+        st.sgpr[10] = 0x00F0_0000;
+        st.sgpr[11] = 0xDEAD_BEEF;
+        st.sgpr[12] = 0xF0FF_FF00;
+        st.sgpr[13] = 0x5555_6666;
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run");
+        assert_eq!(r.sgpr[0], 0xFFFF_00FF, "s0 saves initial EXEC_LO");
+        assert_eq!(r.sgpr[1], 0x1111_2222, "s1 high half must remain untouched in wave32");
+        assert_eq!(r.sgpr[2], 0x0F0F_00FF, "s2 saves EXEC_LO after M0 AND");
+        assert_eq!(r.sgpr[4], 0xF000_FF00, "s4 receives new EXEC_LO from wrexec");
+        assert_eq!(r.sgpr[5], 0x3333_4444, "s5 high half must remain untouched in wave32");
+        assert_eq!(r.sgpr[126], 0xF000_FF00, "final EXEC_LO");
+        assert_eq!(r.sgpr[127], 0xCAFE_BABE, "EXEC_HI must remain untouched in wave32");
+        assert_eq!(r.scc, 1, "SCC = (final EXEC_LO != 0)");
+    }
 }

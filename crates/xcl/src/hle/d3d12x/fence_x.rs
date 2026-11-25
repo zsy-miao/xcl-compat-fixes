@@ -132,6 +132,14 @@ pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) 
     cell.0.as_ptr()
 }
 
+/// Remove a synthetic test fence from `FENCES` before it is dropped.
+#[cfg(test)]
+pub(super) fn forget_fence_for_test(fence: usize) {
+    if let Some(m) = FENCES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.remove(&fence);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

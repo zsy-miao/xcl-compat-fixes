@@ -317,21 +317,41 @@ impl Shader {
         if self.is_i64(v) {
             // AMD's driver (amdxc64, RDNA3/4) gets `Bfrev.i64` wrong (it
             // writes the reversed low half into both halves), so reverse
-            // each 32-bit half and swap them.
+            // each 32-bit half and swap them. The halves are reversed with
+            // shifts and masks, not `Bfrev.i32`: the driver also returns
+            // `x | bfrev(x)` for `Bfrev.i32(trunc(mul i64))` (fuzz seed 817).
             self.require(Feature::Int64Ops);
             let i32 = self.m.i32();
             let lo = self.m.cast(CastOp::Trunc, v, i32);
             let c32 = self.m.const_int(t, 32);
             let hi = self.m.bin(BinOp::LShr, v, c32);
             let hi = self.m.cast(CastOp::Trunc, hi, i32);
-            let rlo = self.op(30, "unary", Some(i32), i32, &[lo], FnAttrs::ReadNone);
-            let rhi = self.op(30, "unary", Some(i32), i32, &[hi], FnAttrs::ReadNone);
+            let rlo = self.bfrev32_shifts(lo);
+            let rhi = self.bfrev32_shifts(hi);
             let rlo = self.m.cast(CastOp::ZExt, rlo, t);
             let rlo = self.m.bin(BinOp::Shl, rlo, c32);
             let rhi = self.m.cast(CastOp::ZExt, rhi, t);
             return self.m.bin(BinOp::Or, rlo, rhi);
         }
         self.op(30, "unary", Some(t), t, &[v], FnAttrs::ReadNone)
+    }
+
+    /// 32-bit bit reverse by swapping bit groups (no `Bfrev`).
+    fn bfrev32_shifts(&mut self, v: Value) -> Value {
+        let i32 = self.m.i32();
+        let mut x = v;
+        for (sh, mask) in [(1, 0x5555_5555u64), (2, 0x3333_3333), (4, 0x0f0f_0f0f), (8, 0x00ff_00ff)] {
+            let (s, m) = (self.m.const_int(i32, sh), self.m.const_int(i32, mask));
+            let a = self.m.bin(BinOp::LShr, x, s);
+            let a = self.m.bin(BinOp::And, a, m);
+            let b = self.m.bin(BinOp::And, x, m);
+            let b = self.m.bin(BinOp::Shl, b, s);
+            x = self.m.bin(BinOp::Or, a, b);
+        }
+        let c16 = self.m.const_int(i32, 16);
+        let a = self.m.bin(BinOp::LShr, x, c16);
+        let b = self.m.bin(BinOp::Shl, x, c16);
+        self.m.bin(BinOp::Or, a, b)
     }
 
     /// Bit counts (i16 / i32 / i64 input) → i32.
@@ -388,6 +408,12 @@ impl Shader {
     pub fn bfi(&mut self, width: Value, offset: Value, value: Value, replaced: Value) -> Value {
         let t = self.m.type_of(value);
         self.op(53, "quaternary", Some(t), t, &[width, offset, value, replaced], FnAttrs::ReadNone)
+    }
+
+    /// `Dot4AddU8Packed(acc, a, b)` (SM 6.4+): `acc + sum_{i=0..3} byte_i(a) * byte_i(b)` (mod 2^32).
+    pub fn dot4_add_u8_packed(&mut self, acc: Value, a: Value, b: Value) -> Value {
+        let i32 = self.m.i32();
+        self.op(164, "dot4AddPacked", Some(i32), i32, &[acc, a, b], FnAttrs::ReadNone)
     }
 
     fn two_outs(&mut self, op: u32, a: Value, b: Value) -> (Value, Value) {

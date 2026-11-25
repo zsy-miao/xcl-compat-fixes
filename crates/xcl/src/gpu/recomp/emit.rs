@@ -3242,6 +3242,10 @@ impl Em {
         let dot: Option<String> = match name {
             "v_dot2_f32_f16" => {
                 let mut c = format!("asfloat({})", src(2));
+                // SRC2 is f32: its NEG_HI bit is ABS (applied before NEG), as in v_fma_mix*
+                if neg_hi >> 2 & 1 == 1 {
+                    c = format!("abs({c})");
+                }
                 if neg >> 2 & 1 == 1 {
                     c = format!("(-{c})");
                 }
@@ -3414,6 +3418,73 @@ impl Em {
             cases.push_str(&format!(" case {k}u: {v} = {td}; break;"));
         }
         self.line(&format!("if ({act}) {{ {vd} = {ts}; switch ({m0}) {{{cases} default: break; }} }}"));
+        Ok(())
+    }
+
+    /// Quad-byte SAD (`v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`): slides the
+    /// 4-byte pattern in `SRC1` across bytes 0..3, 1..4, 2..5, 3..6 of `SRC0` (skipping bytes
+    /// where `SRC1`'s byte is zero for `mqsad`) and adds into `SRC2`, saturating per element
+    /// when `CLAMP` is set.
+    fn valu_qsad(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if d.variant != Variant::Plain {
+            return Err("quad-SAD SDWA/DPP");
+        }
+        let (outs, ins) = Self::ops(d);
+        let clamp = Self::mods(d).clamp;
+        let masked = name.starts_with("v_mqsad");
+        let wide = name == "v_mqsad_u32_u8";
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let limit = if wide { 252 } else { 254 };
+        if matches!(dst, Dst::V(n) if n > limit) {
+            return Err("quad-SAD VDST out of range");
+        }
+        let (s0_lo, s0_hi) = self.read64(d, ins.first().ok_or("op")?, false).ok_or("op")?;
+        let s1 = self.read(d, ins.get(1).ok_or("op")?, false).ok_or("op")?;
+        let s2_op = ins.get(2).ok_or("op")?;
+        let sad = if masked { "msad_u8" } else { "sad_u8" };
+        let t = self.t();
+        self.line(&format!("uint {t}_l = {s0_lo}; uint {t}_h = {s0_hi}; uint {t}_r = {s1};"));
+        let wins = [
+            format!("{t}_l"),
+            format!("(({t}_l >> 8) | ({t}_h << 24))"),
+            format!("(({t}_l >> 16) | ({t}_h << 16))"),
+            format!("(({t}_l >> 24) | ({t}_h << 8))"),
+        ];
+        if wide {
+            let f = s2_op.field.ok_or("op")?;
+            let code = Self::field(d, f);
+            if !(256..=508).contains(&code) {
+                return Err("quad-SAD SRC2 not a 4-VGPR range");
+            }
+            let base = code - 256;
+            for (i, w) in wins.iter().enumerate() {
+                let acc = self.vreg(base + i as u64);
+                let sum = format!("{sad}({w}, {t}_r)");
+                let expr = if clamp { format!("sat_u32((uint64_t){sum} + (uint64_t){acc})") } else { format!("{sum} + {acc}") };
+                self.line(&format!("uint {t}_{i} = {expr};"));
+            }
+            if let Dst::V(dn) = dst {
+                let act = self.act();
+                let writes: Vec<String> = (0..4)
+                    .map(|i| {
+                        let vd = self.vreg(dn + i as u64);
+                        format!("{vd} = select({act}, {t}_{i}, {vd});")
+                    })
+                    .collect();
+                self.line(&writes.join(" "));
+            }
+        } else {
+            let (a_lo, a_hi) = self.read64(d, s2_op, false).ok_or("op")?;
+            self.line(&format!(
+                "uint {t}_0 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_lo}, {clamp});",
+                wins[0], wins[1]
+            ));
+            self.line(&format!(
+                "uint {t}_1 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_hi}, {clamp});",
+                wins[2], wins[3]
+            ));
+            self.write64(&dst, &format!("{t}_0"), &format!("{t}_1"));
+        }
         Ok(())
     }
 
@@ -3727,6 +3798,9 @@ impl Em {
         let mix = name.starts_with("v_fma_mix");
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
+        }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
         }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
@@ -6277,7 +6351,7 @@ uint rla(uint v, uint l) {
     // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
     // helper pixels of a quad a primitive's edge splits.
     uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);
-    uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);
+    uint q = select((l & 2u) != 0u, select((l & 1u) != 0u, q3, q2), select((l & 1u) != 0u, q1, q0));
     // A helper lane of another quad: after s_wqm the console's v_readfirstlane often picks
     // one (the first lane of EXEC on a primitive's edge), and a wave read of it is undefined
     // here (0 in practice: every other quad of the wave got the wrong value, e.g. a shader's
@@ -6285,12 +6359,14 @@ uint rla(uint v, uint l) {
     // reader takes that from a live lane of the same quad.
     uint h = l + 32u * xcl_half;
     uint4 xcl_lv = WaveActiveBallot(true);
-    uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;
+    uint hw = h >> 5;
+    uint lv_w = select(hw < 2u, select(hw == 0u, xcl_lv.x, xcl_lv.y), select(hw == 2u, xcl_lv.z, xcl_lv.w));
+    uint nib = (lv_w >> (h & 28u)) & 15u;
     uint src = (h & ~3u) + firstbitlow(nib);
     uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);
-    uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);
-    if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
-    if ((l >> 2) == (lane_id >> 2)) w = q;
+    uint r = select((l & 2u) != 0u, select((l & 1u) != 0u, r3, r2), select((l & 1u) != 0u, r1, r0));
+    w = select(and(nib != 0u, ((nib >> (h & 3u)) & 1u) == 0u), r, w);
+    w = select((l >> 2) == (lane_id >> 2), q, w);
 #endif
     return w;
 }
@@ -6363,6 +6439,7 @@ uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
 uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }
 uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
+uint pk_sad_u16(uint d0, uint d1, uint acc, bool sat) { uint s0 = (acc & 0xFFFFu) + d0; uint s1 = (acc >> 16) + d1; return select(sat, min(s0, 0xFFFFu), s0 & 0xFFFFu) | (select(sat, min(s1, 0xFFFFu), s1 & 0xFFFFu) << 16); }
 uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
@@ -6453,7 +6530,8 @@ uint cvt_norm_i16_f16(uint h) {
 uint cvt_norm_i16_f32(float f) {
     return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
 }
-float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
+// HLSL frexp()'s mantissa is unsigned; the ISA's keeps the input's sign (as frexp_mant_d)
+float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : asfloat(asuint(frexp(x, e)) | (asuint(x) & 0x80000000u)); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
 int frexp_exp_f32(uint bits, float legacy_src, uint denorm) {
     // 0: initial MODE unknown, 1: flush input, 2: preserve input.
@@ -6633,7 +6711,7 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::PRELUDE_MEM;
+    use super::{PRELUDE, PRELUDE_MEM};
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
@@ -6643,5 +6721,124 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    #[test]
+    fn rla_pixel_helper_avoids_runtime_vector_indexing_and_branches() {
+        let start = PRELUDE.find("uint rla(uint v, uint l) {").expect("rla in PRELUDE");
+        let rest = &PRELUDE[start..];
+        let end = rest.find("\n}\n").expect("rla closing brace");
+        let rla = &rest[..end + 2];
+        assert!(!rla.contains("xcl_lv["), "runtime vector index remains in rla():\n{rla}");
+        assert!(!rla.contains(" ? "), "scalar ternary remains in rla():\n{rla}");
+        assert!(!rla.contains("if ("), "scalar if-branch remains in rla():\n{rla}");
+        assert!(!rla.contains("pick4("), "PRELUDE::rla() must not depend on PRELUDE_MEM::pick4():\n{rla}");
+        for comp in ["xcl_lv.x", "xcl_lv.y", "xcl_lv.z", "xcl_lv.w", "select("] {
+            assert!(rla.contains(comp), "missing {comp} in rla():\n{rla}");
+        }
+    }
+
+    #[test]
+    fn rla_pixel_shader_compiles_without_local_arrays() {
+        let Ok(dxc_dir) = super::super::dxc::location() else {
+            super::super::runner::skip_test("no DXC");
+            return;
+        };
+        let dxc_exe = dxc_dir.join("dxc.exe");
+        if !dxc_exe.is_file() {
+            super::super::runner::skip_test("no dxc.exe");
+            return;
+        }
+        // Self-contained pixel shader (no PRELUDE_MEM) with 3 dynamic-lane rla() calls.
+        let src = format!(
+            "#define XCL_PIXEL 1\n{PRELUDE}\n\
+            float4 main(float4 p : SV_Position) : SV_Target {{\n\
+                lane_id = WaveGetLaneIndex();\n\
+                uint v = (uint)p.x + ((uint)p.y << 8);\n\
+                uint a = rla(v, lane_id ^ 1u);\n\
+                uint b = rla(v, ((uint)p.x + lane_id) & 63u);\n\
+                uint c = rla(v, ((uint)p.y + 3u) & 127u);\n\
+                return float4(asfloat(a), asfloat(b), asfloat(c), 1.0);\n\
+            }}\n"
+        );
+        let dxil = super::super::dxc::compile(&src, "main", "ps_6_6", &[]).expect("DXC ps_6_6 compile");
+        let tmp = std::env::temp_dir().join(format!("xcl_rla_test_{}.dxil", std::process::id()));
+        std::fs::write(&tmp, &dxil).expect("write temp dxil");
+        let out = std::process::Command::new(&dxc_exe).args(["-dumpbin", tmp.to_str().unwrap()]).output().expect("dxc -dumpbin");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(out.status.success(), "dxc -dumpbin failed: {}", String::from_utf8_lossy(&out.stderr));
+        let ir = String::from_utf8_lossy(&out.stdout);
+        let body = ir.split("define void @main(").nth(1).expect("main body in DXIL disassembly");
+        let body = body.split("\n}\n").next().unwrap_or(body);
+        let allocas = body.lines().filter(|l| l.contains(" = alloca ") || l.trim_start().starts_with("alloca ")).count();
+        let cond_branches = body.lines().filter(|l| l.trim_start().starts_with("br i1 ")).count();
+        assert_eq!(allocas, 0, "expected 0 local arrays in rla() DXIL, got {allocas}");
+        assert_eq!(cond_branches, 0, "expected 0 conditional branches in rla() DXIL, got {cond_branches}");
+    }
+
+    #[test]
+    fn gpu_rla_pixel_shader_matches_reference_including_helper_lanes() {
+        use super::super::{dxc, runner};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+        match (runner::adapter(), runner::wave64_programs_supported(), dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, w, d) => {
+                runner::skip_test(if a.is_err() || w.is_err() {
+                    "no GPU"
+                } else if d.is_err() {
+                    "no DXC"
+                } else {
+                    "no 32/64-lane waves"
+                });
+                return;
+            }
+        }
+        let vs = dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+        let ref_rla = "\
+            uint rla_ref(uint v, uint l) {\n\
+                uint w = WaveReadLaneAt(v, l + 32u * xcl_half);\n\
+                uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);\n\
+                uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);\n\
+                uint h = l + 32u * xcl_half;\n\
+                uint4 xcl_lv = WaveActiveBallot(true);\n\
+                uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;\n\
+                uint src = (h & ~3u) + firstbitlow(nib);\n\
+                uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);\n\
+                uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);\n\
+                if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;\n\
+                if ((l >> 2) == (lane_id >> 2)) w = q;\n\
+                return w;\n\
+            }\n";
+        let src = format!(
+            "#define XCL_PIXEL 1\n{PRELUDE}\n{ref_rla}\n\
+            float4 main(float4 p : SV_Position) : SV_Target {{\n\
+                lane_id = WaveGetLaneIndex();\n\
+                uint v = ((uint)p.x + 1u) + (((uint)p.y + 1u) << 8);\n\
+                uint live0 = WaveActiveBallot(true).x;\n\
+                uint first_q = firstbitlow(wqm(live0));\n\
+                uint first_live = firstbitlow(live0);\n\
+                uint last_live = 31u - firstbithigh(live0);\n\
+                uint qx = rla(v, lane_id ^ 1u);\n\
+                uint qy = rla(v, lane_id ^ 2u);\n\
+                bool ok_q = qx == rla_ref(v, lane_id ^ 1u) && qy == rla_ref(v, lane_id ^ 2u) && rla(v, lane_id ^ 3u) == rla_ref(v, lane_id ^ 3u);\n\
+                bool ok_x = rla(v, first_q) == rla_ref(v, first_q) && rla(v, first_live) == rla_ref(v, first_live) && rla(v, last_live) == rla_ref(v, last_live);\n\
+                return float4((float)qx, (float)qy, ok_q ? 1.0 : 0.0, ok_x ? 1.0 : 0.0);\n\
+            }}\n"
+        );
+        let ps = dxc::compile(&src, "main", "ps_6_6", &[]).unwrap();
+        // Two triangles sharing the diagonal x = y so diagonal quads contain live + helper lanes.
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [-1.0; 4]).unwrap();
+        assert_eq!(px.len(), size * size);
+        for y in 0..size {
+            for x in 0..size {
+                let p = px[y * size + x];
+                let want_x = (((x ^ 1) + 1) + ((y + 1) << 8)) as f32;
+                let want_y = ((x + 1) + (((y ^ 1) + 1) << 8)) as f32;
+                assert_eq!(p, [want_x, want_y, 1.0, 1.0], "pixel ({x}, {y}) mismatch: {p:?}");
+            }
+        }
     }
 }

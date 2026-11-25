@@ -38,7 +38,7 @@ const F_RING: usize = 0x2000;
 const F_RING_AT: usize = 0x2100;
 const RING: usize = 64;
 /// Maximum number of mid-list split segments per command list recording.
-const MAX_EXTRA_SEGMENTS: usize = 32;
+const MAX_EXTRA_SEGMENTS: usize = 1024;
 
 #[derive(Default)]
 struct SegmentBook {
@@ -269,12 +269,12 @@ pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
     WRAPPER_OF.lock().unwrap().as_ref()?.get(&(pc as usize)).map(|&w| w as *mut c_void)
 }
 
-/// Whether `wrapper` may allocate/activate another split segment for this recording.
-pub(super) fn can_split(wrapper: *mut c_void) -> bool {
+/// Whether `wrapper` may allocate/activate `n` more split segments for this recording.
+pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
     let sg = SEGMENTS.lock().unwrap();
     sg.as_ref()
         .and_then(|m| m.get(&(wrapper as usize)))
-        .is_none_or(|b| b.extra_active.len() < MAX_EXTRA_SEGMENTS)
+        .is_none_or(|b| b.extra_active.len() + n <= MAX_EXTRA_SEGMENTS)
 }
 
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
@@ -290,6 +290,11 @@ pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
 pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
     let mut sg = SEGMENTS.lock().unwrap();
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
+}
+
+/// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
+pub(super) fn push_segment(wrapper: *mut c_void, pc: *mut c_void) {
+    SEGMENTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active.push(pc as usize);
 }
 
 /// Switch `wrapper` from closed segment `old_pc` to newly opened segment `new_pc`.

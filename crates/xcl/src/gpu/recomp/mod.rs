@@ -1408,6 +1408,14 @@ pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: 
     translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
 }
 
+/// Wave size of an FSSM's program: wave32 when its header says so (`Fssm::wave32`), else by
+/// the code. A wave32 program that never writes EXEC has nothing in its code to tell, and
+/// `detect_wave64` takes it for wave64: its cross-lane reads (`v_readfirstlane`, `v_readlane`,
+/// permutes) then span 64 threads instead of 32.
+pub fn fssm_wave64(f: &super::xbox::Fssm, code: &[u8]) -> bool {
+    !f.wave32() && detect_wave64(code)
+}
+
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
 pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;

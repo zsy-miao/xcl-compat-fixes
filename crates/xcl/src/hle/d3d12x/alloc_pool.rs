@@ -218,6 +218,15 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
 }
 
+/// Whether the GPU may still run a recording made on the title's allocator `alloc`.
+pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return false };
+    let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    busy
+}
+
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).

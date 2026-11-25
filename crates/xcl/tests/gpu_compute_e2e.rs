@@ -26,12 +26,18 @@ fn le(v: &mut Vec<u8>, x: u32) {
 /// holds XBCH (zlib) → FSSM with `code` and a CS stage descriptor: COMPUTE_PGM_RSRC2
 /// `rsrc2` at +0x38, numthreads at +0x3C.
 fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
+    console_cs_flags(code, rsrc2, threads, 0)
+}
+
+/// `console_cs` with the FSSM header's flags word (+0xD4; bit 5 = wave32).
+fn console_cs_flags(code: &[u8], rsrc2: u32, threads: [u32; 3], flags: u32) -> Vec<u8> {
     let code_at = 0x308usize;
     let mut fssm = vec![0u8; code_at];
     fssm[0..4].copy_from_slice(b"FSSM");
     fssm[4..8].copy_from_slice(&0x101u32.to_le_bytes());
     fssm[0xC0..0xC8].copy_from_slice(&((code_at - 0x10) as u64).to_le_bytes());
     fssm[0xC8..0xD0].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    fssm[0xD4..0xD8].copy_from_slice(&flags.to_le_bytes());
     fssm[0x100..0x108].copy_from_slice(&0x0000_00C0_0002_0106u64.to_le_bytes()); // CS, API stage 1
     for (k, x) in [rsrc2, threads[0], threads[1], threads[2]].into_iter().enumerate() {
         fssm[0x138 + 4 * k..0x13C + 4 * k].copy_from_slice(&x.to_le_bytes());
@@ -122,6 +128,96 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     run(true);
     let _ = fs::remove_dir_all(&dir);
     assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+}
+
+/// Wave32 compute program with conditional branches across distinct basic blocks so direct
+/// DXIL splitting (`XCL_DIRECT_SPLIT_INSTRUCTIONS`) partitions it into multiple pieces.
+fn split_program() -> Vec<u8> {
+    let list: &[(&str, &str, &[(&str, u64)], Option<u32>)] = &[
+        // Mark wave32 (`detect_wave64` -> false) so `[32, 1, 1]` splits on every wave32 GPU.
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 131), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 133), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 135), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 137), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 139), ("VSRC1", 2)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 141), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 143), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 145), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 147), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 149), ("VSRC1", 2)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 151), ("VSRC1", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 0), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 2), ("SADDR", 0x7D)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ];
+    list.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect()
+}
+
+#[test]
+fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if !runner::wave32_supported().unwrap_or(false) {
+        runner::skip_test("no wave32 GPU");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-offline-split-pso-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("split.bin"), console_cs(&split_program(), 2 << 1 | 1 << 7, [32, 1, 1])).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(&input)
+            .args(["--precompile", "--pipelines", "--windows", "1"])
+            .env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_DIRECT_DXIL", "1")
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+            .env("XCL_PSO_DISK_CACHE", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    let cold = run();
+    let mut files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    let pieces = files.len();
+    assert!(pieces >= 2, "expected >= 2 split piece blobs in driver cache, got {files:?}\n{cold}");
+    assert!(
+        files.iter().all(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".chain.pso"))),
+        "split compute precompile must write only .chain.pso files, got {files:?}"
+    );
+    assert!(files.iter().all(|p| p.metadata().unwrap().len() > 0));
+    assert!(cold.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{cold}");
+    assert!(cold.contains(&format!("split compute programs: 1 ({pieces} pieces)")), "{cold}");
+
+    let warm = run();
+    assert!(warm.contains(&format!("pipelines loaded from the driver cache {pieces}")), "{warm}");
+
+    // A corrupt .chain.pso is rejected and rebuilt cleanly while sibling pieces stay reused.
+    fs::write(&files[0], b"invalid cached chain pipeline").unwrap();
+    let recovered = run();
+    assert!(recovered.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{recovered}");
+    assert!(recovered.contains(&format!("pipelines loaded from the driver cache {}", pieces - 1)), "{recovered}");
+    assert!(files[0].metadata().unwrap().len() > b"invalid cached chain pipeline".len() as u64);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
@@ -351,4 +447,69 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
     // Releasing the stand-in must release and forget the background-built real PSO too.
     drop(pso);
     assert!(!real::is_translated_compute(real_raw), "forgetting released async compute PSO must clean up TRANSLATED_COMPUTE");
+}
+
+/// A compute program without an EXEC write has nothing in its code that tells its wave size:
+/// the FSSM header's wave32 flag does. 64 threads each store `v_readfirstlane` of the thread
+/// id: in 32-lane waves threads 32..63 read thread 32, in a 64-lane wave all read thread 0.
+#[test]
+fn console_compute_without_an_exec_write_has_the_wave_size_of_its_header() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        runner::skip_test("no GPU");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+    let list: &[(&str, &str, &[(&str, u64)], Option<u32>)] = &[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None), // s4 = first thread of the wave
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 131), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 0), ("VSRC1", 9)], None), // + output base
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ];
+    let code: Vec<u8> = list.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect();
+    assert!(xcl::gpu::recomp::detect_wave64(&code), "the code alone reads as wave64");
+    for (flags, upper) in [(0u32, 0u32), (0x20, 32)] {
+        // user SGPRs 2, thread ids in v0
+        let blob = console_cs_flags(&code, 2 << 1 | 1 << 11, [64, 1, 1], flags);
+        let game_rs: ID3D12RootSignature = unsafe {
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+        };
+        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+            ..Default::default()
+        };
+        let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateComputePipelineState(&desc) };
+        unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+        let pso = pso.expect("CreateComputePipelineState through the backend hook");
+        let real_raw = pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
+        assert!(real::is_translated_compute(real_raw as usize), "flags {flags:#x}: not built from the translated shader: {:?}", real::stats().translation_errors);
+        let pso = unsafe { ID3D12PipelineState::from_raw_borrowed(&real_raw) }.unwrap().clone();
+        let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
+        let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
+        let base = 0x100usize;
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        let out = runner::dispatch_on(&dev, &pso, &rs, [1, 1, 1], &io, &vec![0xFFFF_FFFFu32; (base + 64 * 8) / 4]).expect("dispatch");
+        for t in 0..64usize {
+            let at = base / 4 + t * 2;
+            assert_eq!((out[at], out[at + 1]), (if t < 32 { 0 } else { upper }, t as u32), "flags {flags:#x}, thread {t}");
+        }
+    }
 }

@@ -34,6 +34,9 @@ Usage:
       for the recompiler). RPF9 packages are scanned for shader records.
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
+      --precompile [--only STAGE]: caches compiled shaders before a run (e.g. --only cs).
+          --pipelines also builds compute pipelines and caches them for the next run.
+          --used-only skips compute shaders whose pipelines were not used in earlier runs.
       --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic
           compute HLSL for investigation; an exact hash bypasses the size threshold.
       --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact

@@ -1482,7 +1482,13 @@ mod frame_dump_tests {
             // WARP needs no physical GPU. Fill a CPU-visible buffer with the same padded
             // footprint used by a readback, so this exercises write_frame's actual decoder.
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let adapter: IDXGIAdapter = match factory.EnumWarpAdapter() {
+                Ok(a) => a,
+                Err(_) => {
+                    crate::gpu::recomp::runner::skip_test("no WARP");
+                    return;
+                }
+            };
             let mut dev: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
             let dev = dev.unwrap();
@@ -1544,7 +1550,13 @@ mod frame_dump_tests {
     fn compositor_blends_ui_plane_over_scene_plane() {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let adapter: IDXGIAdapter = match factory.EnumWarpAdapter() {
+                Ok(a) => a,
+                Err(_) => {
+                    crate::gpu::recomp::runner::skip_test("no WARP");
+                    return;
+                }
+            };
             let mut dev: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
             let dev = dev.unwrap();

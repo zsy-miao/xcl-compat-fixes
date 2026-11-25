@@ -152,6 +152,7 @@ impl Module {
                 match (bop, cb) {
                     (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr | BinOp::AShr, Some(0)) => return Some(a),
                     (BinOp::And, Some(m)) if m == mask => return Some(a),
+                    (BinOp::Or, Some(m)) if m == mask => return Some(b),
                     (BinOp::And | BinOp::Mul, Some(0)) => return Some(b),
                     (BinOp::Mul, Some(1)) => return Some(a),
                     _ => {}
@@ -159,7 +160,8 @@ impl Module {
                 match (bop, ca) {
                     (BinOp::Add | BinOp::Or | BinOp::Xor, Some(0)) => return Some(b),
                     (BinOp::And, Some(m)) if m == mask => return Some(b),
-                    (BinOp::And | BinOp::Mul | BinOp::Shl | BinOp::LShr, Some(0)) => return Some(a),
+                    (BinOp::Or, Some(m)) if m == mask => return Some(a),
+                    (BinOp::And | BinOp::Mul | BinOp::Shl | BinOp::LShr | BinOp::AShr, Some(0)) => return Some(a),
                     (BinOp::Mul, Some(1)) => return Some(b),
                     _ => {}
                 }
@@ -169,6 +171,83 @@ impl Module {
                         BinOp::Sub | BinOp::Xor => return Some(self.const_int(ty, 0)),
                         _ => {}
                     }
+                }
+                match bop {
+                    BinOp::Xor => {
+                        for (cand, other) in [(a, b), (b, a)] {
+                            if let Value::Inst(j) = cand {
+                                if let Op::Bin(BinOp::Xor, x, y, 0) = self.insts[j as usize].op {
+                                    if other == y {
+                                        return Some(x);
+                                    }
+                                    if other == x {
+                                        return Some(y);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    BinOp::And => {
+                        if let Some((v, m)) = cb.map(|m| (a, m)).or_else(|| ca.map(|m| (b, m))) {
+                            if let Value::Inst(j) = v {
+                                match self.insts[j as usize].op {
+                                    Op::Bin(BinOp::LShr, _, sh, 0) => {
+                                        if let Some(s) = self.const_u64(sh).filter(|&s| s < w as u64) {
+                                            let known = mask >> s;
+                                            if known & m == known {
+                                                return Some(v);
+                                            }
+                                            if known & m == 0 {
+                                                return Some(self.const_int(ty, 0));
+                                            }
+                                        }
+                                    }
+                                    Op::Bin(BinOp::Shl, _, sh, 0) => {
+                                        if let Some(s) = self.const_u64(sh).filter(|&s| s < w as u64) {
+                                            let known = (mask << s) & mask;
+                                            if known & m == known {
+                                                return Some(v);
+                                            }
+                                            if known & m == 0 {
+                                                return Some(self.const_int(ty, 0));
+                                            }
+                                        }
+                                    }
+                                    Op::Bin(BinOp::And, x, y, 0) => {
+                                        if let Some(c1) = self.const_u64(y).or_else(|| self.const_u64(x)) {
+                                            if c1 & m == c1 {
+                                                return Some(v);
+                                            }
+                                            if c1 & m == 0 {
+                                                return Some(self.const_int(ty, 0));
+                                            }
+                                        }
+                                    }
+                                    Op::Cast(CastOp::ZExt, inner, _) if self.int_width(self.value_ty(inner)) == Some(1) => {
+                                        return Some(if m & 1 != 0 { v } else { self.const_int(ty, 0) });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    BinOp::Or => {
+                        if let Some((v, m)) = cb.map(|m| (a, m)).or_else(|| ca.map(|m| (b, m))) {
+                            if let Value::Inst(j) = v {
+                                if let Op::Bin(BinOp::Or, x, y, 0) = self.insts[j as usize].op {
+                                    if let Some(c1) = self.const_u64(y).or_else(|| self.const_u64(x)) {
+                                        if c1 | m == c1 {
+                                            return Some(v);
+                                        }
+                                        if (c1 | m) == mask {
+                                            return Some(self.const_int(ty, mask));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 None
             }
@@ -1234,6 +1313,90 @@ mod tests {
         let Value::Inst(p_i) = p else { unreachable!() };
         let Op::Phi(inc) = &m.insts[p_i as usize].op else { panic!("expected phi") };
         assert_eq!(inc.len(), 2);
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn simplify_op_folds_bitmasks_double_xor_and_all_ones_or() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let c0 = m.i32c(0);
+        let c2 = m.i32c(2);
+        let c24 = m.i32c(24);
+        let all = m.i32c(u32::MAX);
+        let mff = m.i32c(0xFF);
+        let mhi = m.i32c(0xFFFF_0000);
+        let mlo = m.i32c(0x0000_FFFF);
+        let align4 = m.i32c(!3u32);
+        let low2 = m.i32c(3);
+        let k = m.i32c(0xA5A5_5A5A);
+
+        // 1. All-ones `or` absorption + `ashr 0, x -> 0`
+        let or_all = m.bin(BinOp::Or, x, all);
+        let ashr_z = m.bin(BinOp::AShr, c0, x);
+        // 2. Double `xor` cancellation
+        let x1 = m.bin(BinOp::Xor, x, k);
+        let x2 = m.bin(BinOp::Xor, x1, k);
+        // 3. Redundant and disjoint masks on `lshr`
+        let shr = m.bin(BinOp::LShr, x, c24);
+        let shr_keep = m.bin(BinOp::And, shr, mff);
+        let shr_zero = m.bin(BinOp::And, shr, mhi);
+        // 4. Redundant and disjoint masks on `shl`
+        let shl = m.bin(BinOp::Shl, x, c2);
+        let shl_keep = m.bin(BinOp::And, shl, align4);
+        let shl_zero = m.bin(BinOp::And, shl, low2);
+        // 5. Nested `and` / `or` masks
+        let a1 = m.bin(BinOp::And, x, mff);
+        let a_keep = m.bin(BinOp::And, a1, mlo);
+        let a_zero = m.bin(BinOp::And, a1, mhi);
+        let o1 = m.bin(BinOp::Or, x, mlo);
+        let o_keep = m.bin(BinOp::Or, o1, mff);
+        let o_all = m.bin(BinOp::Or, o1, mhi);
+        // 6. Mask on `zext(i1)`
+        let cond = m.cmp(Pred::Eq, x, c0);
+        let z = m.cast(CastOp::ZExt, cond, i32t);
+        let z_keep = m.bin(BinOp::And, z, mff);
+        let z_zero = m.bin(BinOp::And, z, mhi);
+
+        for v in [or_all, ashr_z, x2, shr_keep, shr_zero, shl_keep, shl_zero, a_keep, a_zero, o_keep, o_all, z_keep, z_zero] {
+            m.call(sink, &[v]);
+        }
+        m.ret();
+        m.optimize();
+
+        let args: Vec<Value> = m.blocks[entry.0 as usize]
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, a) if *f == sink => Some(a[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 13);
+        assert_eq!(m.const_u64(args[0]), Some(u32::MAX as u64), "or(x, ~0) -> ~0");
+        assert_eq!(m.const_u64(args[1]), Some(0), "ashr(0, x) -> 0");
+        assert_eq!(args[2], x, "xor(xor(x, k), k) -> x");
+        assert_eq!(args[3], shr, "and(lshr(x, 24), 0xFF) -> lshr(x, 24)");
+        assert_eq!(m.const_u64(args[4]), Some(0), "and(lshr(x, 24), 0xFFFF0000) -> 0");
+        assert_eq!(args[5], shl, "and(shl(x, 2), !3) -> shl(x, 2)");
+        assert_eq!(m.const_u64(args[6]), Some(0), "and(shl(x, 2), 3) -> 0");
+        assert_eq!(args[7], a1, "and(and(x, 0xFF), 0xFFFF) -> and(x, 0xFF)");
+        assert_eq!(m.const_u64(args[8]), Some(0), "and(and(x, 0xFF), 0xFFFF0000) -> 0");
+        assert_eq!(args[9], o1, "or(or(x, 0xFFFF), 0xFF) -> or(x, 0xFFFF)");
+        assert_eq!(m.const_u64(args[10]), Some(u32::MAX as u64), "or(or(x, 0xFFFF), 0xFFFF0000) -> ~0");
+        assert_eq!(args[11], z, "and(zext(i1), 0xFF) -> zext(i1)");
+        assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }

@@ -865,7 +865,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 const TWO_SOURCE: &[&str] = &[
                     "V_ADD_NC_U32", "V_ADD_U32", "V_SUB_NC_U32", "V_SUB_U32", "V_SUBREV_NC_U32", "V_SUBREV_U32", "V_AND_B32", "V_OR_B32", "V_XOR_B32",
                     "V_MUL_LO_U32", "V_LSHL_ADD_U32", "V_ADD_LSHL_U32", "V_LSHL_OR_B32", "V_AND_OR_B32", "V_OR3_B32", "V_XOR3_B32", "V_ADD3_U32",
-                    "V_LSHLREV_B32", "V_LSHRREV_B32", "V_ASHRREV_I32",
+                    "V_LSHLREV_B32", "V_LSHRREV_B32", "V_ASHRREV_I32", "V_MIN_U32", "V_MAX_U32", "V_MIN_I32", "V_MAX_I32",
                 ];
                 if !TWO_SOURCE.contains(&name) {
                     return Err(format!("unsupported {name}"));
@@ -917,6 +917,16 @@ impl<'a, I: Ir> Lower<'a, I> {
                             _ => Bin::AShr,
                         };
                         self.ir.bin(op, c, sh)
+                    }
+                    "V_MIN_U32" | "V_MAX_U32" | "V_MIN_I32" | "V_MAX_I32" => {
+                        let pred = match name {
+                            "V_MIN_U32" => Cmp::Ult,
+                            "V_MAX_U32" => Cmp::Ugt,
+                            "V_MIN_I32" => Cmp::Slt,
+                            _ => Cmp::Sgt,
+                        };
+                        let cond = self.ir.icmp(pred, a, c);
+                        self.ir.select(cond, a, c)
                     }
                     n => return Err(format!("unsupported {n}")),
                 }
@@ -3520,6 +3530,22 @@ pub(crate) mod tests {
         for (l, regs) in v.iter().enumerate() {
             assert_eq!((regs[1], regs[2]), (10, 10 + l as u32), "lane {l}");
         }
+    }
+
+    #[test]
+    fn integer_min_and_max() {
+        let lines: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)]), // 1
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 193)]), // -1 (0xFFFF_FFFF)
+            ("V_MIN_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ("V_MAX_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ("V_MIN_I32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ("V_MAX_I32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ENDPGM,
+        ];
+        let (s, v) = state(32);
+        let (_, v) = run(lines, false, &s, &v);
+        assert_eq!((v[0][3], v[0][4], v[0][5], v[0][6]), (1, u32::MAX, u32::MAX, 1));
     }
 
     /// The survey goes on past a refused instruction: both are reported, and a program the

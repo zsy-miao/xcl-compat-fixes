@@ -22,12 +22,14 @@ pub struct Effects {
 }
 
 /// The writes of the RDNA2 program `code` (one program, as `xbox::Fssm::programs` cuts it).
-/// None: an instruction that does not decode, so nothing can be said about what follows it.
+/// None when the program cannot be decoded through a terminator, falls through past decoded
+/// code, contains an unresolved indirect transfer, or branches outside the decoded instructions.
 pub fn of(code: &[u8]) -> Option<Effects> {
-    let mut e = Effects::default();
+    let mut insts = Vec::new();
     let mut off = 0;
-    // the whole program: code can follow an early S_ENDPGM (a branch to it, or past it); what
-    // does not decode after one is taken for trailing data, before one it says nothing
+    // the whole program: code can follow an early terminator (a branch to it, or past it); what
+    // does not decode (or S_CODE_END padding) after one is taken for trailing data, unless a
+    // decoded branch still targets past it or the tail falls through into it
     let mut ended = false;
     while off + 4 <= code.len() {
         let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
@@ -36,7 +38,27 @@ pub fn of(code: &[u8]) -> Option<Effects> {
             }
             return None;
         };
+        if ended && d.inst.name == "S_CODE_END" {
+            break;
+        }
         off += d.len;
+        ended |= d.inst.flags & rdna2::F_TERMINATOR != 0;
+        insts.push(d);
+    }
+    if !ended {
+        return None;
+    }
+    rdna2::resolve_far_jumps(&mut insts);
+    let last = insts.last()?;
+    if last.inst.flags & rdna2::F_TERMINATOR == 0 && last.inst.name != "S_BRANCH" && last.far_target.is_none() {
+        return None;
+    }
+    let pcs: std::collections::HashSet<u64> = insts.iter().map(|d| d.pc).collect();
+    let mut e = Effects::default();
+    for d in &insts {
+        if d.inst.flags & (rdna2::F_BRANCH | rdna2::F_INDIRECT) != 0 && rdna2::branch_target(d).is_none_or(|t| !pcs.contains(&t)) {
+            return None;
+        }
         e.instructions += 1;
         let n = d.inst.name;
         let writes = n.contains("_STORE") || n.contains("_ATOMIC");
@@ -50,7 +72,6 @@ pub fn of(code: &[u8]) -> Option<Effects> {
             }
             _ => {}
         }
-        ended |= n == "S_ENDPGM";
     }
     Some(e)
 }
@@ -63,6 +84,9 @@ fn compute_code(blob: &[u8]) -> Option<Vec<u8>> {
     }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    if f.error.is_some() {
+        return None;
+    }
     let p = f.programs.first()?;
     Some(f.data.get(p.offset..p.offset.checked_add(p.len)?)?.to_vec())
 }
@@ -151,5 +175,84 @@ mod tests {
         if rdna2::decode(&[0xff; 8], 0).is_err() {
             assert_eq!(of(&code), None);
         }
+    }
+
+    #[test]
+    fn branch_past_early_end_gap_and_fallthrough_say_nothing() {
+        assert!(rdna2::decode(&[0xff; 8], 0).is_err());
+        let store: (&str, &str, &[(&str, u64)]) = ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
+        // 0x00: s_cbranch_scc1 +5 (-> 0x18), 0x04: image_store (8B), 0x0c: s_endpgm,
+        // 0x10: undecodable gap (8B), 0x18: buffer_store_dword, 0x20: s_endpgm
+        let mut jumped = asm(&[("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)]), IMAGE_STORE, END]);
+        jumped.extend_from_slice(&[0xff; 8]);
+        jumped.extend(asm(&[store, END]));
+        assert_eq!(of(&jumped), None);
+
+        // 0x00: s_cbranch_scc1 +1 (-> 0x08), 0x04: s_endpgm, 0x08: image_store falls into gap
+        let mut fallthrough = asm(&[("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), END, IMAGE_STORE]);
+        fallthrough.extend_from_slice(&[0xff; 8]);
+        fallthrough.extend(asm(&[store, END]));
+        assert_eq!(of(&fallthrough), None);
+
+        // missing terminator fails closed; non-default F_TERMINATOR + trailing data still passes
+        assert_eq!(of(&asm(&[IMAGE_STORE])), None);
+        let mut saved = asm(&[IMAGE_STORE, ("S_ENDPGM_SAVED", "ENC_SOPP", &[])]);
+        saved.extend_from_slice(&[0xff; 8]);
+        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, instructions: 2 }));
+    }
+
+    #[test]
+    fn unresolved_indirect_and_oob_branches_fail_closed_while_far_jump_passes() {
+        let setpc: (&str, &str, &[(&str, u64)]) = ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 0)]);
+        let swappc: (&str, &str, &[(&str, u64)]) = ("S_SWAPPC_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 0)]);
+        let oob_branch: (&str, &str, &[(&str, u64)]) = ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 8)]);
+        let oob_call: (&str, &str, &[(&str, u64)]) = ("S_CALL_B64", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 8)]);
+        for bad in [setpc, swappc, oob_branch, oob_call] {
+            assert_eq!(of(&asm(&[IMAGE_STORE, bad, END])), None, "{}", bad.0);
+        }
+
+        // resolved far jump (base = 0x04, +16 -> 0x14) past early END to IMAGE_STORE; trailing S_CODE_END padding
+        let far_ok = asm(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 128 + 16)]),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)]),
+            setpc,
+            END,
+            IMAGE_STORE,
+            END,
+            ("S_CODE_END", "ENC_SOPP", &[]),
+        ]);
+        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, instructions: 7 }));
+
+        // resolved far jump whose target lands past the decoded slice still fails closed
+        let far_oob = asm(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 128 + 64)]),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)]),
+            setpc,
+            END,
+        ]);
+        assert_eq!(of(&far_oob), None);
+    }
+
+    #[test]
+    fn errored_fssm_is_rejected_by_big_and_image_only() {
+        let mut code = Vec::with_capacity(BIG_CODE + 16);
+        let mov = asm(&[MOV]);
+        while code.len() < BIG_CODE {
+            code.extend_from_slice(&mov);
+        }
+        code.extend(asm(&[IMAGE_STORE, END]));
+        let valid = xbox::tests::sample(5, &[xbox::tests::fssm(&code, &[(6, 0)])]);
+        assert!(big_and_image_only(&valid));
+
+        // bump XBCH rsize so parse_xbch records f.error while still populating f.programs
+        let mut errored = valid.clone();
+        let at = errored.windows(4).position(|w| w == b"XBCH").expect("XBCH header");
+        let rsize = u32::from_le_bytes(errored[at + 16..at + 20].try_into().unwrap());
+        errored[at + 16..at + 20].copy_from_slice(&(rsize + 64).to_le_bytes());
+        let sh = xbox::parse(&errored).expect("container still parses");
+        assert!(sh.fssm[0].error.is_some() && !sh.fssm[0].programs.is_empty());
+        assert!(!big_and_image_only(&errored));
     }
 }

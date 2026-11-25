@@ -612,3 +612,222 @@ fn window_at_lowers_to_32bit_carry_without_int64() {
         assert!(!body0.contains("icmp ult"), "zero-offset window_at must not emit carry compare:\n{dis0}");
     }
 }
+
+#[test]
+fn dot8_u32_u4_unclamped_lowers_to_dot4_add_u8_packed() {
+    use crate::gpu::recomp::{dxc, runner};
+    const V: u64 = 256;
+    let unclamped = prog(&[("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None)]);
+    let clamped = prog(&[("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None)]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&unclamped, ko).unwrap_or_else(|e| panic!("unclamped translation: {e}"));
+    let dxil_clamped = translate(&clamped, ko).unwrap_or_else(|e| panic!("clamped translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator (unclamped): {e}"));
+    super::validate::validate(&dxil_clamped).unwrap_or_else(|e| panic!("validator (clamped): {e}"));
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let dis = super::validate::disassemble(&dxil).unwrap();
+    assert_eq!(dis.matches("dx.op.dot4AddPacked.i32(i32 164,").count(), 2, "expected 2 Dot4AddU8Packed calls:\n{dis}");
+    let dis_clamped = super::validate::disassemble(&dxil_clamped).unwrap();
+    assert!(!dis_clamped.contains("dot4AddPacked"), "clamped dot8 should stay 64-bit saturating:\n{dis_clamped}");
+}
+
+#[test]
+fn raw_loads_in_root_windows_are_branchless() {
+    let loads = prog(&[
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 6), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 16), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_LOAD_USHORT", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+    ]);
+    for (wave64, split) in [(false, false), (true, true), (true, false)] {
+        let dxil = translate(&loads, KernelOptions { wave64, split, mem_windows: 4, sampler_base: 0 })
+            .unwrap_or_else(|e| panic!("wave64={wave64} split={split}: {e}"));
+        super::validate::validate(&dxil).expect("valid DXIL");
+        if let Ok(dis) = super::validate::disassemble(&dxil) {
+            let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+            assert!(dis.contains("@dx.op.rawBufferLoad"), "expected rawBufferLoad in DXIL:\n{dis}");
+            assert!(!body.contains("switch i32"), "multi-window root-UAV loads must not emit switch (wave64={wave64}, split={split}):\n{dis}");
+        }
+    }
+    let heap_dxil = translate(&loads, KernelOptions { wave64: false, split: false, mem_windows: 4 | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
+        .expect("heap windows translate");
+    super::validate::validate(&heap_dxil).expect("heap windows validate");
+
+    let writes = prog(&[
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 4), ("DATA", 5), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)], None),
+    ]);
+    let wdxil = translate(&writes, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }).expect("writes translate");
+    super::validate::validate(&wdxil).expect("writes validate");
+    if let Ok(dis) = super::validate::disassemble(&wdxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(body.contains("switch i32"), "stores and atomics must keep multi-window switch:\n{dis}");
+    }
+
+    let ps_code = prog(&[
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("SADDR", 0), ("OFFSET", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = crate::gpu::recomp::PsInterface {
+        inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x2,
+        attrs: None,
+    };
+    let ps_k = super::kernel::translate_pixel(&ps_code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }, &psi)
+        .expect("pixel shader multi-window load translates");
+    super::validate::validate(&ps_k.dxil).expect("pixel shader validates");
+    if let Ok(dis) = super::validate::disassemble(&ps_k.dxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert!(body.contains("switch i32"), "pixel shader multi-window loads must keep switch:\n{dis}");
+    }
+}
+
+#[test]
+fn raw_loads_in_root_windows_respect_exec_and_bounds() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let code = prog(&[
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0)], None),
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 129), ("VSRC1", 15)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_LOAD_DWORDX2", "ENC_FLAT_GLBL", &[("VDST", 22), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 24), ("VADDR", 10), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 25), ("VADDR", 10), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1), ("OFFSET", 2)], None),
+    ]);
+    let w32_dxil = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }).expect("wave32 translates");
+    let split_dxil = translate(&code, KernelOptions { wave64: true, split: true, mem_windows: 4, sampler_base: 0 }).expect("split-wave64 translates");
+    let w64_dxil = translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 4, sampler_base: 0 }).expect("wave64 translates");
+    for dxil in [&w32_dxil, &split_dxil, &w64_dxil] {
+        super::validate::validate(dxil).expect("valid DXIL");
+    }
+    let (has_w32, has_w64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !has_w32 && !has_w64 {
+        return runner::skip_test("no GPU");
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(4, 1 << 20).expect("4 UMA windows");
+    let ws: [u64; 4] = std::array::from_fn(|k| arena.window(k).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    // Non-zero canary at offset 0 of every window so leaked unselected reads fail immediately.
+    for (k, &wk) in ws.iter().enumerate() {
+        *word(wk) = 0xBAD0_0000 | k as u32;
+        *word(wk + 0x1000) = 0xA000_0000 | (k as u32 * 0x11);
+        *word(wk + 0x1004) = 0xB000_0000 | (k as u32 * 0x11);
+    }
+    *word(ws[1] + 8) = 0xCA44_0001;
+    *word(ws[1] + 12) = 0xCA44_0002;
+    *word(ws[2] + 0x1000) = 0x510A_D001;
+    *word(ws[2] + 0x1004) = 0x510A_D002;
+    for l in 0..64u64 {
+        *word(ws[3] + 0x2000 + 4 * l) = 0x3000_0000 | l as u32;
+        *word(ws[2] + 0x2000 + 4 * l) = ((0xF000 | (l as u32 + 1)) << 16) | 0xBEEF;
+    }
+    let hi = |a: u64| (a >> 32) as u32;
+    let ident = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[(ws[2] + 0x1000) as u32, hi(ws[2])]);
+    st.sgpr[12..16].copy_from_slice(&[(ws[3] + 0x2000) as u32, (hi(ws[3]) & 0xFFFF) | (4 << 16), 64, 0]);
+    st.sgpr[16..20].copy_from_slice(&[(ws[2] + 0x2000) as u32, (hi(ws[2]) & 0xFFFF) | (4 << 16), 64, ident | (11 << 12)]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let slot = l % 16;
+        let active = slot < 8;
+        r[15] = u32::from(active);
+        r[10] = if active { l as u32 } else { 0xFFFF_FFFF };
+        r[20] = 0x5EED_0000 | l as u32;
+        r[22] = 0x5EED_1000 | l as u32;
+        r[23] = 0x5EED_2000 | l as u32;
+        r[24] = 0x5EED_3000 | l as u32;
+        r[25] = 0x5EED_4000 | l as u32;
+        if !active {
+            r[2] = 0x7FFF_FFE0;
+            r[3] = 0xDEAD_0000;
+            r[4] = 0x7FFF_FFE0;
+            r[5] = 0xDEAD_0000;
+            continue;
+        }
+        // Dynamic window choices: 0, 1, 2, 3, w>=4, 0xFFFF_FFFF, hi==0 (-> w0), carry w0->w1.
+        match slot {
+            0..=3 => {
+                r[2] = (ws[slot] + 0x1000) as u32;
+                r[3] = hi(ws[slot]);
+                r[4] = (ws[slot] + 0xFF0) as u32;
+                r[5] = hi(ws[slot]);
+            }
+            4 => {
+                r[2] = 0x1000;
+                r[3] = hi(ws[0]) + 4;
+                r[4] = 0xFF0;
+                r[5] = hi(ws[0]) + 4;
+            }
+            5 => {
+                r[2] = 0x1000;
+                r[3] = 0xFFFF_FFFF;
+                r[4] = 0xFF0;
+                r[5] = 0xFFFF_FFFF;
+            }
+            6 => {
+                r[2] = 0x1000;
+                r[3] = 0;
+                r[4] = 0xFF0;
+                r[5] = 0;
+            }
+            7 => {
+                r[2] = 0x1000;
+                r[3] = hi(ws[0]);
+                // 0xFFFF_FFF8 + OFFSET 16 carries from window 0 into window 1 at byte offset 8.
+                r[4] = 0xFFFF_FFF8;
+                r[5] = hi(ws[0]);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let mut runs: Vec<(&str, &[u8], usize)> = Vec::new();
+    if has_w32 {
+        runs.push(("wave32", &w32_dxil, 32));
+        runs.push(("split-wave64", &split_dxil, 64));
+    }
+    if has_w64 {
+        runs.push(("native-wave64", &w64_dxil, 64));
+    }
+    for (label, dxil, lanes) in runs {
+        let r = runner::run_in_arena(dxil, &st, &arena).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!((r.sgpr[20], r.sgpr[21]), (0x510A_D001, 0x510A_D002), "{label}: s_load_dwordx2 from window 2");
+        for l in 0..lanes {
+            let slot = l % 16;
+            if slot >= 8 {
+                assert_eq!(r.vgpr[l][20], 0x5EED_0000 | l as u32, "{label} lane {l}: inactive global_load preserved v20");
+                assert_eq!(r.vgpr[l][22], 0x5EED_1000 | l as u32, "{label} lane {l}: inactive global_loadx2 preserved v22");
+                assert_eq!(r.vgpr[l][23], 0x5EED_2000 | l as u32, "{label} lane {l}: inactive global_loadx2 preserved v23");
+                assert_eq!(r.vgpr[l][24], 0x5EED_3000 | l as u32, "{label} lane {l}: inactive buffer_load preserved v24");
+                assert_eq!(r.vgpr[l][25], 0x5EED_4000 | l as u32, "{label} lane {l}: inactive buffer_load_format preserved v25");
+                continue;
+            }
+            let (want20, want22, want23) = match slot {
+                0..=3 => {
+                    let w = slot as u32;
+                    let w20 = if w == 2 { 0x510A_D001 } else { 0xA000_0000 | (w * 0x11) };
+                    let w22 = if w == 2 { 0x510A_D001 } else { 0xA000_0000 | (w * 0x11) };
+                    let w23 = if w == 2 { 0x510A_D002 } else { 0xB000_0000 | (w * 0x11) };
+                    (w20, w22, w23)
+                }
+                4 | 5 => (0, 0, 0),
+                6 => (0xA000_0000, 0xA000_0000, 0xB000_0000),
+                7 => (0xA000_0000, 0xCA44_0001, 0xCA44_0002),
+                _ => unreachable!(),
+            };
+            assert_eq!(r.vgpr[l][20], want20, "{label} lane {l} (slot {slot}): global_load_dword");
+            assert_eq!((r.vgpr[l][22], r.vgpr[l][23]), (want22, want23), "{label} lane {l} (slot {slot}): global_load_dwordx2");
+            assert_eq!(r.vgpr[l][24], 0x3000_0000 | l as u32, "{label} lane {l}: buffer_load_dword from window 3");
+            assert_eq!(r.vgpr[l][25], 0xF000 | (l as u32 + 1), "{label} lane {l}: buffer_load_format_x unaligned from window 2");
+        }
+    }
+}

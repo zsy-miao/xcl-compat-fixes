@@ -179,6 +179,8 @@ mod translated {
     use std::sync::OnceLock;
 
     const MAGIC: &[u8; 8] = b"XCLTRAN2";
+    const ERR_MAGIC: &[u8; 8] = b"XCLTERR1";
+    const MAX_CACHED_ERR_BYTES: usize = 64 * 1024;
 
     pub(super) fn identity_for(source: &str, toolchain: &str) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -368,6 +370,61 @@ mod translated {
         }
     }
 
+    fn err_header(ident: u64, blob: &[u8]) -> Vec<u8> {
+        let mut h = ERR_MAGIC.to_vec();
+        for v in [ident, blob.len() as u64, hash2(blob)] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h
+    }
+
+    fn is_cacheable_error(reason: &str) -> bool {
+        if reason.is_empty()
+            || reason.len() > MAX_CACHED_ERR_BYTES
+            || reason == "DXIL not compiled yet"
+        {
+            return false;
+        }
+        // Errors formatted by the lower DXIL cache (`dxc.rs`) are only cacheable when DXC itself
+        // deterministically rejected the HLSL (`: dxc: `, excluding internal compiler errors).
+        // Transient failures such as OOM (`Compile: ... (0x8007000E)`), invalid DXIL containers,
+        // or cross-process mutex lock errors (`DXIL cache: ...`) stay retryable.
+        if reason.starts_with("DXIL cache") {
+            return reason
+                .split_once(": dxc: ")
+                .is_some_and(|(_, tail)| !tail.contains("Internal Compiler error:"));
+        }
+        !reason.contains("dxcompiler.dll not found")
+            && !reason.contains("DxcCreateInstance")
+            && !reason.contains("is too old")
+    }
+
+    pub(super) fn load_err_in(path: &Path, ident: u64, blob: &[u8]) -> Option<String> {
+        let b = std::fs::read(path).ok()?;
+        let head = err_header(ident, blob);
+        let rest = b.strip_prefix(head.as_slice())?;
+        let (len_bytes, msg_bytes) = rest.split_first_chunk::<4>()?;
+        let len = u32::from_le_bytes(*len_bytes) as usize;
+        if len == 0 || len > MAX_CACHED_ERR_BYTES || msg_bytes.len() != len {
+            return None;
+        }
+        String::from_utf8(msg_bytes.to_vec()).ok()
+    }
+
+    pub(super) fn store_err_in(path: &Path, ident: u64, blob: &[u8], reason: &str) {
+        if !is_cacheable_error(reason) {
+            return;
+        }
+        let mut b = err_header(ident, blob);
+        b.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+        b.extend_from_slice(reason.as_bytes());
+        let Some(dir) = path.parent() else { return };
+        let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     /// `cached_rerouted` for a translation that is never rerouted (the tests')
     #[cfg(test)]
     pub(super) fn cached_in(
@@ -384,16 +441,32 @@ mod translated {
             return translate();
         }
         let path = file(dir, ident, blob, stage, sampler_base, windows, split);
+        let err_path = path.with_extension("err");
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
         }
-        let c = translate()?;
-        if !super::dxc::valid_dxil_container(&c.dxil) {
-            return Err("translated cache: translator returned an invalid DXIL container".into());
+        if let Some(reason) = load_err_in(&err_path, ident, blob) {
+            return Err(reason);
         }
-        store_in(&path, ident, blob, &c);
-        Ok(c)
+        match translate() {
+            Ok(c) => {
+                if !super::dxc::valid_dxil_container(&c.dxil) {
+                    return Err("translated cache: translator returned an invalid DXIL container".into());
+                }
+                if err_path.is_file() {
+                    let _ = std::fs::remove_file(&err_path);
+                }
+                store_in(&path, ident, blob, &c);
+                Ok(c)
+            }
+            Err(reason) => {
+                if !super::dxc::cached_only_missed() && is_cacheable_error(&reason) {
+                    store_err_in(&err_path, ident, blob, &reason);
+                }
+                Err(reason)
+            }
+        }
     }
 
     /// `translate` through the disk (`identity()` zero: not used). An enormous compute program
@@ -412,22 +485,33 @@ mod translated {
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
-    /// version and sources, a forced compact form, the split target, the per-lane form (`direct_compute`).
+    /// version and sources, compact dispatch policy, the split target, the per-lane form (`direct_compute`).
     fn direct_output() -> u64 {
         static D: OnceLock<u64> = OnceLock::new();
         *D.get_or_init(|| {
-            let id = direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID"));
-            let id = match crate::gpu::dxil::kernel::compact_mode() {
-                Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
-                None => id,
-            };
-            let id = identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()));
-            if crate::gpu::recomp::lower_dxil::enabled() {
-                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
-            } else {
-                id
-            }
+            direct_output_identity(
+                crate::gpu::dxil::kernel::compact_nest_tag().as_deref(),
+                crate::gpu::dxil::kernel::dispatch_piece_limit(),
+            )
         })
+    }
+
+    pub(super) fn direct_output_identity(nest_tag: Option<&str>, split_limit: usize) -> u64 {
+        let id = direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID"));
+        let id = match crate::gpu::dxil::kernel::compact_mode() {
+            Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
+            None => id,
+        };
+        let id = match nest_tag {
+            Some(tag) => identity_for(&id.to_string(), tag),
+            None => id,
+        };
+        let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
+        if crate::gpu::recomp::lower_dxil::enabled() {
+            identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+        } else {
+            id
+        }
     }
 
     /// The identity of `ident`'s entries the direct translator (`direct`: `direct_output`) made
@@ -457,10 +541,26 @@ mod translated {
                 return Ok(c);
             }
         }
-        let (c, direct) = translate()?;
-        let id = if direct { rerouted } else { ident };
-        store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
-        Ok(c)
+        let err_path = file(dir, rerouted, blob, stage, sampler_base, windows, split).with_extension("err");
+        if let Some(reason) = load_err_in(&err_path, rerouted, blob) {
+            return Err(reason);
+        }
+        match translate() {
+            Ok((c, direct)) => {
+                if err_path.is_file() {
+                    let _ = std::fs::remove_file(&err_path);
+                }
+                let id = if direct { rerouted } else { ident };
+                store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
+                Ok(c)
+            }
+            Err(reason) => {
+                if !super::dxc::cached_only_missed() && is_cacheable_error(&reason) {
+                    store_err_in(&err_path, rerouted, blob, &reason);
+                }
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -851,7 +951,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let wave64 = super::detect_wave64(code);
+    let wave64 = super::fssm_wave64(f, code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
     if super::lower_dxil::enabled() {
@@ -867,7 +967,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -897,7 +997,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::fssm_wave64(f, code), split: false, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
@@ -942,7 +1042,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1035,7 +1135,7 @@ fn console_mesh_with(
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let wave64 = super::detect_wave64(code);
+    let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
     let compile_one = || compile(code, ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
@@ -1503,6 +1603,50 @@ mod shader_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn rerouted_disk_entries_follow_compact_nesting_policy() {
+        use std::process::Command;
+
+        const RUN: &str = "XCL_TEST_REROUTED_CACHE_RUN";
+        if let Ok(case) = std::env::var(RUN) {
+            let (marker, expected) = case.split_once(':').unwrap();
+            let marker = marker.parse::<u8>().unwrap();
+            let read = |blob: &[u8], value, rerouted| {
+                translated::cached(&dxc::cache_dir(), blob, Stage::Compute, 0, 1, true, || {
+                    Ok((compiled(value), rerouted))
+                }).unwrap().dxil[67]
+            };
+            assert_eq!(read(b"console-enormous", marker, true), expected.parse::<u8>().unwrap());
+            assert_eq!(read(b"console-plain", marker + 16, false), 17);
+            return;
+        }
+
+        // These identities use OnceLock. Restart to test what changing real CLI settings does
+        // to a shared disk cache, including the HLSL entry written by the first process.
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl-translated-nesting-{}-{nonce}", std::process::id()));
+        for (nest, split, case) in [
+            ("0", "12500", "1:1"),
+            ("4", "12500", "2:2"),
+            ("4", "0", "3:3"),
+            ("off", "12500", "9:1"),
+            ("4", "12500", "9:2"),
+            ("4", "0", "9:3"),
+        ] {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["gpu::recomp::pso::shader_cache_tests::rerouted_disk_entries_follow_compact_nesting_policy", "--exact", "--nocapture"])
+                .env(RUN, case)
+                .env("XCL_DXIL_CACHE", &dir)
+                .env("XCL_TRANSLATED_CACHE", "1")
+                .env("XCL_DIRECT_DXIL", "0")
+                .env("XCL_DIRECT_COMPACT_NEST", nest)
+                .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", split)
+                .output().unwrap();
+            assert!(out.status.success(), "nest={nest}, split={split}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn key(hash: u64) -> ShaderKey {
         ShaderKey {
             hash,
@@ -1929,6 +2073,156 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[67], 1);
             }
         });
+    }
+
+    #[test]
+    fn translated_cache_caches_refusals_by_capability_identity() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console-shader-with-unsupported-op";
+        let ident_v1 = translated::identity_for("src-v1", "dxc-v1");
+        let ident_v2 = translated::identity_for("src-v2", "dxc-v1");
+
+        // 1. First refusal lowers once and writes capability-scoped `.err` marker with reason text.
+        let mut calls = 0usize;
+        let err1 = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, false, || {
+            calls += 1;
+            Err("image_atomic_add_64 is not supported".into())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err1, "image_atomic_add_64 is not supported");
+        assert_eq!(calls, 1);
+
+        // 2. Second run with unchanged capability identity returns the identical reason with 0 lowerings.
+        let err2 = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, false, || {
+            panic!("cached refusal must not re-lower")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err2, err1);
+
+        // 3. Changing wave mode (`split: true`) or translator source identity (`ident_v2`) invalidates
+        //    the marker and allows the shader to succeed cleanly.
+        let ok_split = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, true, || {
+            Ok(compiled(3))
+        })
+        .unwrap();
+        assert_eq!(ok_split.dxil, compiled(3).dxil);
+
+        let ok_v2 = translated::cached_in(&dir, ident_v2, blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(4))
+        })
+        .unwrap();
+        assert_eq!(ok_v2.dxil, compiled(4).dxil);
+
+        // 4. Disabled cache (`ident == 0`) bypasses negative markers completely.
+        let ok_disabled = translated::cached_in(&dir, 0, blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(5))
+        })
+        .unwrap();
+        assert_eq!(ok_disabled.dxil, compiled(5).dxil);
+
+        // 5. A deferred `cached_only` miss is never recorded as a permanent refusal.
+        let deferred_blob = b"console-shader-deferred";
+        let (res, missed) = dxc::cached_only(|| {
+            translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, || {
+                let dxil = dxc::compile_cached_in(&dir, "deferred probe", "main", "cs_6_6")?.0;
+                Ok(Compiled { dxil, samplers: Vec::new(), dispatch_chain: None })
+            })
+        });
+        assert!(res.is_err() && missed);
+        let ok_after_defer = translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(6))
+        })
+        .unwrap();
+        assert_eq!(ok_after_defer.dxil, compiled(6).dxil);
+
+        // 6. A transient DXC failure (e.g. OOM `0x8007000E`) formatted by `dxc.rs` is NOT cached
+        //    in `translated`, so the next call retries and succeeds; deterministic `: dxc: `
+        //    compile errors remain cached.
+        let transient_blob = b"console-shader-transient-dxc-oom";
+        let oom = translated::cached_in(&dir, ident_v1, transient_blob, Stage::Compute, 0, 1, false, || {
+            Err("DXIL cache C:\\cache\\0001.dxil (cs_6_6, entry \"main\", 128 B HLSL): Compile: E_OUTOFMEMORY (0x8007000E)".into())
+        })
+        .err()
+        .unwrap();
+        assert!(oom.contains("0x8007000E"));
+        let ok_after_oom = translated::cached_in(&dir, ident_v1, transient_blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(7))
+        })
+        .unwrap();
+        assert_eq!(ok_after_oom.dxil, compiled(7).dxil);
+
+        let dxc_err_blob = b"console-shader-deterministic-dxc-err";
+        let dxc_err1 = translated::cached_in(&dir, ident_v1, dxc_err_blob, Stage::Compute, 0, 1, false, || {
+            Err("DXIL cache C:\\cache\\0002.dxil (cs_6_6, entry \"main\", 128 B HLSL): dxc: error: invalid op".into())
+        })
+        .err()
+        .unwrap();
+        let dxc_err2 = translated::cached_in(&dir, ident_v1, dxc_err_blob, Stage::Compute, 0, 1, false, || {
+            panic!("deterministic DXC rejection must stay cached in translated")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(dxc_err2, dxc_err1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_cache_rerouted_caches_refusals_and_skips_transient_errors() {
+        let dir = std::env::temp_dir().join(format!("xcl-rerouted-refusal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ident = 0x5555_6666_7777_8888u64;
+
+        // 1. Deterministic refusal cached under rerouted identity; version bump invalidates it.
+        let blob = b"console-rerouted-refusal";
+        let err1 = translated::cached_rerouted(&dir, ident, 7, blob, Stage::Compute, 0, 1, false, || {
+            Err("unsupported opcode".into())
+        })
+        .err()
+        .unwrap();
+        let err2 = translated::cached_rerouted(&dir, ident, 7, blob, Stage::Compute, 0, 1, false, || {
+            panic!("cached rerouted refusal must not re-lower")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err2, err1);
+        let ok_v8 = translated::cached_rerouted(&dir, ident, 8, blob, Stage::Compute, 0, 1, false, || {
+            Ok((compiled(11), true))
+        })
+        .unwrap();
+        assert_eq!(ok_v8.dxil, compiled(11).dxil);
+
+        // 2. Cross-process lock error ("DXIL cache: ...") is NOT cached by cached_rerouted.
+        let lock_blob = b"console-rerouted-lock-err";
+        let lock_err = translated::cached_rerouted(&dir, ident, 7, lock_blob, Stage::Compute, 0, 1, false, || {
+            Err("DXIL cache: cannot create the cross-process mutex".into())
+        })
+        .err()
+        .unwrap();
+        assert!(lock_err.contains("cross-process mutex"));
+        let ok_after_lock = translated::cached_rerouted(&dir, ident, 7, lock_blob, Stage::Compute, 0, 1, false, || {
+            Ok((compiled(12), false))
+        })
+        .unwrap();
+        assert_eq!(ok_after_lock.dxil, compiled(12).dxil);
+
+        // 3. DXC internal compiler error (which can wrap E_OUTOFMEMORY) is NOT cached.
+        let ice_blob = b"console-rerouted-dxc-ice";
+        let _ = translated::cached_rerouted(&dir, ident, 7, ice_blob, Stage::Compute, 0, 1, false, || {
+            Err("DXIL cache C:\\cache\\0003.dxil (cs_6_6, entry \"main\", 128 B HLSL): dxc: Internal Compiler error: ".into())
+        })
+        .err()
+        .unwrap();
+        let ok_after_ice = translated::cached_rerouted(&dir, ident, 7, ice_blob, Stage::Compute, 0, 1, false, || {
+            Ok((compiled(13), false))
+        })
+        .unwrap();
+        assert_eq!(ok_after_ice.dxil, compiled(13).dxil);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

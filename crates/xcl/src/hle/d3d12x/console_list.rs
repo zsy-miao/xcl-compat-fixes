@@ -676,6 +676,60 @@ pub struct Translation {
     pub unknown: Option<(u32, usize)>,
 }
 
+/// Build the descriptor heap list to bind before a translated dispatch when a console list is
+/// missing a required shader-visible view heap (`heap_windows`) or sampler heap
+/// (`SAMPLER_HEAP_DIRECTLY_INDEXED`). Returns `Some((heaps, has_sampler_heap))` when
+/// `SetDescriptorHeaps` must be updated.
+fn default_dispatch_heaps<H: Clone>(view: Option<H>, sampler: Option<H>, current: &[H], has_sampler: bool) -> Option<(Vec<H>, bool)> {
+    if current.is_empty() {
+        let has_s = sampler.is_some();
+        let mut out = Vec::with_capacity(2);
+        if let Some(v) = view { out.push(v); }
+        if let Some(s) = sampler { out.push(s); }
+        return (!out.is_empty()).then_some((out, has_s));
+    }
+    if current.len() == 1 {
+        if !has_sampler {
+            if let Some(s) = sampler { return Some((vec![current[0].clone(), s], true)); }
+        } else if let Some(v) = view {
+            return Some((vec![v, current[0].clone()], true));
+        }
+    }
+    None
+}
+
+unsafe fn heap_on_device(heap: Option<ID3D12DescriptorHeap>, dev_raw: usize) -> Option<ID3D12DescriptorHeap> {
+    heap.filter(|h| {
+        let mut d: Option<ID3D12Device> = None;
+        h.GetDevice(&mut d).is_ok() && d.is_some_and(|d| d.as_raw() as usize == dev_raw)
+    })
+}
+
+unsafe fn ensure_dispatch_heaps_with(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool, view: Option<ID3D12DescriptorHeap>, sampler: Option<ID3D12DescriptorHeap>) -> bool {
+    let Some((next, next_has_sampler)) = default_dispatch_heaps(view, sampler, bound, *has_sampler) else { return false };
+    let args: Vec<Option<ID3D12DescriptorHeap>> = next.iter().cloned().map(Some).collect();
+    list.SetDescriptorHeaps(&args);
+    *bound = next;
+    *has_sampler = next_has_sampler;
+    true
+}
+
+unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool) {
+    if bound.len() >= 2 { return; }
+    let mut dev: Option<ID3D12Device> = None;
+    let _ = list.GetDevice(&mut dev);
+    let sampler = super::console_heap::global_sampler_heap().or_else(|| {
+        if let Some(d) = &dev { super::console_heap::shared_sampler_heap(d); }
+        super::console_heap::global_sampler_heap()
+    });
+    let view = crate::gpu::recomp::pso::heap_windows().then(super::console_heap::global_heap).flatten();
+    let (view, sampler) = match dev.as_ref().map(|d| d.as_raw() as usize) {
+        Some(dev_raw) => (heap_on_device(view, dev_raw), heap_on_device(sampler, dev_raw)),
+        None => (view, sampler),
+    };
+    ensure_dispatch_heaps_with(list, bound, has_sampler, view, sampler);
+}
+
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
@@ -702,8 +756,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
-    // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
-    let mut heaps_set = false;
+    // tracked PC descriptor heaps bound on `list` (for `heap_windows` + `SAMPLER_HEAP_DIRECTLY_INDEXED`)
+    let mut bound_heaps: Vec<ID3D12DescriptorHeap> = Vec::new();
+    let mut has_sampler_heap = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -721,15 +776,22 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
             } else if w0 == HEAPS_MARKER {
                 let n = get(1) as usize;
                 let named: Vec<usize> = (0..n).map(|k| get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32).collect();
-                let heaps = super::list_x::pc_heaps(n as u32, named.as_ptr());
                 if super::present::trace_frame() {
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                        crate::xlog_info!("frame trace: SetDescriptorHeaps {:x?}", (0..n).map(|k| get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32).collect::<Vec<_>>());
+                        crate::xlog_info!("frame trace: SetDescriptorHeaps {:x?}", named);
                     }
                 }
-                list.SetDescriptorHeaps(&heaps);
-                heaps_set = true;
+                if n == 0 {
+                    list.SetDescriptorHeaps(&[]);
+                    bound_heaps.clear();
+                    has_sampler_heap = false;
+                } else {
+                    let heaps = super::list_x::pc_heaps(n as u32, named.as_ptr());
+                    list.SetDescriptorHeaps(&heaps);
+                    bound_heaps = heaps.into_iter().flatten().collect();
+                    has_sampler_heap = bound_heaps.iter().any(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                }
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
@@ -842,12 +904,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
-                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
-                            if let Some(g) = super::console_heap::global_heap() {
-                                list.SetDescriptorHeaps(&[Some(g)]);
-                                heaps_set = true;
-                            }
-                        }
+                        ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
@@ -1020,5 +1077,71 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn default_dispatch_heaps_binds_and_upgrades_missing_view_or_sampler() {
+        // 0 heaps bound: binds both under heap_windows, or sampler alone when view == None.
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[], false), Some((vec![0x10, 0x20], true)));
+        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[], false), Some((vec![0x20], true)));
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), None, &[], false), Some((vec![0x10], false)));
+        assert_eq!(default_dispatch_heaps::<usize>(None, None, &[], false), None);
+        // 1 view heap bound -> appends sampler heap; 1 sampler heap bound -> prepends view heap when needed.
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x77], false), Some((vec![0x77, 0x20], true)));
+        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[0x77], false), Some((vec![0x77, 0x20], true)));
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x99], true), Some((vec![0x10, 0x99], true)));
+        assert_eq!(default_dispatch_heaps(None, Some(0x20usize), &[0x99], true), None);
+        // Both heaps already bound -> no-op.
+        assert_eq!(default_dispatch_heaps(Some(0x10usize), Some(0x20), &[0x10, 0x20], true), None);
+    }
+
+    #[test]
+    fn gpu_ensure_dispatch_heaps_binds_view_and_sampler_heaps() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let mk_heap = |ty| -> ID3D12DescriptorHeap {
+                dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: ty,
+                    NumDescriptors: 8,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap()
+            };
+            let (view, sampler) = (mk_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV), mk_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+
+            // 0 heaps -> binds [view, sampler]; second call is a no-op.
+            let (mut bound, mut has_sampler) = (Vec::new(), false);
+            assert!(ensure_dispatch_heaps_with(&list, &mut bound, &mut has_sampler, Some(view.clone()), Some(sampler.clone())));
+            assert_eq!((bound.len(), has_sampler), (2, true));
+            assert!(!ensure_dispatch_heaps_with(&list, &mut bound, &mut has_sampler, Some(view.clone()), Some(sampler.clone())));
+
+            // Clearing via SetDescriptorHeaps(&[]) resets state; !heap_windows (view == None) still binds sampler.
+            list.SetDescriptorHeaps(&[]);
+            bound.clear();
+            has_sampler = false;
+            assert!(ensure_dispatch_heaps_with(&list, &mut bound, &mut has_sampler, None, Some(sampler.clone())));
+            assert_eq!((bound.len(), has_sampler), (1, true));
+
+            // 1 view heap alone upgrades to [view, sampler]; 1 sampler alone upgrades to [view, sampler].
+            list.SetDescriptorHeaps(&[Some(view.clone())]);
+            bound = vec![view.clone()];
+            has_sampler = false;
+            assert!(ensure_dispatch_heaps_with(&list, &mut bound, &mut has_sampler, Some(view.clone()), Some(sampler.clone())));
+            assert_eq!((bound.len(), has_sampler), (2, true));
+
+            list.SetDescriptorHeaps(&[Some(sampler.clone())]);
+            bound = vec![sampler.clone()];
+            has_sampler = true;
+            assert!(ensure_dispatch_heaps_with(&list, &mut bound, &mut has_sampler, Some(view.clone()), Some(sampler.clone())));
+            assert_eq!((bound.len(), has_sampler), (2, true));
+
+            list.Close().unwrap();
+        }
     }
 }

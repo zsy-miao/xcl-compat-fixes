@@ -97,6 +97,15 @@ pub fn flush() {
     }
 }
 
+/// A panic goes to the log as well as to stderr.
+pub fn log_panics() {
+    let print = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        write(Level::Error, format_args!("thread '{}' {}", std::thread::current().name().unwrap_or(""), info.to_string().replace('\n', " ")));
+        print(info);
+    }));
+}
+
 #[macro_export]
 macro_rules! xlog_error { ($($a:tt)*) => { $crate::log::write($crate::log::Level::Error, format_args!($($a)*)) } }
 #[macro_export]
@@ -107,3 +116,21 @@ macro_rules! xlog_info { ($($a:tt)*) => { $crate::log::write($crate::log::Level:
 macro_rules! xlog_debug { ($($a:tt)*) => { if $crate::log::enabled($crate::log::Level::Debug) { $crate::log::write($crate::log::Level::Debug, format_args!($($a)*)) } } }
 #[macro_export]
 macro_rules! xlog_trace { ($($a:tt)*) => { if $crate::log::enabled($crate::log::Level::Trace) { $crate::log::write($crate::log::Level::Trace, format_args!($($a)*)) } } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_is_in_the_log() {
+        let path = std::env::temp_dir().join(format!("xcl-log-panics-{}.log", std::process::id()));
+        *FILE.lock().unwrap() = Some(File::create(&path).unwrap());
+        log_panics();
+        let died = std::thread::Builder::new().name("xcl-dies".into()).spawn(|| panic!("gone for the run")).unwrap().join();
+        *FILE.lock().unwrap() = None;
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(died.is_err());
+        assert!(log.contains("thread 'xcl-dies' panicked at ") && log.contains("gone for the run"), "the log: {log:?}");
+    }
+}

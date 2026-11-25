@@ -497,3 +497,54 @@ fn gpu_direct_f32_round_preserved_denormal_times_inf_is_inf() {
     assert_eq!(r.vgpr[0][10], 0x7F80_0000, "v_mul_f32(denorm, +inf) with preserve = {:#010x}, expected +inf", r.vgpr[0][10]);
     assert_eq!(r.vgpr[0][11], 0x7F80_0000, "v_fma_f32(denorm, +inf, 1.0) with preserve = {:#010x}, expected +inf", r.vgpr[0][11]);
 }
+
+/// `s_setreg_b32 hwreg(HW_REG_MODE, 0, 2), s0` (`sp_mask = 3`, `dp_mask = 0`) only updates
+/// f32 rounding (`MODE[1:0]`); it must leave `VAR_FP16_RM` (`MODE[3:2]`) untouched on the GPU.
+#[test]
+fn gpu_s_setreg_b32_f32_mode_preserves_fp16_round_mode() {
+    let mut code = Vec::new();
+    // Set MODE[3:2] (f16/f64 rounding) = 3 (RTZ), MODE[1:0] = 0 (RNE) -> SIMM16 = 0b1100 = 0x0C.
+    code.extend(encode("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x0C)], None).unwrap());
+    // Write ONLY MODE[1:0] from s0 (HW_REG_MODE=1, offset=0, size-1=1 -> 0x0801; sp_mask=3, dp_mask=0).
+    code.extend(encode("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x0801)], None).unwrap());
+    // Directed f32 op using MODE[1:0] = s0 (RTN = 2), followed by f16 conversion using MODE[3:2] = 3 (RTZ).
+    code.extend(encode("V_ADD_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 2), ("VSRC1", 3)], None).unwrap());
+    code.extend(encode("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    if !gpu_ready() {
+        let _ = runner::direct_kernel(&code, true).expect("direct translation");
+        return;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[0] = 2; // f32 RTN (bit 0 == 0; previously clobbered VAR_FP16_RM from 3 -> 1 [RTP])
+    // Lane 0: +1.0 + 2^-23 -> f16 RTZ is 0x3C00 (corrupted RTP would produce 0x3C01)
+    st.vgpr[0][1] = 0x3F80_0001;
+    st.vgpr[0][2] = 0x3F80_0000; // +1.0
+    st.vgpr[0][3] = 0x3380_0000; // +2^-24 (under f32 RTN: 1.0 + 2^-24 == 1.0)
+    // Lane 1: -1.0 - 2^-23 -> f16 RTZ is 0xBC00; f32 RTN: -1.0 + (-2^-24) == -1.0 - 2^-23
+    st.vgpr[1][1] = 0xBF80_0001;
+    st.vgpr[1][2] = 0xBF80_0000; // -1.0
+    st.vgpr[1][3] = 0xB380_0000; // -2^-24
+
+    let r = run(&code, &st);
+    assert_eq!(r.vgpr[0][10], 0x3F80_0000, "lane 0 f32 RTN");
+    assert_eq!(r.vgpr[1][10], 0xBF80_0001, "lane 1 f32 RTN");
+    assert_eq!(r.vgpr[0][11], 0x3C00, "lane 0 f16 RTZ preserved after s_setreg_b32 MODE[1:0]");
+    assert_eq!(r.vgpr[1][11], 0xBC00, "lane 1 f16 RTZ preserved after s_setreg_b32 MODE[1:0]");
+}
+
+/// `s_setreg_b32` writing only `MODE[1:0]` (`dp_mask == 0`) does not touch f64 rounding, so a
+/// shader containing an f64 rounding op must still translate cleanly.
+#[test]
+fn direct_s_setreg_b32_f32_mode_allows_f64_ops() {
+    for simm in [0x0801u64, 0x0001, 0x0041] {
+        let mut code = Vec::new();
+        code.extend(encode("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", simm)], None).unwrap());
+        code.extend(encode("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 2)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = runner::direct_kernel(&code, true)
+            .unwrap_or_else(|e| panic!("SIMM16={simm:#06x} with V_ADD_F64 should translate: {e}"));
+        super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator (SIMM16={simm:#06x}): {e}"));
+    }
+}

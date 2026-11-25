@@ -74,3 +74,44 @@ fn explicit_probe_rejects_conflicting_options() {
         assert!(String::from_utf8(output.stderr).unwrap().contains(args[0]));
     }
 }
+
+#[test]
+fn rpf_rejects_unknown_options_missing_values_and_invalid_numbers() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let archive = std::env::temp_dir().join(format!(
+        "xcl-rpf-badopts-{}-{nonce}.rpf",
+        std::process::id()
+    ));
+    std::fs::write(&archive, b"9FPR").unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["--extract"], "--extract needs a value"),
+        (&["--extract", "--out", "dir"], "--extract needs a value"),
+        (&["--find"], "--find needs a value"),
+        (&["--out"], "--out needs a value"),
+        (&["--top"], "--top needs a value"),
+        (&["--top", "abc"], "invalid value for --top: abc"),
+        (&["--top", "-1"], "invalid value for --top: -1"),
+        (&["--fnid", "foo"], "unknown option: --fnid"),
+        (&["-z"], "unknown option: -z"),
+        (&["extra"], "unexpected argument: extra"),
+    ];
+    for (args, expected) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("rpf")
+            .arg(&archive)
+            .args(*args)
+            .output()
+            .expect("spawn xcl rpf");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("xcl rpf:"), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    std::fs::remove_file(&archive).unwrap();
+}

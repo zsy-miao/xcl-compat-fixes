@@ -771,6 +771,54 @@ pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRES
 mod tests {
     use super::*;
 
+    /// The stream subobject table pinned to the PC headers: type numbers from the `windows`
+    /// crate, payload sizes from the header structs themselves.
+    #[test]
+    fn the_stream_subobject_table_matches_the_pc_headers() {
+        use windows::Win32::Graphics::Direct3D12 as d;
+        let sb = std::mem::size_of::<d::D3D12_SHADER_BYTECODE>();
+        let cases: &[(u32, (usize, usize))] = &[
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 as u32, (std::mem::size_of::<*mut c_void>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT.0 as u32, (std::mem::size_of::<d::D3D12_STREAM_OUTPUT_DESC>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND.0 as u32, (std::mem::size_of::<d::D3D12_BLEND_DESC>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER.0 as u32, (std::mem::size_of::<d::D3D12_RASTERIZER_DESC>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL.0 as u32, (std::mem::size_of::<d::D3D12_DEPTH_STENCIL_DESC>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32, (std::mem::size_of::<d::D3D12_INPUT_LAYOUT_DESC>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC.0 as u32, (8, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS.0 as u32, (std::mem::size_of::<d::D3D12_RT_FORMAT_ARRAY>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT.0 as u32, (std::mem::size_of::<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32, (std::mem::size_of::<d::D3D12_CACHED_PIPELINE_STATE>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS.0 as u32, (std::mem::size_of::<d::D3D12_PIPELINE_STATE_FLAGS>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1.0 as u32, (std::mem::size_of::<d::D3D12_DEPTH_STENCIL_DESC1>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING.0 as u32, (std::mem::size_of::<d::D3D12_VIEW_INSTANCING_DESC>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2.0 as u32, (std::mem::size_of::<d::D3D12_DEPTH_STENCIL_DESC2>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1.0 as u32, (std::mem::size_of::<d::D3D12_RASTERIZER_DESC1>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2.0 as u32, (std::mem::size_of::<d::D3D12_RASTERIZER_DESC2>(), 4)),
+        ];
+        for (ty, want) in cases {
+            assert_eq!(subobject_payload(*ty), Some(*want), "subobject {ty}");
+        }
+    }
+
+    /// The PC has no subobject 23; the console's mesh numbering puts AS there and mesh at 24
+    /// (the PC's AS), which `real.rs` takes as the mesh program of a mesh-only pipeline.
+    #[test]
+    fn subobject_23_is_unknown() {
+        assert_eq!(subobject_payload(23), None);
+    }
+
     type Fn4 = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
 
     unsafe fn slot(obj: *mut c_void, i: usize) -> usize {

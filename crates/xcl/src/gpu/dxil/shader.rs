@@ -664,6 +664,7 @@ pub fn dxc_fn_attrs(op: u32) -> Option<FnAttrs> {
         137 | 138 => ReadNone,                 // attributeAtVertex, viewID
         139 => ReadOnly,                       // rawBufferLoad
         140 => NoUnwind,                       // rawBufferStore
+        164 => ReadNone,                       // dot4AddU8Packed
         165..=169 => NoUnwind,                 // waveMatch, waveMultiPrefix*, mesh outputs
         170 => ReadOnly,                       // getMeshPayload
         171 | 172 => NoUnwind,                 // storeVertexOutput, storePrimitiveOutput

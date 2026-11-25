@@ -285,11 +285,22 @@ fn test_title_runs_and_game_folder_is_untouched() {
 /// (Graphics Tools) and the system XGameRuntime, as the run above does; skipped without them.
 #[test]
 fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
+    title_under_the_debug_layer(false);
+}
+
+/// The same run with `XCL_DRED=1` too (#2298): D3D12Core makes a command list's breadcrumb
+/// buffer through the device's public CreatePlacedResource, which XCL took for the title's.
+#[test]
+fn test_title_runs_under_the_debug_layer_with_dred() {
+    title_under_the_debug_layer(true);
+}
+
+fn title_under_the_debug_layer(dred: bool) {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
     for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
         if !sys.join(dll).is_file() {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
+            let _ = writeln!(std::io::stderr(), "SKIPPED the title under the debug layer (dred: {dred}): no {dll}");
             return;
         }
     }
@@ -302,7 +313,14 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     for f in ["xcl_testtitle.exe", "testgame_mw.dll"] {
         std::fs::copy(bin_dir.join(f), game.join(f)).unwrap_or_else(|e| panic!("{f}: {e} – build first: cargo build --workspace"));
     }
-    let out = Command::new(&xcl).arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1").output().expect("spawn xcl");
+    let mut cmd = Command::new(&xcl);
+    cmd.arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1");
+    if dred {
+        cmd.env("XCL_DRED", "1");
+    } else {
+        cmd.env_remove("XCL_DRED");
+    }
+    let out = cmd.output().expect("spawn xcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "exit code {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}", out.status.code());

@@ -568,6 +568,9 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
                     String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
                 })
                 .unwrap_or_default();
+            if status == windows::Win32::Foundation::E_OUTOFMEMORY {
+                return Err(format!("dxc (0x{:08X}): {msg}", status.0 as u32));
+            }
             return Err(format!("dxc: {msg}"));
         }
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
@@ -831,6 +834,51 @@ where
     compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
 }
 
+const ERR_MAGIC: &[u8; 8] = b"XCLDXCE1";
+const MAX_CACHED_ERR_BYTES: usize = 64 * 1024;
+
+/// Deterministic DXC compiler rejections start with `"dxc: "` (from `compile`).
+/// Transient environment/loader/validation/internal-OOM errors are never negatively cached.
+fn is_cacheable_dxc_error(raw: &str) -> bool {
+    raw.starts_with("dxc: ") && !raw.contains("Internal Compiler error:")
+}
+
+fn cached_error_file(file: &Path, key: u64, src_len: usize) -> Option<String> {
+    let b = std::fs::read(file).ok()?;
+    let rest = b.strip_prefix(ERR_MAGIC.as_slice())?;
+    let (k_bytes, rest) = rest.split_first_chunk::<8>()?;
+    let (len_bytes, rest) = rest.split_first_chunk::<8>()?;
+    let (msg_len_bytes, msg_bytes) = rest.split_first_chunk::<4>()?;
+    if u64::from_le_bytes(*k_bytes) != key || u64::from_le_bytes(*len_bytes) != src_len as u64 {
+        return None;
+    }
+    let msg_len = u32::from_le_bytes(*msg_len_bytes) as usize;
+    if msg_len == 0 || msg_len > MAX_CACHED_ERR_BYTES || msg_bytes.len() != msg_len {
+        return None;
+    }
+    String::from_utf8(msg_bytes.to_vec()).ok()
+}
+
+fn store_error_file(file: &Path, key: u64, src_len: usize, reason: &str) {
+    if reason.is_empty() || reason.len() > MAX_CACHED_ERR_BYTES {
+        return;
+    }
+    let Some(dir) = file.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut b = Vec::with_capacity(8 + 8 + 8 + 4 + reason.len());
+    b.extend_from_slice(ERR_MAGIC);
+    b.extend_from_slice(&key.to_le_bytes());
+    b.extend_from_slice(&(src_len as u64).to_le_bytes());
+    b.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+    b.extend_from_slice(reason.as_bytes());
+    let tmp = file.with_extension(format!("err.tmp{}", std::process::id()));
+    if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn compile_cached_in_observed<F>(
     dir: &Path,
     src: &str,
@@ -845,9 +893,13 @@ where
     let key = cache_key(src, entry, profile);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
+    let err_file = dir.join(format!("{key:016x}.err"));
     if let Some(b) = cached_file(&file) {
         counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
+    }
+    if let Some(err) = cached_error_file(&err_file, key, src.len()) {
+        return Err(err);
     }
     // before the locks: a cached-only attempt (non-blocking pipeline creation) must not wait
     // for a worker compiling the same shader
@@ -865,30 +917,43 @@ where
         counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
+    if let Some(err) = cached_error_file(&err_file, key, src.len()) {
+        return Err(err);
+    }
     // A corrupt target must be removed before the atomic rename on Windows;
     // rename does not replace an existing file there.
     if file.is_file() {
         let _ = std::fs::remove_file(&file);
     }
     counters.compilations.fetch_add(1, Ordering::Relaxed);
-    let b = {
+    let raw_result = {
         let _active = Compiling::start();
         compile_one()
-    }
-    .and_then(|b| {
+    };
+    let cacheable_err = matches!(&raw_result, Err(e) if is_cacheable_dxc_error(e));
+    let b = match raw_result.and_then(|b| {
         if valid_dxil_container(&b) {
             Ok(b)
         } else {
             Err("DXIL cache: compiler returned an invalid DXIL container".into())
         }
-    })
-    .map_err(|e| {
-        counters.failure(format!(
-            "DXIL cache {} ({profile}, entry {entry:?}, {} B HLSL): {e}",
-            file.display(),
-            src.len()
-        ))
-    })?;
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            let formatted = counters.failure(format!(
+                "DXIL cache {} ({profile}, entry {entry:?}, {} B HLSL): {e}",
+                file.display(),
+                src.len()
+            ));
+            if cacheable_err {
+                store_error_file(&err_file, key, src.len(), &formatted);
+            }
+            return Err(formatted);
+        }
+    };
+    if err_file.is_file() {
+        let _ = std::fs::remove_file(&err_file);
+    }
     if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
@@ -938,6 +1003,11 @@ pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
     let r = f();
     CACHED_ONLY.with(|c| c.set(false));
     (r, MISSED.with(|m| m.replace(false)))
+}
+
+/// True when the current `cached_only` probe recorded a deferred cache miss.
+pub(super) fn cached_only_missed() -> bool {
+    CACHED_ONLY.with(|c| c.get()) && MISSED.with(|m| m.get())
 }
 
 /// Inside `cached_only`: what is being made is deferred as if its DXIL were missing (the
@@ -1306,5 +1376,74 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn dxc_compile_failure_is_cached_and_skips_recompilation() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let counters = CacheCounters::default();
+        let src = "float4 main() : SV_Target { return bad_op(); }";
+
+        // 1. Deterministic DXC failure ("dxc: ...") is compiled once and cached in `.err`.
+        let first = compile_cached_in_observed(&dir, src, "main", "ps_6_6", &counters, || {
+            Err("dxc: error: undeclared identifier 'bad_op'".into())
+        })
+        .unwrap_err();
+        assert!(first.contains("undeclared identifier 'bad_op'"), "{first}");
+        assert_eq!(counters.snapshot().compilations, 1);
+        assert_eq!(counters.snapshot().compilation_failures, 1);
+
+        // 2. Subsequent runs (normal and cached_only) return the exact cached error with 0 compiles.
+        let second = compile_cached_in_observed(&dir, src, "main", "ps_6_6", &counters, || {
+            panic!("cached DXC failure must not invoke compiler again")
+        })
+        .unwrap_err();
+        assert_eq!(second, first);
+        let (probe, missed) = cached_only(|| {
+            compile_cached_in_observed(&dir, src, "main", "ps_6_6", &counters, || {
+                panic!("cached_only hit on DXC failure must not compile")
+            })
+        });
+        assert!(!missed);
+        assert_eq!(probe.unwrap_err(), first);
+        assert_eq!(counters.snapshot().compilations, 1);
+        assert_eq!(counters.snapshot().compilation_failures, 1);
+
+        // 3. Different profile/key misses the old marker and compiles cleanly.
+        let (dxil, hit) = compile_cached_in_observed(&dir, src, "main", "cs_6_6", &counters, || {
+            Ok(synthetic_dxil(7))
+        })
+        .unwrap();
+        assert!(!hit);
+        assert_eq!(dxil, synthetic_dxil(7));
+        assert_eq!(counters.snapshot().compilations, 2);
+
+        // 4. Transient non-DXC errors (e.g. missing DLL) and DXC internal errors are never cached.
+        let transient_src = "transient missing dxc";
+        let _ = compile_cached_in_observed(&dir, transient_src, "main", "cs_6_6", &counters, || {
+            Err("dxcompiler.dll not found".into())
+        })
+        .unwrap_err();
+        let (ok, hit) = compile_cached_in_observed(&dir, transient_src, "main", "cs_6_6", &counters, || {
+            Ok(synthetic_dxil(8))
+        })
+        .unwrap();
+        assert!(!hit);
+        assert_eq!(ok, synthetic_dxil(8));
+
+        let ice_src = "transient dxc internal error";
+        let _ = compile_cached_in_observed(&dir, ice_src, "main", "cs_6_6", &counters, || {
+            Err("dxc: Internal Compiler error: out of memory".into())
+        })
+        .unwrap_err();
+        let (ok_ice, hit_ice) = compile_cached_in_observed(&dir, ice_src, "main", "cs_6_6", &counters, || {
+            Ok(synthetic_dxil(9))
+        })
+        .unwrap();
+        assert!(!hit_ice);
+        assert_eq!(ok_ice, synthetic_dxil(9));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

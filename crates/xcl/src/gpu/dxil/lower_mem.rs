@@ -314,6 +314,93 @@ impl Lw {
         out
     }
 
+    /// Pure read-only raw buffer loads across the active memory window (`loads` is a slice of
+    /// `(aligned_byte_offset, component_mask)` pairs). For non-graphics stages with root UAV
+    /// windows (`self.heap_mem.is_none() && self.gfx.is_none()`), emits branchless straight-line
+    /// loads reading offset `0` on unselected windows / inactive lanes and merging with `select`,
+    /// eliminating per-load `switch` / guard CFGs and `phi` nodes while preserving `#1693`
+    /// semantics (out-of-range windows and inactive lanes yield `0`). Graphics stages (`VS`/`PS`)
+    /// keep the `switch` form so non-coherent root UAV loads are not serialized in one basic block.
+    pub(crate) fn with_mem_raw_loads(
+        &mut self,
+        mut guard: Option<Value>,
+        loads: &[(Value, u8)],
+    ) -> Vec<Value> {
+        let total: usize = loads.iter().map(|&(_, mask)| mask.count_ones() as usize).sum();
+        let z = self.c(0);
+        if let Some(c) = guard {
+            match self.s.m.const_u64(c) {
+                Some(1) => guard = None,
+                Some(0) => return vec![z; total],
+                _ => {}
+            }
+        }
+        if self.heap_mem.is_some() || self.gfx.is_some() {
+            return self.with_mem_i32s(guard, total, &mut |lw, m| {
+                let mut out = Vec::with_capacity(total);
+                for &(a, mask) in loads {
+                    out.extend(lw.s.raw_load(m, a, mask));
+                }
+                out
+            });
+        }
+        let fixed_mem = if self.mems.len() <= 1 {
+            Some(self.mems[0])
+        } else {
+            let w = self.rd(super::lower::VAR_WIN);
+            if let Some(k) = self.s.m.const_u64(w) {
+                if (k as usize) < self.mems.len() {
+                    Some(self.mems[k as usize])
+                } else {
+                    return vec![z; total];
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(m) = fixed_mem {
+            let mut out = Vec::with_capacity(total);
+            if let Some(cond) = guard {
+                for &(a, mask) in loads {
+                    let at = self.sel(cond, a, z);
+                    for v in self.s.raw_load(m, at, mask) {
+                        out.push(self.sel(cond, v, z));
+                    }
+                }
+            } else {
+                for &(a, mask) in loads {
+                    out.extend(self.s.raw_load(m, a, mask));
+                }
+            }
+            return out;
+        }
+        let w = self.rd(super::lower::VAR_WIN);
+        let mems = self.mems.clone();
+        let n = mems.len();
+        let w_eff = if let Some(cond) = guard {
+            let skip = self.c(n as u32);
+            self.sel(cond, w, skip)
+        } else {
+            w
+        };
+        let sels: Vec<Value> = (0..n).map(|k| self.cmpc(Pred::Eq, w_eff, k as u32)).collect();
+        let mut out = Vec::with_capacity(total);
+        for &(a, mask) in loads {
+            let count = mask.count_ones() as usize;
+            let mut acc = vec![z; count];
+            for (k, &m) in mems.iter().enumerate() {
+                let sel_k = sels[k];
+                let at = self.sel(sel_k, a, z);
+                let vals = self.s.raw_load(m, at, mask);
+                for (dst, v) in acc.iter_mut().zip(vals) {
+                    *dst = self.sel(sel_k, v, *dst);
+                }
+            }
+            out.extend(acc);
+        }
+        out
+    }
+
     pub(crate) fn with_mem_i32s(
         &mut self,
         guard: Option<Value>,
@@ -346,14 +433,26 @@ impl Lw {
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {
         let a = self.andc(a, !3);
-        self.with_mem_i32s(None, 1, &mut |lw, m| lw.s.raw_load(m, a, 1))[0]
+        self.with_mem_raw_loads(None, &[(a, 1)])[0]
     }
-    /// `mem.Load2/3/4(a & ~3)` (1..=4 consecutive dwords in one window switch).
+    /// `mem.Load2/3/4(a & ~3)` (1..=4 consecutive dwords across root or heap memory windows).
     pub(crate) fn mem_ld_n(&mut self, guard: Option<Value>, a: Value, count: u32) -> Vec<Value> {
         debug_assert!((1..=4).contains(&count));
         let a = self.andc(a, !3);
         let mask = ((1u32 << count) - 1) as u8;
-        self.with_mem_i32s(guard, count as usize, &mut |lw, m| lw.s.raw_load(m, a, mask))
+        self.with_mem_raw_loads(guard, &[(a, mask)])
+    }
+    fn mem_ld_chunks(&mut self, base_aligned: Value, count: u32) -> Vec<Value> {
+        let mut loads = Vec::new();
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(4);
+            let at = self.addc(base_aligned, 4 * done);
+            let mask = ((1u32 << chunk) - 1) as u8;
+            loads.push((at, mask));
+            done += chunk;
+        }
+        self.with_mem_raw_loads(None, &loads)
     }
     /// `mem.Store(a & ~3, v)`
     pub fn mem_st(&mut self, a: Value, v: Value) {
@@ -368,17 +467,13 @@ impl Lw {
     }
 
     /// `ld_raw`: four dwords from an unaligned byte address (one Load4 + one Load1
-    /// in a single window switch, optionally combined with a lane guard).
+    /// across memory windows, optionally combined with a lane guard).
     fn ld_raw_guarded(&mut self, guard: Option<Value>, a: Value) -> [Value; 4] {
         let b = self.andc(a, !3);
         let b16 = self.addc(b, 16);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let w = self.with_mem_i32s(guard, 5, &mut |lw, m| {
-            let mut v = lw.s.raw_load(m, b, 0xF);
-            v.push(lw.s.raw_load(m, b16, 1)[0]);
-            v
-        });
+        let w = self.with_mem_raw_loads(guard, &[(b, 0xF), (b16, 1)]);
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -393,12 +488,12 @@ impl Lw {
         r
     }
 
-    /// One unaligned dword from byte address `a` (one Load2 in a single window switch).
+    /// One unaligned dword from byte address `a` (one Load2 across memory windows).
     fn ld_raw_u32_guarded(&mut self, guard: Option<Value>, a: Value) -> Value {
         let b = self.andc(a, !3);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let w = self.with_mem_i32s(guard, 2, &mut |lw, m| lw.s.raw_load(m, b, 0x3));
+        let w = self.with_mem_raw_loads(guard, &[(b, 0x3)]);
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -1071,18 +1166,7 @@ impl Lw {
             let lim = self.sel(sz, d2, lim);
             let base = self.add(d0, off);
             let base_aligned = self.andc(base, !3);
-            let raw = self.with_mem_i32s(None, count as usize, &mut |lw, m| {
-                let mut out = Vec::with_capacity(count as usize);
-                let mut done = 0u32;
-                while done < count {
-                    let chunk = (count - done).min(4);
-                    let at = lw.addc(base_aligned, 4 * done);
-                    let mask = ((1u32 << chunk) - 1) as u8;
-                    out.extend(lw.s.raw_load(m, at, mask));
-                    done += chunk;
-                }
-                out
-            });
+            let raw = self.mem_ld_chunks(base_aligned, count);
             let z = self.c(0);
             (0..count)
                 .map(|i| {
@@ -1109,18 +1193,7 @@ impl Lw {
             let a = self.add(b, k);
             let a = self.add(a, soff);
             let base_aligned = self.andc(a, !3);
-            self.with_mem_i32s(None, count as usize, &mut |lw, m| {
-                let mut out = Vec::with_capacity(count as usize);
-                let mut done = 0u32;
-                while done < count {
-                    let chunk = (count - done).min(4);
-                    let at = lw.addc(base_aligned, 4 * done);
-                    let mask = ((1u32 << chunk) - 1) as u8;
-                    out.extend(lw.s.raw_load(m, at, mask));
-                    done += chunk;
-                }
-                out
-            })
+            self.mem_ld_chunks(base_aligned, count)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -1279,7 +1352,7 @@ impl Lw {
                     let ea3 = self.andc(ea, 3);
                     let ea3_8 = self.shlc(ea3, 3);
                     let s = self.or(ea3_8, c1.off_bits);
-                    let w = self.with_mem_i32s(Some(act), 2, &mut |lw, m| lw.s.raw_load(m, eb, 0x3));
+                    let w = self.with_mem_raw_loads(Some(act), &[(eb, 0x3)]);
                     let lo = self.bin(BinOp::LShr, w[0], s);
                     let k32 = self.c(32);
                     let inv = self.sub(k32, s);
@@ -1588,7 +1661,7 @@ impl Lw {
     }
 
     /// Bitwise IEEE-754 f64 ordered equality in pure i64 ops (no DoubleExtensions needed).
-    fn feq_bits64(&mut self, a: Value, b: Value) -> Value {
+    pub(super) fn feq_bits64(&mut self, a: Value, b: Value) -> Value {
         let mask = self.c64(0x7FFF_FFFF_FFFF_FFFF);
         let inf = self.c64(0x7FF0_0000_0000_0000);
         let z = self.c64(0);

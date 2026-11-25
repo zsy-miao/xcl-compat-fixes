@@ -941,6 +941,49 @@ fn gpu_frexp_f64_exp_and_mant() {
     }
 }
 
+/// v_frexp_mant_f32 / _f16 keep the input's sign, as the f64 one does (#580): HLSL frexp()
+/// returns an unsigned mantissa, so −10.125 came out as +0.6328125 and −0 as +0.
+#[test]
+fn gpu_frexp_mant_f32_f16_keep_the_sign() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_FREXP_MANT_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 0)], None),
+        ("V_FREXP_MANT_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 0), ("NEG", 1)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 0)], None),
+        ("V_FREXP_MANT_F16", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 1)], None),
+    ]);
+    // (input, mantissa, exponent): mant · 2^exp = input with |mant| in [0.5, 1); 0 / inf / NaN pass through
+    const F32: [(u32, u32, i32); 8] = [
+        (0xC122_0000, 0xBF22_0000, 4),  // −10.125 → −0.6328125 · 2^4
+        (0x4122_0000, 0x3F22_0000, 4),  // 10.125 → 0.6328125 · 2^4
+        (0xBF80_0000, 0xBF00_0000, 1),  // −1 → −0.5 · 2^1
+        (0xBE80_0000, 0xBF00_0000, -1), // −0.25 → −0.5 · 2^−1
+        (0x8000_0000, 0x8000_0000, 0),  // −0 → −0
+        (0x0000_0000, 0x0000_0000, 0),  // +0 → +0
+        (0xFF80_0000, 0xFF80_0000, 0),  // −inf → −inf
+        (0xC2C8_0000, 0xBF48_0000, 7),  // −100 → −0.78125 · 2^7
+    ];
+    // f16: −10.125 → −0.6328125, −1 → −0.5, −0 → −0, 3 → 0.75
+    const F16: [(u32, u32); 4] = [(0xC910, 0xB910), (0xBC00, 0xB800), (0x8000, 0x8000), (0x4200, 0x3A00)];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = F32[l % F32.len()].0;
+        r[1] = F16[l % F16.len()].0;
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let (x, mant, exp) = F32[l % F32.len()];
+        assert_eq!(v[2], mant, "lane {l} v_frexp_mant_f32 {:#x}", x);
+        assert_eq!(v[3], mant ^ 0x8000_0000, "lane {l} v_frexp_mant_f32 neg {:#x}", x);
+        assert_eq!(v[4] as i32, exp, "lane {l} v_frexp_exp_i32_f32 {:#x}", x);
+        let (h, hmant) = F16[l % F16.len()];
+        assert_eq!(v[5] & 0xFFFF, hmant, "lane {l} v_frexp_mant_f16 {:#x}", h);
+    }
+}
+
 /// Edge inputs of the f64 operations: |x| ≥ 2^63, values outside the f32 range, denormals,
 /// signed zeros, ±inf and NaN.
 const F64_EDGES: [u64; 22] = [
@@ -3372,6 +3415,56 @@ fn gpu_valu_16_and_64_bit() {
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0x5555_5555, 0x5555_5555), "v_cmp_eq_u64 → sdst");
     let carries: u64 = (0..64).filter(|&l| (0xFFFF_FFFFu64 * (l as u64 + 1)).overflowing_add(if l % 2 == 1 { u64::MAX } else { l as u64 }).1).map(|l| 1u64 << l).sum();
     assert_eq!(r.sgpr[22] as u64 | (r.sgpr[23] as u64) << 32, carries, "v_mad_u64_u32 carry mask");
+}
+
+/// NEG_HI[2] of v_dot2_f32_f16 is the ABS of its f32 accumulator (SRC2), applied before NEG[2]
+/// (LLVM `SIDefines.h` `NEG_HI = ABS`; `llvm.amdgcn.fdot2.ll` `v_fdot2_abs_c`: `neg_hi:[0,0,1]`).
+#[test]
+fn dot2_f32_f16_neg_hi_on_src2_is_abs() {
+    let hlsl = |neg: u64, neg_hi: u64| {
+        let code = prog(&[(
+            "V_DOT2_F32_F16",
+            "ENC_VOP3P",
+            &[("VDST", 4), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", neg), ("NEG_HI", neg_hi)],
+            None,
+        )]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let plain = hlsl(0, 0);
+    assert!(plain.contains("asfloat(v3)") && !plain.contains("abs(asfloat(v3))"), "{plain}");
+    let abs = hlsl(0, 0b100);
+    assert!(abs.contains("abs(asfloat(v3))") && !abs.contains("(-abs(asfloat(v3)))"), "{abs}");
+    let neg_abs = hlsl(0b100, 0b100);
+    assert!(neg_abs.contains("(-abs(asfloat(v3)))"), "{neg_abs}");
+}
+
+/// v_dot2_f32_f16 with ABS (NEG_HI[2]) and NEG (NEG[2]) on the f32 accumulator: 1·1 + 1·1 + c.
+#[test]
+fn gpu_dot2_f32_f16_abs_neg_on_src2() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // neg_hi:[0,0,1]: 2 + |c|
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG_HI", 0b100)], None),
+            // neg_lo:[0,0,1] neg_hi:[0,0,1]: 2 - |c|
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", 0b100), ("NEG_HI", 0b100)], None),
+            // neg_lo:[0,0,1]: 2 - c
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 6), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", 0b100)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[1] = 0x3C00_3C00; // 1.0h, 1.0h
+            r[2] = 0x3C00_3C00;
+            r[3] = f(-5.0);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[4], f(7.0), "wave{lanes} lane {l} v_dot2_f32_f16 neg_hi:[0,0,1]");
+            assert_eq!(v[5], f(-3.0), "wave{lanes} lane {l} v_dot2_f32_f16 neg_lo:[0,0,1] neg_hi:[0,0,1]");
+            assert_eq!(v[6], f(7.0), "wave{lanes} lane {l} v_dot2_f32_f16 neg_lo:[0,0,1]");
+        }
+    }
 }
 
 #[test]
@@ -6411,11 +6504,12 @@ fn isa_coverage() {
         let Some(ie) = inst.encs.iter().find(|e| ENCODINGS[e.encoding as usize].primary) else { continue };
         let enc = ENCODINGS[ie.encoding as usize].name;
         let lit = inst.always_literal.then_some(0);
-        // operands that must not be 0: MIMG channel mask, VOP3 SDST (VCC)
+        // operands that must not be 0: MIMG channel mask, VOP3 SDST (VCC), VGPR-only sources
         let fields: &[(&str, u64)] = match enc {
             "ENC_MIMG" => &[("DMASK", 1)],
             "VOP3_SDST_ENC" => &[("SDST", 106)],
             _ if inst.name == "V_SWAPREL_B32" => &[("SRC0", V)],
+            _ if inst.name == "V_MQSAD_U32_U8" => &[("SRC2", V)],
             _ => &[],
         };
         let Ok(mut code) = encode(inst.name, enc, fields, lit) else { continue };
@@ -9023,6 +9117,166 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+#[test]
+fn qsad_and_mqsad_operand_forms_and_validation() {
+    let vop3 = |name: &str, f: &[(&str, u64)]| encode(name, "ENC_VOP3", f, None).unwrap();
+    let end = || encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+    // Valid LLVM GFX10 operand combinations: VGPR pairs/quads (up to v255), SGPR pairs, VCC, EXEC, 0, -1, CLAMP.
+    let mut valid = Vec::new();
+    for name in ["V_QSAD_PK_U16_U8", "V_MQSAD_PK_U16_U8"] {
+        valid.extend(vop3(name, &[("VDST", 254), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]));
+        valid.extend(vop3(name, &[("VDST", 4), ("SRC0", 2), ("SRC1", 103), ("SRC2", 126), ("CLAMP", 1)]));
+        valid.extend(vop3(name, &[("VDST", 6), ("SRC0", 193), ("SRC1", 128), ("SRC2", 106)]));
+        valid.extend(vop3(name, &[("VDST", 8), ("SRC0", 128), ("SRC1", 193), ("SRC2", 193)]));
+    }
+    valid.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 252), ("SRC0", 193), ("SRC1", V + 2), ("SRC2", V + 3)]));
+    valid.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 12), ("SRC0", 126), ("SRC1", 106), ("SRC2", V + 20), ("CLAMP", 1)]));
+    valid.extend(end());
+    let t = translate(&valid, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+
+    // Invalid VGPR bounds / non-VGPR SRC2 on v_mqsad_u32_u8 must be rejected cleanly.
+    for bad in [
+        &[("VDST", 255), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 3)][..],
+        &[("VDST", 4), ("SRC0", V + 255), ("SRC1", V + 2), ("SRC2", V + 3)],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 255)],
+    ] {
+        let mut p = vop3("V_QSAD_PK_U16_U8", bad);
+        p.extend(end());
+        assert!(!translate(&p, &Options::default()).unwrap().complete(), "{bad:?}");
+    }
+    for bad in [
+        &[("VDST", 253), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 3)][..],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", 0)],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", 128)],
+        &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 253)],
+    ] {
+        let mut p = vop3("V_MQSAD_U32_U8", bad);
+        p.extend(end());
+        assert!(!translate(&p, &Options::default()).unwrap().complete(), "{bad:?}");
+    }
+}
+
+/// GPU verification of `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, and `v_mqsad_u32_u8`: sliding
+/// windows across `S0[63:0]`, zero-byte masking on `S1`, wrapping vs `CLAMP` saturation,
+/// SGPR/inline sources, overlapping `VDST`/`SRC` ranges, and `EXEC` masking.
+#[test]
+fn gpu_qsad_and_mqsad() {
+    if !gpu_ready() {
+        return;
+    }
+    let vop3 = |name: &str, f: &[(&str, u64)]| encode(name, "ENC_VOP3", f, None).unwrap();
+    // both backends: HLSL + DXC, and direct DXIL
+    let run_on = |code: &[u8], st: &KernelState, wave64: bool, direct: bool| {
+        let dxil = if direct {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && !gpu_waves().contains(&true), mem_windows: 1, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}"))
+        } else {
+            let t = translate(code, &on_gpu(Options { wave64, ..Default::default() })).unwrap();
+            assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl))
+        };
+        runner::run(&dxil, st, &[]).unwrap()
+    };
+    let mut code = Vec::new();
+    // Unmasked vs masked sliding windows (v4 = 0x4000_2015 has zero byte 2; v3 top byte 0xFF unused)
+    code.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 6)]));
+    code.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 10)]));
+    code.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 10), ("CLAMP", 1)]));
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 16), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 6)]));
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 10), ("CLAMP", 1)]));
+    // Inline -1 SRC0, SGPR SRC1 (s2) and SGPR pair SRC2 (s[4:5])
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 20), ("SRC0", 193), ("SRC1", 2), ("SRC2", 4)]));
+    // 128-bit accumulator wrap vs CLAMP saturation
+    code.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 26), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 22)]));
+    code.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 30), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 22), ("CLAMP", 1)]));
+    // Overlapping VDST/SRC0/SRC2 (in-place pk and staggered v[36:39] <- v[37:40])
+    code.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 34), ("SRC0", V + 34), ("SRC1", V + 4), ("SRC2", V + 34)]));
+    code.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 36), ("SRC0", V + 2), ("SRC1", V + 4), ("SRC2", V + 37)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x00FF_0001;
+    st.sgpr[4] = 0x0002_0001;
+    st.sgpr[5] = 0x0004_0003;
+    for r in &mut st.vgpr {
+        r[2] = 0x4030_2010;
+        r[3] = 0xFF60_5000;
+        r[4] = 0x4000_2015;
+        r[6] = 0x0002_0001;
+        r[7] = 0x0004_0003;
+        r[10] = 0x0001_FFFE;
+        r[11] = 0x0100_FFE0;
+        r[22] = 0xFFFF_FFFC;
+        r[23] = 0xFFFF_FFA0;
+        r[24] = 0xFFFF_FFFF;
+        r[25] = 5;
+        r[34] = 0x4030_2010;
+        r[35] = 0xFF60_5000;
+        r[37] = 10;
+        r[38] = 20;
+        r[39] = 30;
+        r[40] = 40;
+    }
+
+    for (wave64, lanes, direct) in [(false, 32usize, false), (true, 64usize, false), (false, 32, true), (true, 64, true)] {
+        let r = run_on(&code, &st, wave64, direct);
+        for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
+            assert_eq!((v[8], v[9]), (54 | (157 << 16), 78 | (191 << 16)), "direct={direct} wave64={wave64} lane {l}: v_qsad_pk_u16_u8");
+            assert_eq!((v[12], v[13]), (51 | (156 << 16), 43 | (443 << 16)), "direct={direct} wave64={wave64} lane {l}: v_qsad_pk_u16_u8 wrap");
+            assert_eq!((v[14], v[15]), (0xFFFF | (156 << 16), 0xFFFF | (443 << 16)), "direct={direct} wave64={wave64} lane {l}: v_qsad_pk_u16_u8 clamp");
+            assert_eq!((v[16], v[17]), (6 | (93 << 16), 78 | (111 << 16)), "direct={direct} wave64={wave64} lane {l}: v_mqsad_pk_u16_u8");
+            assert_eq!((v[18], v[19]), (0xFFFF | (92 << 16), 0xFFFF | (363 << 16)), "direct={direct} wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 clamp");
+            assert_eq!((v[20], v[21]), (255 | (256 << 16), 257 | (258 << 16)), "direct={direct} wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 -1/SGPR");
+            assert_eq!((v[26], v[27], v[28], v[29]), (1, 0xFFFF_FFFB, 74, 112), "direct={direct} wave64={wave64} lane {l}: v_mqsad_u32_u8 wrap");
+            assert_eq!((v[30], v[31], v[32], v[33]), (u32::MAX, 0xFFFF_FFFB, u32::MAX, 112), "direct={direct} wave64={wave64} lane {l}: v_mqsad_u32_u8 clamp");
+            assert_eq!((v[34], v[35]), (0x408B_2015, 0xFFCB_504B), "direct={direct} wave64={wave64} lane {l}: overlapping pk");
+            assert_eq!((v[36], v[37], v[38], v[39], v[40]), (15, 111, 105, 147, 40), "direct={direct} wave64={wave64} lane {l}: staggered u32");
+        }
+    }
+
+    // EXEC masking (32-lane and split/native 64-lane) + VCC pair as SRC2: inactive lanes keep old VDST.
+    let mut masked = Vec::new();
+    masked.extend(vop3("V_MQSAD_PK_U16_U8", &[("VDST", 0), ("SRC0", 193), ("SRC1", 129), ("SRC2", 128)]));
+    masked.extend(vop3("V_MQSAD_U32_U8", &[("VDST", 2), ("SRC0", 193), ("SRC1", 129), ("SRC2", V + 2)]));
+    masked.extend(vop3("V_QSAD_PK_U16_U8", &[("VDST", 6), ("SRC0", 193), ("SRC1", 129), ("SRC2", 106)]));
+    masked.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut ms = KernelState::default();
+    ms.sgpr[106] = 0x0002_0001;
+    ms.sgpr[107] = 0x0004_0003;
+    ms.sgpr[126] = 0x00FF_00FF;
+    ms.sgpr[127] = 0x0F0F_0F0F;
+    for r in &mut ms.vgpr {
+        r[0] = 0xAAAA_AAAA;
+        r[1] = 0xBBBB_BBBB;
+        r[2] = 11;
+        r[3] = 22;
+        r[4] = 33;
+        r[5] = 44;
+        r[6] = 0xCCCC_CCCC;
+        r[7] = 0xDDDD_DDDD;
+    }
+    for (wave64, lanes, direct) in [(false, 32usize, false), (true, 64usize, false), (false, 32, true), (true, 64, true)] {
+        let r = run_on(&masked, &ms, wave64, direct);
+        for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
+            let active = ((if l < 32 { ms.sgpr[126] } else { ms.sgpr[127] }) >> (l & 31)) & 1 != 0;
+            if active {
+                assert_eq!((v[0], v[1]), (0x00FE_00FE, 0x00FE_00FE), "direct={direct} wave64={wave64} active lane {l} pk");
+                assert_eq!((v[2], v[3], v[4], v[5]), (265, 276, 287, 298), "direct={direct} wave64={wave64} active lane {l} u32");
+                assert_eq!((v[6], v[7]), (1020 | (1021 << 16), 1022 | (1023 << 16)), "direct={direct} wave64={wave64} active lane {l} vcc");
+            } else {
+                assert_eq!((v[0], v[1]), (0xAAAA_AAAA, 0xBBBB_BBBB), "direct={direct} wave64={wave64} inactive lane {l} pk");
+                assert_eq!((v[2], v[3], v[4], v[5]), (11, 22, 33, 44), "direct={direct} wave64={wave64} inactive lane {l} u32");
+                assert_eq!((v[6], v[7]), (0xCCCC_CCCC, 0xDDDD_DDDD), "direct={direct} wave64={wave64} inactive lane {l} vcc");
+            }
+        }
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
@@ -9859,6 +10113,52 @@ fn gpu_compute_coherent_and_cached_loads() {
         assert_eq!(out[0x100 / 4], 512, "{tag} coherent cross-group counter");
         for ticket in 0..512usize {
             assert_eq!(out[(0x200 + ticket * 4) / 4], ticket as u32, "{tag} coherent ticket={ticket}");
+        }
+    }
+}
+
+#[test]
+fn gpu_v_dot8_u32_u4_edge_cases() {
+    const CASES: [(u32, u32, u32); 16] = [
+        (0, 0, 0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0),
+        (0x0F0F_0F0F, 0x0F0F_0F0F, 123),
+        (0xF0F0_F0F0, 0xF0F0_F0F0, 456),
+        (0x0F0F_0F0F, 0xF0F0_F0F0, 0x1234_5678),
+        (0x0123_4567, 0x89AB_CDEF, 0x1111_2222),
+        (0xFEDC_BA98, 0x7654_3210, 0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_F8F7), // exact u32::MAX with sum 8*15*15 = 1800 (0x708): 0xFFFF_F8F7 + 0x708 = 0xFFFF_FFFF
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_F8F8), // wraps to 0 unclamped, saturates to u32::MAX clamped
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFF0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
+        (0x8888_8888, 0x9999_9999, 0xFFFF_FE00),
+        (0x1010_1010, 0x0204_0608, 0),
+        (0x0102_0304, 0x0506_0708, 0x8000_0000),
+        (0xA5A5_5A5A, 0x5A5A_A5A5, 0x7FFF_FFFF),
+        (0x0000_000F, 0x0000_000F, 0xFFFF_FF1F),
+    ];
+    let p = prog(&[
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+    ]);
+    let dot_u4 = |a: u32, b: u32, c: u32, clamp: bool| -> u32 {
+        let mut sum = c as u64;
+        for i in 0..8 {
+            sum += (((a >> (4 * i)) & 0xF) * ((b >> (4 * i)) & 0xF)) as u64;
+        }
+        if clamp { sum.min(u32::MAX as u64) as u32 } else { sum as u32 }
+    };
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, c) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2]) = (a, b, c);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, c) = CASES[l % CASES.len()];
+            assert_eq!(v[3], dot_u4(a, b, c, false), "wave{lanes} lane {l} unclamped v_dot8_u32_u4({a:#x}, {b:#x}, {c:#x})");
+            assert_eq!(v[4], dot_u4(a, b, c, true), "wave{lanes} lane {l} clamped v_dot8_u32_u4({a:#x}, {b:#x}, {c:#x})");
         }
     }
 }

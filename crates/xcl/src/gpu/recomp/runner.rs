@@ -1738,7 +1738,9 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        for k in 0..4 {
+            list.SetComputeRootUnorderedAccessView(2 + k as u32, mem_buf.GetGPUVirtualAddress());
+        }
         let scratch = chain.map(|(_, words, most)| {
             let first = super::pso::dispatch_slabs(groups, most)[0].1;
             let bytes = first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));

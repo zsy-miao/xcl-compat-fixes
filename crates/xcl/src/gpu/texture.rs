@@ -821,11 +821,72 @@ mod tests {
         assert_eq!(staging_capacity(u64::MAX), None);
     }
 
+    fn select_large_upload_device_with<F, D>(
+        selector: &crate::gpu::adapter::Selector,
+        make_factory: impl FnOnce() -> Result<F, String>,
+        warp_device: impl FnOnce(&F) -> Result<D, String>,
+        hardware_device: impl FnOnce(&F, &crate::gpu::adapter::Selector) -> Option<(D, String)>,
+        default_device: impl FnOnce() -> Result<D, String>,
+    ) -> Result<(D, String), String> {
+        match make_factory() {
+            Ok(factory) if *selector == crate::gpu::adapter::Selector::Warp => {
+                warp_device(&factory).map(|dev| (dev, "WARP (software renderer)".to_string()))
+            }
+            Ok(factory) => hardware_device(&factory, selector).ok_or_else(|| "no GPU".to_string()),
+            Err(err) if *selector == crate::gpu::adapter::Selector::Auto => default_device()
+                .map(|dev| (dev, "default D3D12 adapter".to_string()))
+                .map_err(|dev_err| format!("DXGI factory unavailable ({err}); default D3D12 device unavailable ({dev_err})")),
+            Err(err) => Err(format!("DXGI factory unavailable for {selector}: {err}")),
+        }
+    }
+
+    unsafe fn large_upload_device(selector: &crate::gpu::adapter::Selector) -> Result<(ID3D12Device, String), String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6};
+        select_large_upload_device_with(
+            selector,
+            || CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string()),
+            |factory| {
+                let warp: IDXGIAdapter1 = factory.EnumWarpAdapter().map_err(|e| format!("WARP adapter unavailable: {e}"))?;
+                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).map_err(|e| format!("WARP device unavailable: {e}"))
+            },
+            |factory, sel| {
+                crate::gpu::adapter::candidates(factory, sel).into_iter().find_map(|(a, desc)| {
+                    crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_11_0).ok().map(|dev| (dev, crate::gpu::adapter::name(&desc)))
+                })
+            },
+            || crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0).map_err(|e| e.to_string()),
+        )
+    }
+
+    #[test]
+    fn large_upload_device_selection_handles_factory_fallback_and_selectors() {
+        use crate::gpu::adapter::Selector;
+        // 1. Auto + DXGI_ERROR_UNSUPPORTED falls back to default device.
+        let mut used_default = false;
+        let ok = select_large_upload_device_with(&Selector::Auto, || Err::<(), _>("DXGI_ERROR_UNSUPPORTED (0x887A0004)".into()), |_| unreachable!(), |_, _| unreachable!(), || { used_default = true; Ok(42u32) });
+        assert!(used_default && ok == Ok((42, "default D3D12 adapter".to_string())));
+        // 2. Auto + double failure returns Err without panicking.
+        let err = select_large_upload_device_with(&Selector::Auto, || Err::<(), _>("E_FAIL".into()), |_| unreachable!(), |_, _| unreachable!(), || Err::<u32, _>("no D3D12 device".into()));
+        assert!(err.as_ref().is_err_and(|e| e.contains("E_FAIL") && e.contains("no D3D12 device")));
+        // 3. Explicit XCL_ADAPTER filter + factory error must not ignore filter via default fallback.
+        for sel in [Selector::Name("rtx".into()), Selector::Index(1), Selector::Warp] {
+            let mut fallback = false;
+            let res = select_large_upload_device_with(&sel, || Err::<(), _>("DXGI_ERROR_UNSUPPORTED".into()), |_| unreachable!(), |_, _| unreachable!(), || { fallback = true; Ok(99u32) });
+            assert!(!fallback && res.is_err());
+        }
+        // 4. Headless CI: Auto + factory ok with 0 hardware adapters skips cleanly without fallback.
+        let mut fallback = false;
+        let none = select_large_upload_device_with(&Selector::Auto, || Ok(()), |_| unreachable!(), |_, _| None::<(u32, String)>, || { fallback = true; Ok(7u32) });
+        assert!(!fallback && none == Err("no GPU".to_string()));
+        // 5. Selector::Warp + factory ok uses EnumWarpAdapter path.
+        let warp = select_large_upload_device_with(&Selector::Warp, || Ok(()), |_| Ok(11u32), |_, _| unreachable!(), || unreachable!());
+        assert_eq!(warp, Ok((11, "WARP (software renderer)".to_string())));
+    }
+
     #[test]
     fn gpu_large_mixed_upload_keeps_tight_staging_and_exact_pixels() {
         use windows::core::Interface;
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory6};
 
         unsafe {
             if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
@@ -834,16 +895,15 @@ mod tests {
                     Err(error) => println!("D3D12 debug layer unavailable: {error}"),
                 }
             }
-            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
             let selector = crate::gpu::adapter::Selector::from_env_or("auto");
-            let selected = crate::gpu::adapter::candidates(&factory, &selector).into_iter().find_map(|(a, desc)| {
-                crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_11_0).ok().map(|dev| (dev, desc))
-            });
-            let Some((dev, desc)) = selected else {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
+            let (dev, adapter_name) = match large_upload_device(&selector) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    crate::gpu::recomp::runner::skip_test(&reason);
+                    return;
+                }
             };
-            println!("large upload adapter: {}", String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'));
+            println!("large upload adapter: {adapter_name}");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
             let make = |width, height, format| {
                 let desc = D3D12_RESOURCE_DESC {

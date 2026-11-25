@@ -592,6 +592,16 @@ impl Module {
         self.push(Op::Bin(op, a, b, flags), t)
     }
     pub fn cast(&mut self, op: CastOp, v: Value, to: Ty) -> Value {
+        let v = if op == CastOp::SExt
+            && self.int_width(to) == Some(64)
+            && self.type_ids.get(&TypeDef::Int(1)).copied().is_some_and(|i1| self.type_of(v) == i1)
+        {
+            // Direct i1 -> i64 sign extension loses the high word on the RX 6800M.
+            let i32 = self.i32();
+            self.push(Op::Cast(CastOp::SExt, v, i32), i32)
+        } else {
+            v
+        };
         self.push(Op::Cast(op, v, to), to)
     }
     pub fn bitcast(&mut self, v: Value, to: Ty) -> Value {
@@ -1525,5 +1535,38 @@ impl Module {
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
         self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_extension_does_not_intern_unrelated_integer_types() {
+        let mut wide = Module::new();
+        let signed = wide.i32c(u32::MAX);
+        let i64 = wide.i64();
+        wide.cast(CastOp::SExt, signed, i64);
+        assert!(!wide.type_ids.contains_key(&TypeDef::Int(1)));
+
+        let mut narrow = Module::new();
+        let bit = narrow.i1c(true);
+        let i16 = narrow.int(16);
+        narrow.cast(CastOp::SExt, bit, i16);
+        assert!(!narrow.type_ids.contains_key(&TypeDef::Int(64)));
+    }
+
+    #[test]
+    fn sign_extension_from_i1_to_i64_still_uses_i32() {
+        let mut module = Module::new();
+        let bit = module.i1c(true);
+        let i64 = module.i64();
+        module.cast(CastOp::SExt, bit, i64);
+
+        let [first, second] = module.insts.as_slice() else { panic!("expected two casts") };
+        assert!(matches!(first.op, Op::Cast(CastOp::SExt, source, ty)
+            if source == bit && module.int_width(ty) == Some(32)));
+        assert!(matches!(second.op, Op::Cast(CastOp::SExt, Value::Inst(0), ty) if ty == i64));
     }
 }
