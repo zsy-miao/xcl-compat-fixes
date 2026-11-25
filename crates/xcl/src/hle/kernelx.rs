@@ -1000,6 +1000,11 @@ fn page_home(page: usize) -> Option<usize> {
     (b.live > 0 && index < first.checked_add(b.count)?).then(|| b.home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
 }
 
+/// Whether every page of `pages` (at least one) is a physical page allocated now.
+pub fn physical_pages_live(pages: &[usize]) -> bool {
+    !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
+}
+
 /// Resolve the live virtual addresses of the physical pages covering `offset..offset+len`.
 /// Caller must hold `AWAY`.
 unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: usize, len: usize) -> Option<Vec<usize>> {
