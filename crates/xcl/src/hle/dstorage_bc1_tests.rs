@@ -104,18 +104,18 @@ fn bc1_virtual_request_succeeds_or_keeps_destination_untouched() {
         ..Default::default()
     };
     assert_eq!(r.check(true), Ok(()));
-    assert_eq!(unsafe { execute(&r, None, None, None) }, Ok(()));
+    assert_eq!(unsafe { execute(&r, None, None, false, None) }, Ok(()));
     assert_eq!(destination, FITTED);
     // The official codec permits this FF tail. The legacy adapter's stricter
     // exact-consumption refusal remains covered by its direct test above.
     r.source_size = 91;
-    assert_eq!(unsafe { execute(&r, None, None, None) }, Ok(()));
+    assert_eq!(unsafe { execute(&r, None, None, false, None) }, Ok(()));
     assert_eq!(destination, FITTED);
     for n in [45] {
         r.source_size = n;
         destination.fill(0xa5);
         assert_eq!(
-            unsafe { execute(&r, None, None, None) },
+            unsafe { execute(&r, None, None, false, None) },
             Err(E_DECOMPRESSION)
         );
         assert_eq!(destination, [0xa5; 16]);
@@ -169,7 +169,7 @@ fn bc1_file_request_reaches_scattered_physical_pages_transactionally() {
             r.source_size = n;
             valid.push(write_physical_pages(&scattered, offset, &[0xa5; 16]));
             checks.push(r.check(false));
-            results.push(execute(&r, Some(&file), Some(&scattered), None));
+            results.push(execute(&r, Some(&file), Some(&scattered), false, None));
             let mut b = [0; 16];
             valid.push(read_physical_pages(&scattered, offset, &mut b));
             outputs.push(b);

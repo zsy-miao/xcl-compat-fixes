@@ -54,7 +54,7 @@ unsafe fn copy_from(at: usize, destination: &mut [u8]) -> Result<(), HRESULT> {
         ..Default::default()
     };
     assert_eq!(request.check(true), Ok(()));
-    execute(&request, None, None, None)
+    execute(&request, None, None, false, None)
 }
 
 #[test]
