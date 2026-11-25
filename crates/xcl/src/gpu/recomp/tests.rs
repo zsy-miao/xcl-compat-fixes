@@ -3041,6 +3041,65 @@ fn gpu_static_samplers_from_constants_in_code() {
     }
 }
 
+/// A static sampler's S# word that the compiler writes bit-reversed (`s_brev_b32 s26, 40` is
+/// 0x14000000: a constant with only high bits set) is a constant like one from s_mov: the
+/// S# is a static sampler, not the sampler-heap entry its word 3 (0 here) would name.
+fn brev_sampler_program() -> (Vec<u8>, [u32; 4]) {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let point = [clamp, 0x00FF_F000u32, 40u32.reverse_bits(), 0];
+    // T# tex0 in s[16:23] (SRSRC = 4); S# s[24:27] (SSAMP = 6)
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(point[0])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(point[1])),
+        ("S_BREV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 128 + 40)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    (code, point)
+}
+
+#[test]
+fn static_sampler_word_from_s_brev_is_a_constant() {
+    let (code, point) = brev_sampler_program();
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(point, false)], "the S# with a bit-reversed word is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+}
+
+/// The same program on the GPU: the texel a point sampler picks at a texel boundary.
+#[test]
+fn gpu_static_sampler_word_from_s_brev() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let (code, _) = brev_sampler_program();
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    for r in st.vgpr.iter_mut() {
+        r[0] = f(0.5); // the boundary between texel columns 1 and 2
+        r[1] = f(0.125); // row 0
+    }
+    // 4x4 RGBA32F, texel (x, y) = (x, y, x + 4y, 1)
+    let mut t0 = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            for v in [x as f32, y as f32, (x + 4 * y) as f32, 1.0] {
+                t0.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let fl = |i: usize| f32::from_bits(v[i]);
+        assert_eq!([fl(10), fl(11), fl(12), fl(13)], [2.0, 0.0, 2.0, 1.0], "lane {l}: static point sampler");
+    }
+}
+
 #[test]
 fn gpu_images_a16_d16() {
     if !gpu_ready() {

@@ -1343,7 +1343,7 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
-/// set by s_mov / s_movk with constants earlier in its block, those words.
+/// set by s_mov / s_movk / s_brev with constants earlier in its block, those words.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
     let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
@@ -1362,6 +1362,8 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
         let set: Vec<(u64, u32)> = match d.inst.name {
             "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
             "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
+            // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
+            "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
             // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
             "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
                 (Some(r), Some(c @ 128..=208)) => {
