@@ -160,6 +160,20 @@ pub struct RawUav {
 }
 
 impl Shader {
+    pub(super) fn dispatch_piece(&self) -> Self {
+        Self {
+            m: self.m.declarations(),
+            stage: self.stage,
+            sm: self.sm,
+            entry: self.entry,
+            features: self.features.clone(),
+            bindings: self.bindings.clone(),
+            handle_ty: self.handle_ty,
+            props_ty: self.props_ty,
+            rov: self.rov,
+        }
+    }
+
     pub fn new(stage: Stage, sm: (u32, u32)) -> Shader {
         let mut m = Module::new();
         let entry = m.define_entry("main");
@@ -519,6 +533,10 @@ impl Shader {
             self.m.ret();
         }
         self.m.optimize();
+        self.finish_optimized(numthreads, wave_size)
+    }
+
+    pub(super) fn finish_optimized(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
         self.infer_type_features();
         let (flags, sfi0) = self.feature_flags();
 

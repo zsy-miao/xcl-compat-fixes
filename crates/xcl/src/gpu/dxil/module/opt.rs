@@ -41,7 +41,7 @@ impl Op {
     }
 
     /// Rewrites every value operand through `f`.
-    fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
+    pub(super) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Bin(_, a, b, _) | Op::Cmp(_, a, b) | Op::Store(a, b, _) | Op::AtomicRmw(_, a, b) => {
                 *a = f(*a);
@@ -295,7 +295,7 @@ impl Module {
 
     /// Immediate dominators of the blocks in `order` (reverse postorder), by
     /// Cooper, Harvey and Kennedy's iteration ("A Simple, Fast Dominance Algorithm").
-    fn idoms(&self, order: &[u32]) -> Vec<Option<usize>> {
+    pub(super) fn idoms(&self, order: &[u32]) -> Vec<Option<usize>> {
         let n = self.blocks.len();
         let mut rpo = vec![usize::MAX; n];
         for (k, &b) in order.iter().enumerate() {

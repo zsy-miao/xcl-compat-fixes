@@ -142,12 +142,23 @@ pub fn dll_key(name: &str) -> String {
     s
 }
 
-/// Simple glob: only a single trailing or embedded '*' is supported ("api-ms-win-core-*").
+/// Simple glob: `*` stands for any run of characters (also none), anywhere and as often as the
+/// pattern has it ("api-ms-win-core-*", "api-ms-win-*-l1-1-*.dll"); every other character
+/// stands for itself.
 pub fn glob_match(pattern: &str, s: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == s,
-        Some((pre, post)) => s.len() >= pre.len() + post.len() && s.starts_with(pre) && s.ends_with(post),
+    let mut parts = pattern.split('*');
+    let Some(mut rest) = s.strip_prefix(parts.next().unwrap_or("")) else { return false };
+    let mut parts: Vec<&str> = parts.collect();
+    // no `*`: the whole name; else the last part is the tail, and the parts between the stars
+    // are taken in order, each at its first place
+    let Some(tail) = parts.pop() else { return rest.is_empty() };
+    for part in parts {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
     }
+    rest.ends_with(tail)
 }
 
 /// GDK-style "copy string into caller buffer" helper: `size` includes the terminator.
@@ -323,6 +334,26 @@ mod tests {
         assert!(!glob_match("api-ms-win-core-*", "api-ms-win-crt-runtime-l1-1-0.dll"));
         assert!(glob_match("xgameruntime*.dll", "xgameruntime.thunks.dll"));
         assert!(glob_match("kernelx.dll", "kernelx.dll"));
+    }
+
+    #[test]
+    fn globbing_with_several_stars() {
+        // an alias for a family of API sets: both stars have to match
+        assert!(glob_match("api-ms-win-*-l1-1-*.dll", "api-ms-win-core-file-l1-1-0.dll"));
+        assert!(!glob_match("api-ms-win-*-l1-1-*.dll", "api-ms-win-core-file-l1-2-0.dll"));
+        assert!(glob_match("a*b*c", "abc"));
+        assert!(glob_match("a*b*c", "aXbYbZc"));
+        assert!(!glob_match("a*b*c", "acb"));
+        assert!(glob_match("*", "anything.dll"));
+        assert!(glob_match("**", ""));
+        // the parts do not overlap, and the ends of the name are fixed
+        assert!(!glob_match("ab*ba", "aba"));
+        assert!(!glob_match("a*a", "a"));
+        assert!(!glob_match("x*", "ax"));
+        assert!(!glob_match("*x", "xa"));
+        assert!(glob_match("*.dll", "kernelx.dll"));
+        // a name without a star is the whole name
+        assert!(!glob_match("kernelx.dll", "kernelx.dll.bak"));
     }
 
     #[test]

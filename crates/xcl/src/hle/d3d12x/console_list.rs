@@ -695,6 +695,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     // the whole recording is replayed into the PC list here: its transitions of textures kept
     // in step are these
     super::title_textures::list_reset(st.pc);
+    super::dred::reset(st.pc as *mut c_void);
     let windows = super::real::uma_window_vas();
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
     let mut out = Translation::default();
@@ -856,8 +857,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         let mark = super::culprit::before_dispatch(&list, (*p).pc, real, [x, y, z]);
-                        list.Dispatch(x, y, z);
+                        let ran = super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z]);
                         super::culprit::after_dispatch(&list, mark);
+                        ran?;
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

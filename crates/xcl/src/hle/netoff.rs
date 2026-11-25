@@ -55,6 +55,9 @@ extern "system" {
     fn real_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32;
     #[link_name = "GetAddrInfoW"]
     fn real_getaddrinfo_w(node: *const u16, service: *const u16, hints: *const c_void, out: *mut *mut c_void) -> i32;
+    #[link_name = "GetAddrInfoExW"]
+    #[allow(clippy::too_many_arguments)]
+    fn real_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32;
     #[link_name = "gethostname"]
     fn real_gethostname(name: *mut u8, len: i32) -> i32;
 }
@@ -136,6 +139,7 @@ static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
+static O_GETADDRINFO_EX: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
@@ -187,6 +191,14 @@ unsafe fn orig_getaddrinfo_w(node: *const u16, service: *const u16, hints: *cons
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn orig_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32 {
+    match O_GETADDRINFO_EX.load(Ordering::Acquire) {
+        0 => real_getaddrinfo_ex(n, s, ns, id, hints, out, t, ov, cb, h),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut c_void) -> i32>(f)(n, s, ns, id, hints, out, t, ov, cb, h),
+    }
+}
+
 /// `XCL_NETWORK=0` for the whole process: the system's own network functions refuse as the
 /// title's imports do (see the module's comment). Call once, before the title runs.
 pub fn install_system_hooks() {
@@ -213,7 +225,7 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "gethostbyname", gethostbyname as usize, spare()),
             ("ws2_32.dll", "getaddrinfo", getaddrinfo as usize, &O_GETADDRINFO),
             ("ws2_32.dll", "GetAddrInfoW", getaddrinfo_w as usize, &O_GETADDRINFO_W),
-            ("ws2_32.dll", "GetAddrInfoExW", getaddrinfo_ex as usize, spare()),
+            ("ws2_32.dll", "GetAddrInfoExW", getaddrinfo_ex as usize, &O_GETADDRINFO_EX),
         ];
         let mut failed = Vec::new();
         for (dll, name, detour, orig) in hooks {
@@ -391,8 +403,12 @@ unsafe extern "system" fn getaddrinfo_w(node: *const u16, _service: *const u16, 
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn getaddrinfo_ex(_n: *const u16, _s: *const u16, _ns: u32, _id: *const c_void, _hints: *const c_void, out: *mut *mut c_void, _t: *const c_void, _ov: *mut c_void, _cb: *const c_void, _h: *mut c_void) -> i32 {
-    note("GetAddrInfoExW");
+unsafe extern "system" fn getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32 {
+    let name = if n.is_null() { String::new() } else { crate::util::from_wide_ptr(n).unwrap_or_default() };
+    if local_name(&name) {
+        return orig_getaddrinfo_ex(n, s, ns, id, hints, out, t, ov, cb, h);
+    }
+    note(&format!("GetAddrInfoExW({name})"));
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }

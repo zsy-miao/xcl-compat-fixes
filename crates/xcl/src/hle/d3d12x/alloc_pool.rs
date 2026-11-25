@@ -117,7 +117,9 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
 }
 
 #[cfg(test)]
-pub(super) fn recording_backing_for_test(list: usize) -> Option<usize> {
+pub(super) use recording_backing as recording_backing_for_test;
+
+pub(super) fn recording_backing(list: usize) -> Option<usize> {
     STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
 }
 

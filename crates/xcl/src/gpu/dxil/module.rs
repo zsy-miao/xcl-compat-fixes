@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
+pub(super) mod split;
 
 // ---------------------------------------------------------------- types
 
@@ -59,6 +60,7 @@ enum ConstDef {
     Aggregate(Ty, Vec<Value>),
 }
 
+#[derive(Clone)]
 struct FuncDecl {
     name: String,
     ty: Ty,
@@ -93,6 +95,7 @@ impl FnAttrs {
     }
 }
 
+#[derive(Clone)]
 struct GlobalDef {
     name: String,
     /// Value type (the global itself is a pointer to it).

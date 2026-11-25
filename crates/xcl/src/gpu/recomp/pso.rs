@@ -119,6 +119,7 @@ pub type StaticSampler = ([u32; 4], bool);
 /// A console shader as PC DXIL and the static samplers it needs in its root signature.
 #[derive(Clone)]
 pub struct Compiled {
+    pub dispatch_chain: Option<std::sync::Arc<crate::gpu::dxil::kernel::DispatchChain>>,
     pub dxil: Vec<u8>,
     pub samplers: Vec<StaticSampler>,
 }
@@ -259,6 +260,9 @@ mod translated {
                 Some(tag) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), &tag),
                 _ => id,
             };
+            let id = if Backend::current() != Backend::Hlsl {
+                identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
+            } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -309,7 +313,28 @@ mod translated {
             samplers.push((s, cmp != 0));
         }
         let len = u32_(&mut r)? as usize;
-        (r.len() == len && super::dxc::valid_dxil_container(r)).then(|| Compiled { dxil: r.to_vec(), samplers })
+        if len == 0 { return None; }
+        let (whole, mut rest) = r.split_at_checked(len)?;
+        if !super::dxc::valid_dxil_container(whole) { return None; }
+        let dispatch_chain = if rest.is_empty() {
+            None
+        } else {
+            let dwords_per_group = u32_(&mut rest)?;
+            let count = u32_(&mut rest)?;
+            if dwords_per_group == 0 || count < 2 || count as usize > rest.len() / 4 { return None; }
+            let mut pieces = Vec::new();
+            for _ in 0..count {
+                let len = u32_(&mut rest)? as usize;
+                if len == 0 { return None; }
+                let (piece, next) = rest.split_at_checked(len)?;
+                if !super::dxc::valid_dxil_container(piece) { return None; }
+                pieces.push(piece.to_vec());
+                rest = next;
+            }
+            if !rest.is_empty() { return None; }
+            Some(std::sync::Arc::new(crate::gpu::dxil::kernel::DispatchChain { dwords_per_group, pieces }))
+        };
+        Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain })
     }
 
     pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
@@ -324,6 +349,14 @@ mod translated {
         }
         b.extend_from_slice(&(c.dxil.len() as u32).to_le_bytes());
         b.extend_from_slice(&c.dxil);
+        if let Some(chain) = &c.dispatch_chain {
+            b.extend_from_slice(&chain.dwords_per_group.to_le_bytes());
+            b.extend_from_slice(&(chain.pieces.len() as u32).to_le_bytes());
+            for piece in &chain.pieces {
+                b.extend_from_slice(&(piece.len() as u32).to_le_bytes());
+                b.extend_from_slice(piece);
+            }
+        }
         let Some(dir) = path.parent() else { return };
         let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
         // written whole, then renamed: a reader never sees half a file
@@ -379,7 +412,7 @@ mod translated {
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
-    /// version and sources, a forced compact form, the per-lane form (`direct_compute`).
+    /// version and sources, a forced compact form, the split target, the per-lane form (`direct_compute`).
     fn direct_output() -> u64 {
         static D: OnceLock<u64> = OnceLock::new();
         *D.get_or_init(|| {
@@ -388,6 +421,7 @@ mod translated {
                 Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
                 None => id,
             };
+            let id = identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()));
             if crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
             } else {
@@ -521,7 +555,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok((Compiled { dxil, samplers: t.static_samplers }, false))
+    Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -608,6 +642,7 @@ impl ShaderEntry {
         self.blob.len()
             + self.key.cache_dir.capacity()
             + self.shader.dxil.capacity()
+            + self.shader.dispatch_chain.as_ref().map_or(0, |chain| chain.pieces.iter().map(Vec::capacity).sum())
             + self.shader.samplers.capacity() * std::mem::size_of::<StaticSampler>()
     }
 }
@@ -824,7 +859,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
                 dump_direct(blob, &k.dxil);
-                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
             }
             Err(e) => {
                 let reason = crate::gpu::dxil::coverage::record_fallback("CS per-lane", &e);
@@ -834,7 +869,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     }
     let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
     dump_direct(blob, &k.dxil);
-    Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+    Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
 
 /// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's
@@ -869,7 +904,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
     dump_direct(blob, &k.dxil);
-    Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+    Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
 }
 
 pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
@@ -944,7 +979,7 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    finish_two_pass_compiled(Compiled { dxil: cs, samplers: t.static_samplers }, record, ps)
+    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
 }
 
 fn compile_console_mesh(
@@ -970,7 +1005,7 @@ fn compile_console_mesh(
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 dump_direct(blob, &k.dxil);
-                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
             }
             Err(e) => direct_fallback("MS", &e),
         }
@@ -981,7 +1016,7 @@ fn compile_console_mesh(
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    Ok(Compiled { dxil, samplers: t.static_samplers })
+    Ok(Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers })
 }
 
 fn console_mesh_with(
@@ -1142,10 +1177,61 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 
 /// The ABI root signature with the pipeline's static samplers (registers 0.., space 1).
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    abi_signature(dev, graphics, samplers, false)
+}
+
+/// Record all piece dispatches after the six common root views have been bound.
+/// The slabs of at most `most` groups a chain runs a dispatch of `grid` groups in, as (first
+/// group, groups): whole planes, else whole rows, else parts of one. Each uses the same scratch.
+pub(crate) fn dispatch_slabs(grid: [u32; 3], most: u64) -> Vec<([u32; 3], [u32; 3])> {
+    let [x, y, z] = grid;
+    let fit = |n: u32, of: u64| (n as u64).min((most / of.max(1)).max(1)) as u32;
+    let sx = fit(x, 1);
+    let sy = if sx == x { fit(y, x as u64) } else { 1 };
+    let sz = if sx == x && sy == y { fit(z, x as u64 * y as u64) } else { 1 };
+    let at = |n: u32, step: u32| (0..n).step_by(step.max(1) as usize).map(move |k| (k, step.min(n - k)));
+    let mut out = Vec::new();
+    for (oz, nz) in at(z, sz) {
+        for (oy, ny) in at(y, sy) {
+            for (ox, nx) in at(x, sx) {
+                out.push(([ox, oy, oz], [nx, ny, nz]));
+            }
+        }
+    }
+    out
+}
+
+/// A chain's dispatch of `grid` groups, `most` of them at once (`dispatch_slabs`). `used`: the
+/// list (or one before it) has used `scratch`.
+pub(crate) unsafe fn record_dispatch_chain<'a>(
+    list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool,
+    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
+) {
+    list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
+    for (slab, (origin, size)) in dispatch_slabs(grid, most).into_iter().enumerate() {
+    let ([x, y, z], [ox, oy, oz]) = (size, origin);
+    for (i, piece) in pieces.clone().into_iter().enumerate() {
+        if i != 0 || slab != 0 || used {
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
+        }
+        let constants = [x, y, z, i as u32, ox, oy, oz, 0];
+        list.SetComputeRoot32BitConstants(7, 8, constants.as_ptr().cast(), 0);
+        list.SetPipelineState(piece);
+        list.Dispatch(x, y, z);
+    }
+    }
+}
+
+pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    abi_signature(dev, false, samplers, true)
+}
+
+fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -1154,6 +1240,22 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             })
             .collect();
+        if split {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0, RegisterSpace: 2, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0, RegisterSpace: 2, Num32BitValues: 8,
+                } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let mut flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
         if graphics {
             flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -1174,6 +1276,34 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
         D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("{e}"))?;
         let blob = blob.ok_or("root signature")?;
         dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).map_err(|e| format!("CreateRootSignature: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::dispatch_slabs;
+
+    #[test]
+    fn slabs_cover_a_dispatch_once_within_their_size() {
+        for grid in [[1, 1, 1], [2, 3, 2], [240, 135, 1], [65_535, 2, 1], [5, 1, 7]] {
+            for most in [0, 1, 3, 239, 240, 1000, u64::MAX] {
+                let slabs = dispatch_slabs(grid, most);
+                let groups = |s: [u32; 3]| s.into_iter().map(u64::from).product::<u64>();
+                assert_eq!(slabs.iter().map(|s| groups(s.1)).sum::<u64>(), groups(grid), "{grid:?} {most}");
+                assert!(slabs.iter().all(|s| groups(s.1) <= most.max(1)), "{grid:?} {most}");
+                for (o, n) in &slabs {
+                    assert!((0..3).all(|k| n[k] > 0 && o[k] + n[k] <= grid[k]), "{grid:?} {most}");
+                }
+                let mut firsts: Vec<_> = slabs.iter().map(|s| s.0).collect();
+                firsts.sort();
+                firsts.dedup();
+                assert_eq!(firsts.len(), slabs.len());
+                // the first is the largest: the scratch is made for it
+                assert!(slabs.iter().all(|s| groups(s.1) <= groups(slabs[0].1)));
+            }
+        }
+        assert_eq!(dispatch_slabs([240, 135, 1], 1400).len(), 27, "five rows of 240 at once");
+        assert!(dispatch_slabs([0, 4, 4], 8).is_empty());
     }
 }
 
@@ -1216,7 +1346,7 @@ mod shader_cache_tests {
     fn translations_on_disk_need_the_same_bytes_and_identity() {
         let dir = std::env::temp_dir().join(format!("xcl-translated-{}", std::process::id()));
         let path = dir.join("t.bin");
-        let c = Compiled { dxil: synthetic_dxil(5), samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
+        let c = Compiled { dispatch_chain: None, dxil: synthetic_dxil(5), samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
         translated::store_in(&path, 42, b"console", &c);
         let back = translated::load_in(&path, 42, b"console").expect("stored");
         assert_eq!((back.dxil, back.samplers), (c.dxil.clone(), c.samplers.clone()));
@@ -1408,7 +1538,7 @@ mod shader_cache_tests {
 
         // Store a valid entry first, then corrupt only the DXIL payload while keeping the
         // XCLTRAN2 header and payload length intact (e.g. zeroed blocks after a hard reset).
-        let valid = Compiled { dxil: synthetic_dxil(1), samplers: vec![([1, 2, 3, 4], false)] };
+        let valid = Compiled { dispatch_chain: None, dxil: synthetic_dxil(1), samplers: vec![([1, 2, 3, 4], false)] };
         translated::store_in(&path, ident, blob, &valid);
         let mut raw = std::fs::read(&path).unwrap();
         let dxil_start = raw.len() - valid.dxil.len();
@@ -1427,7 +1557,7 @@ mod shader_cache_tests {
         let mut calls = 0usize;
         let rebuilt = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
             calls += 1;
-            Ok(Compiled { dxil: synthetic_dxil(9), samplers: vec![([5, 6, 7, 8], true)] })
+            Ok(Compiled { dispatch_chain: None, dxil: synthetic_dxil(9), samplers: vec![([5, 6, 7, 8], true)] })
         })
         .unwrap();
         assert_eq!(calls, 1);
@@ -1451,20 +1581,20 @@ mod shader_cache_tests {
         let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false);
 
         let err = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
-            Ok(Compiled { dxil: b"not DXIL".to_vec(), samplers: Vec::new() })
+            Ok(Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() })
         })
         .err()
         .expect("invalid fresh DXIL must be rejected");
         assert!(err.contains("invalid DXIL container"), "{err}");
         assert!(!path.exists(), "invalid fresh DXIL must not be written to disk");
 
-        translated::store_in(&path, ident, blob, &Compiled { dxil: b"not DXIL".to_vec(), samplers: Vec::new() });
+        translated::store_in(&path, ident, blob, &Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() });
         assert!(!path.exists(), "store_in must not write an invalid DXIL container");
 
         // A real container emitted by the direct DXIL backend must be accepted and cached.
         let real_direct = crate::gpu::dxil::shader::Shader::new(crate::gpu::dxil::container::Stage::Compute, (6, 6)).finish([1, 1, 1], None);
         let stored = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
-            Ok(Compiled { dxil: real_direct.clone(), samplers: Vec::new() })
+            Ok(Compiled { dispatch_chain: None, dxil: real_direct.clone(), samplers: Vec::new() })
         })
         .unwrap();
         assert_eq!(stored.dxil, real_direct);
@@ -1478,6 +1608,7 @@ mod shader_cache_tests {
 
     fn compiled(marker: u8) -> Compiled {
         Compiled {
+            dispatch_chain: None,
             dxil: synthetic_dxil(marker),
             samplers: vec![([marker as u32; 4], false)],
         }
@@ -1553,6 +1684,7 @@ mod shader_cache_tests {
             cached_shader(&cache, key(1), b"a", || {
                 let dxil = dxc::compile_cached_in(&dir, "probe", "main", "cs_6_6")?.0;
                 Ok(Compiled {
+                            dispatch_chain: None,
                     dxil,
                     samplers: Vec::new(),
                 })
@@ -1586,6 +1718,7 @@ mod shader_cache_tests {
             key(4),
             b"d",
             Arc::new(Compiled {
+                dispatch_chain: None,
                 dxil: vec![0; limit + 1],
                 samplers: Vec::new(),
             }),
@@ -1760,6 +1893,7 @@ mod shader_cache_tests {
                         let dxil =
                             dxc::compile_cached_in(&dir, "pending probe", "main", "cs_6_6")?.0;
                         Ok(Compiled {
+                            dispatch_chain: None,
                             dxil,
                             samplers: Vec::new(),
                         })

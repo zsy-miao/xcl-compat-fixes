@@ -17,6 +17,8 @@ pub(super) enum Flow {
 }
 
 pub(super) struct Em {
+    /// whole-wave reductions (`wave32_reductions`)
+    pub reductions: super::Reductions,
     opt: Options,
     out: String,
     pub indent: usize,
@@ -74,6 +76,8 @@ pub(super) struct Em {
     safe_barrier: bool,
     /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
     img_writes: Vec<u64>,
+    /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
+    pub coherent_mem: bool,
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -594,6 +598,7 @@ impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
             opt,
+            reductions: Default::default(),
             out: String::new(),
             indent: 1,
             sgprs: BTreeSet::new(),
@@ -623,6 +628,7 @@ impl Em {
             track_frexp_denorm: false,
             safe_barrier: false,
             img_writes: Vec::new(),
+            coherent_mem: false,
         }
     }
 
@@ -1269,6 +1275,7 @@ impl Em {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
         }
+        let seed = self.reductions.seeds.get(&d.pc).copied();
         let r = match d.enc.name {
             "ENC_SOPP" => return self.sopp(d, &name, next),
             "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => self.salu(d, &name),
@@ -1284,6 +1291,10 @@ impl Em {
         };
         if let Err(why) = r {
             self.unsupported(d, why);
+        }
+        if let Some(v) = seed {
+            let v = self.vreg(v);
+            self.line(&format!("uint xcl_seed_{:x} = {v};", d.pc));
         }
         Flow::Next
     }
@@ -1693,7 +1704,15 @@ impl Em {
             _ => return Err("SALU"),
         };
         self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
+        // "is a lane left" of a lane mask (an AND with EXEC or VCC) in a pixel shader: over the
+        // live lanes (`mask_live`)
+        let lanes_left = matches!(name, "s_and_b32" | "s_andn2_b32")
+            && matches!(self.opt.mode, Mode::Pixel(_))
+            && d.enc.name == "ENC_SOP2"
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126));
+        if lanes_left {
+            self.line(&format!("scc = (uint)(mask_live({t}) != 0u);"));
+        } else if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
         self.write32(&dst, &t);
@@ -3997,12 +4016,19 @@ impl Em {
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
-                self.line(&format!("uint {t} = {rla}({a}, first_lane({el}, {eh}));"));
+                // (a live lane of EXEC where there is one: `first_lane_live`)
+                self.line(&format!("uint {t} = {rla}({a}, first_lane_live({el}, {eh}));"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
             "v_readlane_b32" => {
                 let t = self.t();
+                // the end of a whole-wave reduction (`wave32_reductions`)
+                if let Some((seed, op)) = self.reductions.reads.get(&d.pc) {
+                    self.line(&format!("uint {t} = xcl_red_{op}(xcl_seed_{seed:x});"));
+                    self.write32(&dst, &t);
+                    return Ok(());
+                }
                 let rla = self.rla_uniform_fn();
                 let read = format!("{rla}({a}, {b} & {wmask}u)");
                 // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
@@ -4746,8 +4772,9 @@ impl Em {
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        // memory coherent across the GPU only when the program actually uses those; otherwise
+        // keep the cached (faster) view
+        let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
         let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
         let windows = self.opt.mem_windows.clamp(1, max_win);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
@@ -4773,6 +4800,9 @@ static uint xcl_cap = 1u << 16;
         }
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
+        }
+        if !self.reductions.reads.is_empty() {
+            h.push_str(PRELUDE_REDUCE);
         }
         if self.x64() {
             self.x64_prelude(&mut h);
@@ -5239,7 +5269,7 @@ static uint xcl_cap = 1u << 16;
             }
         }
         if windows > 1 {
-            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+            let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
             h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
         }
         h
@@ -6141,6 +6171,41 @@ void xcl_s_barrier() {
 }
 "#;
 
+/// Whole-wave reductions of wave32 VS / PS programs (`wave32_reductions`). The console's combine
+/// the lanes through DPP and permlane steps that pass partial results through lanes that were
+/// never launched (`s_or_saveexec -1` runs them); here those lanes do not exist and the steps
+/// read 0 from them, so a wave that is not full lost the words of live lanes. The lanes of each
+/// half of a 64-lane wave are a console wave of their own. A helper lane is in no wave
+/// operation and gets the result of a live lane of its quad (every quad has one).
+const PRELUDE_REDUCE: &str = r#"
+uint xcl_red_share(uint r) {
+#ifdef XCL_PIXEL
+    uint hw = WaveGetLaneIndex();
+    uint nib = (WaveActiveBallot(true)[hw >> 5] >> (hw & 28u)) & 15u;
+    uint q0 = QuadReadLaneAt(r, 0u), q1 = QuadReadLaneAt(r, 1u), q2 = QuadReadLaneAt(r, 2u), q3 = QuadReadLaneAt(r, 3u);
+    uint k = firstbitlow(nib);
+    r = (k & 2u) != 0u ? ((k & 1u) != 0u ? q3 : q2) : ((k & 1u) != 0u ? q1 : q0);
+#endif
+    return r;
+}
+uint xcl_red_or(uint x) {
+    uint a = WaveActiveBitOr(select(xcl_half == 0u, x, 0u)), b = WaveActiveBitOr(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_max(uint x) {
+    uint a = WaveActiveMax(select(xcl_half == 0u, x, 0u)), b = WaveActiveMax(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_and(uint x) {
+    uint a = WaveActiveBitAnd(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveBitAnd(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_min(uint x) {
+    uint a = WaveActiveMin(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveMin(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+"#;
+
 /// Pixel shaders: masks hold the helper lanes (#105). After `s_wqm` the helper pixels of a
 /// quad a primitive's edge splits are in EXEC and the console's `v_cmp*` / carries set their
 /// bits like any other lane's; wave ops leave helper lanes out before SM 6.7 (their ballot bits
@@ -6261,6 +6326,35 @@ float3 cube_dir(float s, float t, float face) {
 // the cube of a cube array the face coordinate (face + 8 · slice) is in
 float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }
 uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
+// The lane a v_readfirstlane reads. In a pixel shader EXEC holds helper lanes (s_wqm) and its
+// first lane is often one, on a primitive's edge. A helper lane's registers cannot be read once
+// a loop has run a wave op: AMD's RDNA2 driver (RX 6700 XT) gives 0 for everything a helper
+// lane holds after a WaveReadLaneAt inside a loop, quad reads included. A loop whose state the
+// console's compiler carries in a vector (v_mov v, s … v_readfirstlane s, v) then read 0 back
+// each time round and ran to the loop budget: a retail volumetric light pass took seconds a draw
+// and the GPU was reset. So the first live lane of EXEC is read if EXEC has one. The value
+// is the same there: the console's compiler reads the first lane of values that are equal in
+// every lane, or of any lane it then removes from EXEC (a waterfall loop).
+// "Is a lane left" of a lane mask in a pixel shader, over the live lanes. AMD's RDNA2 driver
+// (RX 6700 XT) also stops keeping a helper lane's registers at a loop's back edge when the
+// shader has another loop before it: from the second pass on, everything a helper lane holds
+// reads as 0. A loop that goes on as long as lanes are left in a mask (s_andn2 mask, mask, EXEC;
+// s_cbranch_scc1) then kept a helper lane's bit, whose "done" condition comes from registers
+// that no longer change, and ran to the loop budget (a retail volumetric light pass took seconds
+// a draw and the GPU was reset). The helper lanes leave with the live ones.
+uint mask_live(uint m) {
+#ifdef XCL_PIXEL
+    m &= ballot(true).x;
+#endif
+    return m;
+}
+uint first_lane_live(uint lo, uint hi) {
+#ifdef XCL_PIXEL
+    uint2 lv = ballot(true);
+    if (((lo & lv.x) | (hi & lv.y)) != 0u) { lo &= lv.x; hi &= lv.y; }
+#endif
+    return first_lane(lo, hi);
+}
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }

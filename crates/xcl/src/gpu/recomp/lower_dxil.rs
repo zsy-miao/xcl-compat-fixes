@@ -45,7 +45,7 @@ struct DxilIr {
 
 impl DxilIr {
     /// The builder state for `insts` at `entry` (a kernel or a compute program), with one memory
-    /// window; a compute program's is coherent, as the HLSL path declares it.
+    /// window; a compute program's is coherent when `needs_coherent_mem` holds, matching the HLSL path.
     fn new(insts: &[Decoded], wave64: bool, entry: &Entry) -> DxilIr {
         Self::with(insts, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, entry)
     }

@@ -16,6 +16,8 @@ struct Pending {
     job: Mutex<Option<Job>>,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
+    /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
+    driver: AtomicUsize,
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
@@ -256,10 +258,12 @@ pub type Job = Box<dyn FnOnce() -> usize + Send>;
 /// Stack of the threads that build pipelines: translation recurses deeply on big programs.
 const BUILD_STACK: usize = 64 << 20;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+type Work = Box<dyn FnOnce() + Send>;
+
+fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
         // DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
@@ -267,21 +271,54 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(BUILD_STACK).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (released by the title meanwhile)
-                if p.orphan.load(Ordering::Acquire) {
-                    let _ = p.job.lock().unwrap().take();
-                    continue;
-                }
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    build(&p, job, false);
-                }
+                let Ok(work) = next else { return };
+                work();
             });
         }
         Mutex::new(tx)
     })
+}
+
+fn enqueue(p: Arc<Pending>) {
+    let _ = queue().lock().unwrap().send(Box::new(move || {
+        // (released by the title meanwhile)
+        if p.orphan.load(Ordering::Acquire) {
+            let _ = p.job.lock().unwrap().take();
+            return;
+        }
+        // (None: a bind took it and builds it itself)
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            build(&p, job, false);
+        }
+    }));
+}
+
+/// The caller also drains its batch. Multiple workers can therefore build
+/// different chains without ever waiting for a free worker to start a piece.
+pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
+    let count = jobs.len();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
+    let (send, recv) = mpsc::channel();
+    let drain = move || loop {
+        let job = jobs.lock().unwrap().pop();
+        let Some((i, job)) = job else { return };
+        let _ = send.send((i, job()));
+    };
+    // the helpers build for this worker's pipeline: the title waiting for it waits for them too
+    let parent = BUILDING.with(|b| b.borrow().clone());
+    for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
+        let (drain, parent) = (drain.clone(), parent.clone());
+        let _ = queue().lock().unwrap().send(Box::new(move || {
+            let before = BUILDING.with(|b| b.replace(parent));
+            drain();
+            BUILDING.with(|b| *b.borrow_mut() = before);
+        }));
+    }
+    drain();
+    let mut results = vec![0; count];
+    for (i, result) in recv.iter().take(count) { results[i] = result; }
+    results
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -343,6 +380,7 @@ static LAZY: AtomicUsize = AtomicUsize::new(0);
 fn pending(standin: usize, compute: bool, job: Job, key: u64) -> Arc<Pending> {
     let p = Arc::new(Pending {
         real: AtomicUsize::new(0),
+        driver: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
@@ -362,7 +400,7 @@ fn pending(standin: usize, compute: bool, job: Job, key: u64) -> Arc<Pending> {
 /// To the workers, once.
 fn send(p: Arc<Pending>) {
     if !p.queued.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
     }
 }
 
@@ -638,6 +676,26 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A stand-in that is no driver object (`shared`) never reaches the driver: binds get the
+    /// driver pipeline shared with other stand-ins until the real one is built, and after a build
+    /// that failed.
+    #[test]
+    fn a_bind_of_a_shared_stand_in_gets_its_driver_pipeline() {
+        let (fails, builds, driver) = (0x7E57_B011usize, 0x7E57_B012usize, 0x7E57_B013usize);
+        submit_lazy(fails, false, Box::new(|| 0), 0);
+        submit_lazy(builds, false, Box::new(|| 0x1234), 0);
+        for s in [fails, builds] {
+            shared(s, driver);
+            assert_eq!(entry(s).unwrap().stand(s), driver);
+        }
+        assert_eq!(resolve_wait_for(fails, None), driver, "its build failed");
+        assert_eq!(resolve(fails), driver);
+        assert_eq!(resolve_wait_for(builds, None), 0x1234);
+        assert_eq!(resolve_for_bind(builds), 0x1234);
+        // (0x1234 is no pipeline: taken, not released)
+        assert_eq!((released(fails), released(builds)), (0, 0x1234));
+    }
+
     /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
     /// at once, with no budget, the build goes to the workers
     /// unwanted, and once built the bind gets the real one. Without `image_only` the same bind
@@ -875,15 +933,36 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
-/// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
+impl Pending {
+    /// What a bind of the stand-in `pso` gives the driver while the pipeline is not built.
+    fn stand(&self, pso: usize) -> usize {
+        match self.driver.load(Ordering::Acquire) {
+            0 => pso,
+            d => d,
+        }
+    }
+}
+
+/// Stand-in `standin` is no driver object (`standin::shell`): binds get `driver` in its place.
+/// Told before the title has the stand-in.
+pub fn shared(standin: usize, driver: usize) {
+    if let Some(p) = entry(standin) {
+        p.driver.store(driver, Ordering::Release);
+    }
+}
+
+/// The pipeline to use for `pso` now: the real one once built, else the stand-in's driver
+/// pipeline (`pso` itself when it is one).
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy pipeline's first use: build it now (the stand-in draws nothing meanwhile)
+            // a lazy pipeline's first use: build it now (the stand-in, or the driver pipeline
+            // it shares, draws nothing meanwhile)
+            let stand = p.stand(pso);
             send(p);
-            pso
+            stand
         }
         r => r,
     }
@@ -938,7 +1017,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         done = p.cv.wait(done).unwrap();
     }
     match p.real.load(Ordering::Acquire) {
-        0 => pso,
+        0 => p.stand(pso),
         r => r,
     }
 }
@@ -957,7 +1036,7 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// dispatches are skipped) until a worker has built it.
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
-        0 => pso,
+        0 => p.stand(pso),
         r => r,
     };
     if *p.done.lock().unwrap() {
@@ -965,7 +1044,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     }
     send(p.clone());
     if p.late.load(Ordering::Acquire) {
-        return pso;
+        return p.stand(pso);
     }
     p.want();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
@@ -979,7 +1058,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if n < 16 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
-    pso
+    p.stand(pso)
 }
 
 /// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
@@ -1017,7 +1096,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
                     crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
                 }
             }
-            pso
+            p.stand(pso)
         }
         r => r,
     }

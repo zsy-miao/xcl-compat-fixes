@@ -980,6 +980,80 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
     Some(pending)
 }
 
+/// The whole-wave reductions of a wave32 program (`wave32_reductions`).
+#[derive(Default)]
+pub struct Reductions {
+    /// pc of a `v_cndmask` that starts one → the VGPR it writes
+    pub seeds: std::collections::BTreeMap<u64, u64>,
+    /// pc of the `v_readlane` that ends one → (its seed's pc, the operation: `xcl_red_<op>`)
+    pub reads: std::collections::BTreeMap<u64, (u64, &'static str)>,
+}
+
+/// The reductions the console's compiler makes over the lanes of a wave32 wave:
+/// `s_or_saveexec_b32 s, -1` (every lane runs, launched or not), `v_cndmask v, identity, value,
+/// mask`, three DPP8 steps (within 2, 4 and 8 lanes), a DPP row mirror, `v_permlanex16 w, v`, one more
+/// step and `v_readlane s, v, 0` – nothing else in between, all in one basic block.
+fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>) -> Reductions {
+    let op_of = |d: &Decoded| match d.inst.name {
+        "V_OR_B32" => Some(("or", 128)),
+        "V_MAX_U32" => Some(("max", 128)),
+        "V_AND_B32" => Some(("and", 193)),
+        "V_MIN_U32" => Some(("min", 193)),
+        _ => None,
+    };
+    let f = |d: &Decoded, n: &str| rdna2::field_value(d.enc, &d.words, n);
+    let ext = |d: &Decoded, n: &str| emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, n));
+    // (the steps' waits and nops are not part of it)
+    let idle = |d: &Decoded| matches!(d.inst.name, "S_NOP" | "S_WAITCNT" | "V_NOP" | "S_WAITCNT_DEPCTR" | "S_INST_PREFETCH");
+    // step k takes its value from the other half of the 2^(k+1) lanes a lane is in (all lanes of a
+    // half hold the same by then, so any of them will do)
+    let other_half = |k: usize, n: u64, sel: Option<u64>| sel.is_some_and(|s| s >> (k + 1) == n >> (k + 1) && (s ^ n) >> k & 1 == 1);
+    let mut out = Reductions::default();
+    for (i, seed) in insts.iter().enumerate() {
+        if seed.inst.name != "V_CNDMASK_B32" || seed.variant != rdna2::Variant::Plain {
+            continue;
+        }
+        // the every-lane section it is in, with no other EXEC write before the end
+        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193)) else { continue };
+        let open = i - 1 - open;
+        let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(7).collect();
+        let [a, b, c, mirror, cross, last, read] = steps[..] else { continue };
+        let Some((op, identity)) = op_of(a) else { continue };
+        let (_, w) = rdna2::vgpr_uses(seed);
+        let [v] = w[..] else { continue };
+        if f(seed, "SRC0") != Some(identity) {
+            continue;
+        }
+        let same = |d: &Decoded, variant: rdna2::Variant| {
+            let (r, w) = rdna2::vgpr_uses(d);
+            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == vec![v] && r.contains(&v)
+        };
+        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
+        let crossed = {
+            let (r, w) = rdna2::vgpr_uses(cross);
+            cross.inst.name == "V_PERMLANEX16_B32" && r.contains(&v) && w.len() == 1
+        };
+        if !dpp8 || !same(mirror, rdna2::Variant::Dpp16) || ext(mirror, "DPP_CTRL") != Some(0x140) || !crossed || !same(last, rdna2::Variant::Plain) {
+            continue;
+        }
+        let (r, _) = rdna2::vgpr_uses(read);
+        if read.inst.name != "V_READLANE_B32" || !r.contains(&v) || f(read, "SRC1") != Some(128) {
+            continue;
+        }
+        // one basic block, and EXEC kept all ones from the section's start
+        let end = insts.iter().position(|d| d.pc == read.pc).unwrap_or(i);
+        let inside = &insts[open + 1..=end];
+        let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & rdna2::F_TERMINATOR == 0 && rdna2::branch_target(d).is_none());
+        let exec = inside.iter().any(|d| d.inst.name.contains("SAVEEXEC") || (d.enc.name.starts_with("ENC_SOP") && f(d, "SDST").is_some_and(|x| (126..=127).contains(&x))));
+        if !straight || exec {
+            continue;
+        }
+        out.seeds.insert(seed.pc, v);
+        out.reads.insert(read.pc, (seed.pc, op));
+    }
+    out
+}
+
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
@@ -1418,6 +1492,34 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
+///
+/// Compute work that coordinates across workgroups (e.g. bottom-up BVH builds: atomics,
+/// then reading what other groups wrote) relies on `GLC`/`DLC`/`SLC`, memory atomics, or
+/// cache invalidation on the console. Programs without any of those only access read-only
+/// or disjointly written memory within the dispatch, so keeping their flat memory windows
+/// un-qualified lets the GPU cache them in L1.
+pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
+            return true;
+        }
+        if name.starts_with("BUFFER_ATOMIC_")
+            || name.starts_with("GLOBAL_ATOMIC_")
+            || name.starts_with("FLAT_ATOMIC_")
+        {
+            return true;
+        }
+        matches!(
+            d.enc.name,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+    })
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
@@ -1468,6 +1570,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
@@ -1486,6 +1589,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
+    }
+    if !opt.wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        em.reductions = wave32_reductions(&insts, &leaders);
     }
     em.max_vgpr = insts
         .iter()
